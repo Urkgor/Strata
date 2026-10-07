@@ -52,6 +52,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <sys/stat.h>
@@ -103,6 +104,10 @@ struct Options {
     int ckpt_slots = 4;          // state checkpoints kept for the conversation cache
     int ckpt_every = 8192;       // tokens between checkpoints inside a long prompt (0: only at its end)
     int n_rs_seq = 0;            // recurrent snapshots for rollback (llama.cpp experimental)
+    // speculation: guesses from the context, checked in one batch (docs/Q35.md)
+    std::string spec = "off";   // off | lookup
+    int spec_max = 4;            // guessed tokens per step
+    int spec_match = 2;          // shortest repeat of the context that makes a guess
     // the hybrid expert cache (docs/Q35.md): the hot experts on the card, the CPU computes only the rest
     std::string expert_cache = "off";   // off | auto | sim | <MiB>
     int cache_slots = 0;         // experts per layer (instead of a size in MiB)
@@ -175,6 +180,10 @@ void usage() {
         "  --bench                read a prompt and generate, print tokens/s (needs --native; -p/-f for the text)\n"
         "  --bench-pp N, --bench-tg N, --bench-reps N     prompt tokens (512), generated tokens (64), repeats (3)\n"
         "  --bench-compare        with a cache: run it again without, to show what the cache gives\n"
+        "\n"
+        "speculation (the model's answer is the same; some steps write several tokens)\n"
+        "  --spec off|lookup      off (default) | lookup: guess the next tokens from a repeat in the prompt and the answer so far\n"
+        "  --spec-max N           tokens guessed per step (default 4);  --spec-match N  shortest repeat that makes a guess (2)\n"
         "\n"
         "serving\n"
         "  --eos-ids a,b          token ids that end an answer (default: the model's end-of-turn tokens)\n"
@@ -321,6 +330,13 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--ckpt-slots") { if (!num(a.c_str(), 0, 64, n)) return false; o.ckpt_slots = (int) n; }
         else if (a == "--ckpt-every") { if (!num(a.c_str(), 0, 1LL << 30, n)) return false; o.ckpt_every = (int) n; }
         else if (a == "--rs-snapshots") { if (!num(a.c_str(), 0, 64, n)) return false; o.n_rs_seq = (int) n; }
+        else if (a == "--spec") {
+            if (!(v = need(i, a.c_str()))) return false;
+            const std::string s2 = v;
+            if (s2 == "off" || s2 == "lookup") o.spec = s2; else { err = "--spec takes off or lookup"; return false; }
+        }
+        else if (a == "--spec-max") { if (!num(a.c_str(), 1, 16, n)) return false; o.spec_max = (int) n; }
+        else if (a == "--spec-match") { if (!num(a.c_str(), 1, 8, n)) return false; o.spec_match = (int) n; }
         else if (a == "--expert-cache") { if (!(v = need(i, a.c_str()))) return false; o.expert_cache = v; }
         else if (a == "--cache-slots") { if (!num(a.c_str(), 0, 4096, n)) return false; o.cache_slots = (int) n; }
         else if (a == "--cache-tokens") { if (!num(a.c_str(), 1, 4096, n)) return false; o.cache_tokens = (int) n; }
@@ -408,6 +424,52 @@ std::string meta_str(const llama_model* m, const char* key) {
     return n < 0 ? std::string() : std::string(buf);
 }
 
+// The guesses of `--spec lookup`: the longest repeat of the context's last tokens that occurred before, and what followed it.
+// Code, quotations, lists and the model's own habit of repeating a phrase give long repeats; a model's answer that never
+// repeats gives no guess, and costs nothing.
+class Lookup {
+public:
+    Lookup(int min_n, int max_n) : min_n_(min_n), max_n_(std::max(min_n, max_n)) { maps_.resize((size_t) max_n_ + 1); }
+
+    void clear() { for (auto& m : maps_) m.clear(); }
+
+    // Notes the n-grams that end at hist[end].
+    void add(const std::vector<llama_token>& hist, size_t end) {
+        for (int n = min_n_; n <= max_n_ && (size_t) n <= end + 1; ++n) maps_[(size_t) n][key(hist, end, n)] = (int32_t) end;
+    }
+
+    // The tokens of `corpus` that followed the latest repeat of the last n tokens of `ctx` (the longest n that repeats), at most k.
+    // `corpus` is what was add()ed: `ctx` itself (a repeat earlier than its own end), or another text, e.g. a hint.
+    void find(const std::vector<llama_token>& corpus, const std::vector<llama_token>& ctx, int k, std::vector<llama_token>& out) const {
+        out.clear();
+        if (ctx.size() < (size_t) min_n_) return;
+        const size_t end = ctx.size() - 1;
+        const bool self = &corpus == &ctx;
+        for (int n = max_n_; n >= min_n_; --n) {
+            if ((size_t) n > end + 1) continue;
+            auto it = maps_[(size_t) n].find(key(ctx, end, n));
+            if (it == maps_[(size_t) n].end()) continue;
+            const size_t at = (size_t) it->second;
+            if (self && at >= end) continue;
+            if (at >= corpus.size() || (size_t) n > at + 1) continue;
+            bool same = true;                       // a hash is not a proof
+            for (int j = 0; j < n && same; ++j) same = corpus[at - (size_t) j] == ctx[end - (size_t) j];
+            if (!same) continue;
+            for (size_t j = at + 1; j < corpus.size() && (int) out.size() < k; ++j) out.push_back(corpus[j]);
+            if (!out.empty()) return;
+        }
+    }
+
+private:
+    static uint64_t key(const std::vector<llama_token>& h, size_t end, int n) {
+        uint64_t x = 1469598103934665603ull;
+        for (int j = 0; j < n; ++j) { x ^= (uint64_t) (uint32_t) h[end - (size_t) j]; x *= 1099511628211ull; }
+        return x;
+    }
+    int min_n_, max_n_;
+    std::vector<std::unordered_map<uint64_t, int32_t>> maps_;
+};
+
 struct Ckpt {
     int32_t n = 0;                 // tokens in memory when it was taken
     std::vector<uint8_t> data;     // the recurrent state (llama_state_seq_*_ext, partial only)
@@ -421,6 +483,9 @@ struct Request {
     float penalty_repeat = 1.0f, penalty_freq = 0.0f, penalty_present = 0.0f;
     int penalty_last_n = 0;
     bool ckpt = true;
+    bool ignore_eos = false;   // --bench: exactly max_new tokens
+    std::vector<llama_token> hint;   // spec_hint=: tokens the answer is likely to contain (an edit of a text, a quotation)
+    bool spec = true;          // may use the engine's speculation
 };
 
 class Engine {
@@ -509,7 +574,7 @@ public:
         cp.n_batch = (uint32_t) o.n_batch;
         cp.n_ubatch = (uint32_t) std::min(o.n_ubatch, o.n_batch);
         cp.n_seq_max = 1;
-        cp.n_rs_seq = (uint32_t) o.n_rs_seq;
+        cp.n_rs_seq = (uint32_t) std::max(o.n_rs_seq, o.spec == "lookup" ? o.spec_max : 0);   // a rejected guess is rolled back from these
         cp.n_threads = o.threads > 0 ? o.threads : physical_cores();
         cp.n_threads_batch = o.threads_batch > 0 ? o.threads_batch : cp.n_threads;
         cp.flash_attn_type = o.flash < 0 ? LLAMA_FLASH_ATTN_TYPE_AUTO
@@ -599,6 +664,12 @@ public:
                 eos.insert(248044);
                 eos.insert(248046);
             }
+        }
+        spec_on = o.spec == "lookup";
+        if (spec_on && llama_n_rs_seq(ctx) < (uint32_t) o.spec_max) {
+            std::fprintf(stderr, "strata-q35: --spec lookup needs a model whose recurrent state can be rolled back (%u snapshots, %d wanted): off\n",
+                         (unsigned) llama_n_rs_seq(ctx), o.spec_max);
+            spec_on = false;
         }
         setup_hybrid();
         return true;
@@ -788,12 +859,13 @@ public:
     // Feeds toks[0, n) at positions live.size() ...; `want_logits` asks for the last one's logits.
     // Returns 0, or the llama_decode code; on an abort (2) `live` has grown by what the memory really holds.
     // With the expert cache, one llama_decode runs one micro-batch, so the routing it recorded is whole.
+    bool spec_on = false;    // --spec lookup, and the model can roll back a rejected guess
     bool hybrid_on = true;   // false while a measurement runs without the cache
     bool hx_live() const { return hx && hx->ready() && hybrid_on; }
 
-    int decode(const llama_token* toks, int n, bool want_logits) {
+    int decode(const llama_token* toks, int n, bool want_logits, bool all_logits = false) {
         if (!hx_live() || n <= cparams_ubatch) {
-            const int rc = decode_piece(toks, n, want_logits);
+            const int rc = decode_piece(toks, n, want_logits, all_logits);
             if (rc == 0 && hx_live()) hx->after_decode(n);
             return rc;
         }
@@ -806,7 +878,7 @@ public:
         return 0;
     }
 
-    int decode_piece(const llama_token* toks, int n, bool want_logits) {
+    int decode_piece(const llama_token* toks, int n, bool want_logits, bool all_logits = false) {
         const int32_t p0 = (int32_t) live.size();
         batch.n_tokens = n;
         for (int i = 0; i < n; ++i) {
@@ -814,7 +886,7 @@ public:
             batch.pos[i] = p0 + i;
             batch.n_seq_id[i] = 1;
             batch.seq_id[i][0] = 0;
-            batch.logits[i] = (want_logits && i == n - 1) ? 1 : 0;
+            batch.logits[i] = (want_logits && (all_logits || i == n - 1)) ? 1 : 0;
         }
         const int rc = llama_decode(ctx, batch);
         if (rc == 0) {
@@ -861,6 +933,7 @@ public:
         double prompt_ms = 0, decode_ms = 0;
         const char* finish = "length";
         long long resume = 0, read_n = 0;
+        long long drafts_offered = 0, drafts_accepted = 0;
     };
 
     struct Hooks {
@@ -934,20 +1007,98 @@ public:
         llama_sampler* smpl = make_sampler(r, ids);
         const auto t1 = Clock::now();
         bool ok = true;
+        const bool spec = spec_on && r.spec;
+        std::vector<llama_token> hist;             // the prompt and the answer so far: what memory holds, and the token to be fed next
+        Lookup lk(o.spec_match, std::max(o.spec_match, 4));
+        std::vector<llama_token> draft, step;
+        int cooldown = 0, backoff = 0;             // after a guess nobody believed: no guesses for a few tokens
+        Lookup lkh(o.spec_match, std::max(o.spec_match, 4));   // over the request's hint
+        if (spec) {
+            hist = ids;
+            for (size_t i = 0; i < hist.size(); ++i) lk.add(hist, i);
+            for (size_t i = 0; i < r.hint.size(); ++i) lkh.add(r.hint, i);
+        }
+        llama_token tok = llama_sampler_sample(smpl, ctx, -1);
         for (;;) {
-            const llama_token tok = llama_sampler_sample(smpl, ctx, -1);
             if (hk.token) hk.token(tok);
             ++res.produced;
-            if (eos.count(tok)) { res.finish = "stop"; break; }
+            if (!r.ignore_eos && eos.count(tok)) { res.finish = "stop"; break; }
             if (g_stop.load()) { res.finish = "cancel"; break; }
             if (res.produced >= r.max_new) { res.finish = "length"; break; }
-            const int rc = decode(&tok, 1, true);
+
+            draft.clear();
+            if (spec) {
+                hist.push_back(tok);
+                if (cooldown > 0) --cooldown;
+                else {
+                    const int kmax = (int) std::min<long long>(o.spec_max, r.max_new - res.produced - 1);
+                    if (!r.hint.empty()) lkh.find(r.hint, hist, kmax, draft);
+                    if (draft.empty()) lk.find(hist, hist, kmax, draft);
+                }
+                lk.add(hist, hist.size() - 1);
+            }
+            if (draft.empty()) {
+                const int rc = decode(&tok, 1, true);
+                if (rc == 2) { res.finish = "cancel"; break; }
+                if (rc != 0) { err = "decode failed (code " + std::to_string(rc) + ")"; ok = false; break; }
+                tok = llama_sampler_sample(smpl, ctx, -1);
+                continue;
+            }
+
+            // Feed the token and the guesses in one batch, then ask the model what follows each of them.  The answer is
+            // the same as without guesses: every token is sampled from the model's own row, in order, and a guess is only
+            // kept when the sampler produced exactly it.
+            const int k = (int) draft.size();
+            step.assign(1, tok);
+            step.insert(step.end(), draft.begin(), draft.end());
+            const int32_t p0 = (int32_t) live.size();
+            const int rc = decode(step.data(), k + 1, true, true);
             if (rc == 2) { res.finish = "cancel"; break; }
             if (rc != 0) { err = "decode failed (code " + std::to_string(rc) + ")"; ok = false; break; }
+            res.drafts_offered += k;
+            int n_acc = 0;
+            bool finished = false;
+            llama_token next = 0;
+            for (int i = 0; i <= k; ++i) {
+                next = llama_sampler_sample(smpl, ctx, i);
+                if (i == k || next != draft[(size_t) i]) break;       // the model said something else (or this was the bonus row)
+                ++n_acc;
+                hist.push_back(next);
+                lk.add(hist, hist.size() - 1);
+                if (hk.token) hk.token(next);
+                ++res.produced;
+                if (!r.ignore_eos && eos.count(next)) { res.finish = "stop"; finished = true; break; }
+                if (g_stop.load()) { res.finish = "cancel"; finished = true; break; }
+                if (res.produced >= r.max_new) { res.finish = "length"; finished = true; break; }
+            }
+            res.drafts_accepted += n_acc;
+            if (n_acc == 0) { backoff = std::min(std::max(1, backoff * 2), 16); cooldown = backoff; }
+            else backoff = 0;
+            if (n_acc < k && !drop_tail(p0 + 1 + n_acc, hist)) { err = "could not take back a rejected guess"; ok = false; break; }
+            if (finished) break;
+            tok = next;
         }
         res.decode_ms = ms_since(t1);
         llama_sampler_free(smpl);
         return ok;
+    }
+
+    // Memory holds live[0, len): keeps live[0, keep) of it.  `hist` has the tokens of positions 0 .. keep-1.
+    // The recurrent state steps back through the snapshots of --spec-max; past them it goes to a checkpoint and reads the rest again.
+    bool drop_tail(int32_t keep, const std::vector<llama_token>& hist) {
+        if (llama_memory_seq_rm(mem, 0, keep, -1)) {
+            live.resize((size_t) keep);
+            drop_ckpts_above(keep);
+            return true;
+        }
+        const int32_t at = rewind_to(keep);
+        if ((size_t) keep > hist.size()) return false;
+        for (int32_t pos = at; pos < keep;) {
+            const int32_t chunk = std::min<int32_t>(o.n_batch, keep - pos);
+            if (decode(hist.data() + pos, chunk, false) != 0) return false;
+            pos += chunk;
+        }
+        return (int32_t) live.size() == keep;
     }
 
     // ------------------------------------------------------------------------------ serve
@@ -1089,6 +1240,12 @@ public:
             else if (key == "penalty_present") r.penalty_present = fv;
             else if (key == "seed") r.seed = std::strtoull(val, nullptr, 10);
             else if (key == "ckpt") r.ckpt = std::atoi(val) != 0;
+            else if (key == "spec_hint") {
+                std::vector<int64_t> h;
+                std::string he;
+                if (!parse_i64_list(val, h, he)) { std::printf("ERR bad request: spec_hint: %s\n", he.c_str()); std::fflush(stdout); return; }
+                r.hint = to_tokens(h);
+            }
             // other keys (cvec, pcie_frac, spec_min_p, ...) belong to the `strata` engine: ignored
         }
         std::vector<int64_t> raw;
@@ -1133,8 +1290,8 @@ public:
         // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused>
         //      [hits] [lookups] [RAM blobs] [file blobs] [file MB] [prompt tokens read] [offloaded]
         // with the expert cache: the expert uses the card served, all expert uses, and the experts copied into the cache
-        std::printf("DONE %lld %lld %.1f %.1f %s 0 0 %lld %llu %llu 0 0 0.0 %lld %llu\n", res.produced, (long long) n, res.prompt_ms,
-                    res.decode_ms, res.finish, res.resume, (unsigned long long) (cs1.hits - cs0.hits),
+        std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %llu %llu 0 0 0.0 %lld %llu\n", res.produced, (long long) n, res.prompt_ms,
+                    res.decode_ms, res.finish, res.drafts_accepted, res.drafts_offered, res.resume, (unsigned long long) (cs1.hits - cs0.hits),
                     (unsigned long long) (cs1.lookups - cs0.lookups), res.read_n, (unsigned long long) (cs1.swaps - cs0.swaps));
         std::fflush(stdout);
     }
@@ -1314,44 +1471,38 @@ public:
 
     struct BenchRow {
         double pp_ms = 0, tg_ms = 0;
-        std::vector<double> tok_ms;
+        long long produced = 0, read_n = 0, drafts_offered = 0, drafts_accepted = 0;
         q35::CacheStats cs;
         double upkeep_ms = 0;
     };
 
-    // One prompt of `prompt`, then `n_gen` greedy tokens, timed.
+    // One prompt of `prompt`, then `n_gen` tokens (the model's own end token ignored), timed as a request is.
     bool bench_once(const std::vector<llama_token>& prompt, int n_gen, BenchRow& row) {
         clear_all();
-        g_stop.store(false);
-        const int n = (int) prompt.size();
-        const auto t0 = Clock::now();
-        for (int pos = 0; pos < n;) {
-            const int chunk = std::min(o.n_batch, n - pos);
-            if (decode(prompt.data() + pos, chunk, pos + chunk == n) != 0) return false;
-            pos += chunk;
-        }
-        row.pp_ms = ms_since(t0);
-        if (hx_live()) hx->reset_stats();
         Request r;
-        llama_sampler* smpl = make_sampler(r, prompt);
-        const auto t1 = Clock::now();
-        bool ok = true;
-        for (int i = 0; i < n_gen; ++i) {
-            const llama_token tok = llama_sampler_sample(smpl, ctx, -1);
-            const auto ta = Clock::now();
-            if (decode(&tok, 1, true) != 0) { ok = false; break; }
-            row.tok_ms.push_back(ms_since(ta));
+        r.max_new = n_gen;
+        r.ckpt = false;
+        r.ignore_eos = true;
+        Result res;
+        Hooks hk;
+        std::string err;
+        const q35::CacheStats cs0 = hx_live() ? hx->stats() : q35::CacheStats();
+        const double up0 = hx_live() ? hx->update_ms() : 0.0;
+        if (!run(prompt, r, res, hk, err)) { std::fprintf(stderr, "strata-q35: bench: %s\n", err.c_str()); return false; }
+        row.pp_ms = res.prompt_ms;
+        row.tg_ms = res.decode_ms;
+        row.produced = res.produced;
+        row.read_n = res.read_n;
+        row.drafts_offered = res.drafts_offered;
+        row.drafts_accepted = res.drafts_accepted;
+        if (hx_live()) {
+            const q35::CacheStats cs1 = hx->stats();
+            row.cs.hits = cs1.hits - cs0.hits;
+            row.cs.lookups = cs1.lookups - cs0.lookups;
+            row.cs.swaps = cs1.swaps - cs0.swaps;
+            row.upkeep_ms = hx->update_ms() - up0;
         }
-        row.tg_ms = ms_since(t1);
-        llama_sampler_free(smpl);
-        if (hx_live()) { row.cs = hx->stats(); row.upkeep_ms = hx->update_ms(); }
-        return ok;
-    }
-
-    static double percentile(std::vector<double> v, double q) {
-        if (v.empty()) return 0;
-        std::sort(v.begin(), v.end());
-        return v[(size_t) std::min<double>((double) v.size() - 1, std::floor(q * (double) v.size()))];
+        return true;
     }
 
     // Returns the median generation speed, tokens/s (0: failed).
@@ -1359,18 +1510,19 @@ public:
         std::vector<double> speeds;
         for (int rep = 1; rep <= o.bench_reps; ++rep) {
             BenchRow row;
-            if (hx_live()) hx->reset_stats();
-            if (!bench_once(prompt, o.bench_tg, row)) { std::fprintf(stderr, "strata-q35: bench: a decode failed\n"); return 0; }
-            const double pp = row.pp_ms > 0 ? (double) prompt.size() * 1000.0 / row.pp_ms : 0.0;
-            const double tg = row.tg_ms > 0 ? (double) row.tok_ms.size() * 1000.0 / row.tg_ms : 0.0;
+            if (!bench_once(prompt, o.bench_tg, row)) return 0;
+            const double pp = row.pp_ms > 0 ? (double) row.read_n * 1000.0 / row.pp_ms : 0.0;
+            const double tg = row.tg_ms > 0 ? (double) row.produced * 1000.0 / row.tg_ms : 0.0;
             speeds.push_back(tg);
-            std::printf("bench[%s] %d/%d  prompt %zu tokens %.1f tok/s | generation %zu tokens %.2f tok/s (%.1f ms/token, median %.1f, p95 %.1f)",
-                        label, rep, o.bench_reps, prompt.size(), pp, row.tok_ms.size(), tg,
-                        row.tok_ms.empty() ? 0.0 : row.tg_ms / (double) row.tok_ms.size(), percentile(row.tok_ms, 0.5), percentile(row.tok_ms, 0.95));
+            std::printf("bench[%s] %d/%d  prompt %zu tokens %.1f tok/s | generation %lld tokens %.2f tok/s (%.1f ms/token)",
+                        label, rep, o.bench_reps, prompt.size(), pp, row.produced, tg,
+                        row.produced ? row.tg_ms / (double) row.produced : 0.0);
             if (hx_live() && hx->caching())
                 std::printf(" | cache: %.1f%% hits, %.2f copies/token, %.2f ms upkeep/token, %d/%d slots",
-                            100.0 * row.cs.rate(), row.tok_ms.empty() ? 0.0 : (double) row.cs.swaps / (double) row.tok_ms.size(),
-                            row.tok_ms.empty() ? 0.0 : row.upkeep_ms / (double) (row.tok_ms.size() + 1), hx->slots_used(), hx->slots_total());
+                            100.0 * row.cs.rate(), row.produced ? (double) row.cs.swaps / (double) row.produced : 0.0,
+                            row.produced ? row.upkeep_ms / (double) row.produced : 0.0, hx->slots_used(), hx->slots_total());
+            if (spec_on)
+                std::printf(" | speculation: %lld of %lld guesses right", row.drafts_accepted, row.drafts_offered);
             std::printf("\n");
             std::fflush(stdout);
         }
@@ -1408,21 +1560,25 @@ public:
                     o.threads > 0 ? o.threads : physical_cores());
         double with_cache = 0, without = 0;
         const bool cached = hx && hx->caching();
-        if (cached) with_cache = bench_run("cache", prompt);
-        else if (hx) with_cache = bench_run("sim", prompt);
-        else with_cache = bench_run("usual", prompt);
+        const char* label = cached ? "cache" : spec_on ? "spec" : hx ? "sim" : "usual";
+        if (cached && spec_on) label = "cache+spec";
+        with_cache = bench_run(label, prompt);
         if (hx) { std::fflush(stdout); print_sims(stdout); }
-        if (cached && o.bench_compare) {
-            // the usual graphs on a fresh context: what llama.cpp alone does with the same placement
-            hybrid_on = false;
-            hx->detach(model);
+        if ((cached || spec_on) && o.bench_compare) {
+            // what llama.cpp alone does with the same placement: the usual graphs, no guesses, on a fresh context
+            const bool had_spec = spec_on;
+            const uint32_t had_rs = saved_cp.n_rs_seq;
+            if (cached) { hybrid_on = false; hx->detach(model); }
+            spec_on = false;
+            saved_cp.n_rs_seq = (uint32_t) o.n_rs_seq;
             reset_context();
             without = bench_run("usual", prompt);
-            hx->attach(model);
-            hybrid_on = true;
+            saved_cp.n_rs_seq = had_rs;
+            spec_on = had_spec;
+            if (cached) { hx->attach(model); hybrid_on = true; }
             reset_context();
             if (with_cache > 0 && without > 0)
-                std::printf("bench: the cache makes generation %.2fx the speed of the usual graphs (%.2f vs %.2f tok/s)\n", with_cache / without,
+                std::printf("bench: with %s generation is %.2fx the speed of the usual graphs (%.2f vs %.2f tok/s)\n", label, with_cache / without,
                             with_cache, without);
         }
         return with_cache > 0 ? 0 : 1;

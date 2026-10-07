@@ -400,7 +400,7 @@ class Q35ExpertCache(unittest.TestCase):
         self.assertIn("bench[cache] 2/2", out)
         self.assertIn("bench[usual] 2/2", out)
         self.assertIn("% hits", out)
-        self.assertIn("the cache makes generation", out)
+        self.assertIn("with cache generation", out)
 
     def test_bad_cache_options_are_refused(self):
         for args in (["--expert-cache", "lots"], ["--expert-cache", "off", "--cache-slots", "2"], ["--sim-cache", "0"]):
@@ -414,6 +414,101 @@ class Q35ExpertCache(unittest.TestCase):
         self.assertEqual(r.returncode, 0, err[-400:])
         self.assertIn("expert cache check passed", err)
         self.assertIn("expert cache: 12 slots in 4 layers", err)
+
+
+SPEC = ["--spec", "lookup", "--spec-match", "1", "--spec-max", "4"]
+
+
+@unittest.skipUnless(READY, "set STRATA_Q35_ENGINE and STRATA_Q35_MODEL_DIR (see the module docstring)")
+class Q35Speculation(unittest.TestCase):
+    """`--spec lookup`: guesses from the context, checked in one batch, a rejected guess rolled back from the recurrent
+    state's snapshots.  The answer must be the one without guesses; a request's `spec_hint` (tokens the answer is likely to
+    contain) gives the tests guesses that are right, partly wrong, and late."""
+
+    @staticmethod
+    def hinted(tokens, mode):
+        hint = list(tokens)
+        if mode == "wrong now and then":
+            for j in range(5, len(hint), 7):
+                hint[j] = (hint[j] + 1) % 290
+        elif mode == "late, with a hole":
+            hint = hint[3:]
+            del hint[10:12]
+        return hint
+
+    def test_the_answer_is_the_same_whatever_the_guesses(self):
+        e = Engine(*SPEC)
+        try:
+            for r in REF:
+                for mode in ("right", "wrong now and then", "late, with a hole"):
+                    hint = ",".join(map(str, self.hinted(r["gen"], mode)))
+                    got = e.gen(r["ids"], len(r["gen"]), keys="spec_hint=" + hint)
+                    self.assertEqual(got["tokens"], r["gen"], f"{len(r['ids'])}-token prompt, hint {mode}")
+                    accepted, offered = int(got["done"][6]), int(got["done"][7])
+                    self.assertLessEqual(accepted, offered)
+                    if mode == "right":
+                        self.assertGreater(offered, 0)
+                        self.assertEqual(accepted, offered)      # every guess was the model's own token
+                    elif mode == "wrong now and then":
+                        self.assertLess(accepted, offered)       # some were rolled back, and the answer is still right
+        finally:
+            e.close()
+
+    def test_sampling_with_a_seed_gives_the_same_tokens(self):
+        keys = "temperature=0.8 top_k=30 seed=7"
+        want = cold(REF[1]["ids"], 40, keys=keys)["tokens"]
+        e = Engine(*SPEC)
+        try:
+            for mode in ("right", "wrong now and then"):
+                hint = ",".join(map(str, self.hinted(want, mode)))
+                got = e.gen(REF[1]["ids"], 40, keys=keys + " spec_hint=" + hint)
+                self.assertEqual(got["tokens"], want, mode)
+        finally:
+            e.close()
+
+    def test_a_model_that_never_repeats_gets_no_guess_right_and_the_default_is_off(self):
+        e = Engine(*SPEC)
+        try:
+            got = e.gen(REF[0]["ids"], N_GEN)
+            self.assertEqual(got["tokens"], REF[0]["gen"])
+            self.assertEqual(got["done"][6], "0")                # a random model repeats no phrase: whatever was guessed was wrong
+        finally:
+            e.close()
+        e = Engine()
+        try:
+            hint = ",".join(map(str, REF[0]["gen"]))
+            got = e.gen(REF[0]["ids"], N_GEN, keys="spec_hint=" + hint)
+            self.assertEqual((got["tokens"], got["done"][6:8]), (REF[0]["gen"], ["0", "0"]))
+        finally:
+            e.close()
+
+    def test_a_conversation_goes_on_after_guesses(self):
+        p, extra = REF[1]["ids"], [11, 12, 13, 14, 15]
+        e = Engine(*SPEC)
+        try:
+            hint = ",".join(map(str, REF[1]["gen"]))
+            first = e.gen(p, N_GEN, keys="spec_hint=" + hint)
+            turn2 = p + first["tokens"] + extra
+            got = e.gen(turn2)
+            self.assertIn(got["resume"], (len(p) + N_GEN - 1, len(p) + N_GEN))   # memory holds the answer (all of it if the last token was a guess)
+            self.assertEqual(got["tokens"], cold(turn2)["tokens"])
+        finally:
+            e.close()
+
+    def test_guesses_and_the_expert_cache_together(self):
+        e = Engine(*SPEC, *CACHE, "--cache-slots", "3", "--cache-tokens", "64")
+        try:
+            for r in REF:
+                hint = ",".join(map(str, self.hinted(r["gen"], "wrong now and then")))
+                got = e.gen(r["ids"], len(r["gen"]), keys="spec_hint=" + hint)
+                self.assertEqual(got["tokens"], r["gen"])
+        finally:
+            e.close()
+
+    def test_a_bad_spec_option_is_refused(self):
+        for args in (["--spec", "fast"], ["--spec-max", "0"], ["--spec-match", "9"]):
+            r = subprocess.run([ENGINE, "--native", GGUF, "-p", "hi", *args], capture_output=True, timeout=60)
+            self.assertEqual(r.returncode, 2, args)
 
 
 if __name__ == "__main__":
