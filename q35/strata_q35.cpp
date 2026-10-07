@@ -486,6 +486,11 @@ public:
         else {
             for (llama_token t = 0; t < n_vocab; ++t)
                 if (llama_vocab_is_eog(vocab, t)) eos.insert(t);
+            // the Qwen3.5 / 3.6 vocabulary: <|endoftext|> and <|im_end|> end an answer, and serve/server.py stops on both
+            if (arch != "qwen4exp" && n_vocab > 248046 && (arch == "qwen35moe" || arch == "qwen35" || arch == "qwen3next")) {
+                eos.insert(248044);
+                eos.insert(248046);
+            }
         }
         return true;
     }

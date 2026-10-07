@@ -134,6 +134,7 @@ class Q35Engine(unittest.TestCase):
         e.gen([5, 6, 7, 8], 4)
         e.send("QUIT")
         self.assertEqual(e.proc.wait(timeout=20), 0)   # a reader thread blocked in std::cin used to hold exit() for ever
+        e.close()
 
     def test_greedy_tokens_are_pytorchs(self):
         e = Engine()
