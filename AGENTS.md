@@ -10,6 +10,11 @@ protocol, so the server runs on it unchanged): [docs/Q35.md](docs/Q35.md), and f
 [docs/RHEL7.md](docs/RHEL7.md). Its tests: `python -m unittest tools.test_q35_setup` (no engine needed) and
 `tools/test_q35.py` (needs the engine and the tiny model from `tools/q35_tiny_model.py`).
 
+The Python server (`serve/`) and `tools/strata_tokenizer.py` use **only the standard library**: chat templates are
+rendered by `serve/jinja_lite.py`, the tokenizer's Unicode classes come from `tools/unicode_classes.py` (made by
+`tools/gen_unicode_classes.py`). Do not import `jinja2` or `regex` there. `python -m unittest serve.test_jinja_lite
+serve.test_tokenizer_classes` hold both to the real packages when they are installed.
+
 ## Installing Strata for a user
 
 Follow **[docs/AI_SETUP.md](docs/AI_SETUP.md)**: check the PC, pick the model by RAM, run setup non-interactively,

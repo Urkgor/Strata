@@ -4,7 +4,8 @@ Everything here is text: no model, no GPU. The engine consumes token ids and pro
 
   * normalizes OpenAI Chat Completions and Anthropic Messages requests into the chat template's message form,
   * renders the model's own Jinja chat template (pack `tokenizer/chat_template.jinja`) exactly as Hugging Face
-    does (checked against the pack's `chat_golden.json`, 10 cases incl. thinking and tools),
+    does (checked against the pack's `chat_golden.json`, 10 cases incl. thinking and tools; the renderer is
+    serve/jinja_lite.py, standard library only, held to Jinja2's output by serve/test_jinja_lite.py),
   * parses the streamed output incrementally into reasoning (`<think>...</think>`), content and tool calls in
     the template's XML form (`<tool_call><function=NAME><parameter=P>VALUE</parameter>...</function></tool_call>`),
     never emitting a partial tag to the client.
@@ -22,28 +23,24 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import jinja2
-from jinja2.sandbox import ImmutableSandboxedEnvironment
+from serve import jinja_lite
 
 
 # ------------------------------------------------------------------------------------------------ template
-class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
+class TemplateRequestError(jinja_lite.TemplateError, ValueError):
     """The template refused the request's messages (e.g. "No user query found in messages."): a ValueError, so the
     client gets a 400 with the template's message instead of a dropped connection (#365)."""
 
 
 class ChatTemplate:
-    """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
+    """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template - by
+    serve/jinja_lite.py, so the server needs no Jinja2 (its `tojson` is transformers' too: not HTML-escaped)."""
 
     def __init__(self, path: str | Path):
         def raise_exception(message):
             raise TemplateRequestError(message)
 
-        def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
-            return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
-
-        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
-        env.filters["tojson"] = tojson
+        env = jinja_lite.Environment(trim_blocks=True, lstrip_blocks=True)
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)

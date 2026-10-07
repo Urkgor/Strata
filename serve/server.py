@@ -2577,9 +2577,9 @@ class Service:
                 if record is None:
                     return None
                 return {k: v for k, v in record.items() if not k.startswith("_")}
-            return [{k: v for k, v in r.items()
-                     if k not in ("input", "output", "reasoning", "response") and not k.startswith("_")}
-                    | {"wallclock_s": r.get("wallclock_s", round(time.perf_counter() - r["_clock"], 3))}
+            return [{**{k: v for k, v in r.items()
+                        if k not in ("input", "output", "reasoning", "response") and not k.startswith("_")},
+                     "wallclock_s": r.get("wallclock_s", round(time.perf_counter() - r["_clock"], 3))}
                     for r in reversed(records)]
 
     def metrics(self, all_requests=False) -> dict:
@@ -3686,7 +3686,7 @@ def make_handler(svc: Service):
                     try:
                         readable, _, _ = select.select([sock], [], [], 0)
                         gone = bool(readable) and sock.recv(1, socket.MSG_PEEK) == b""
-                    except (ConnectionError, TimeoutError):
+                    except (ConnectionError, TimeoutError, socket.timeout):    # (socket.timeout is not TimeoutError before 3.10)
                         gone = True
                     except (OSError, ValueError):            # the socket was closed here: the request has ended
                         return

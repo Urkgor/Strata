@@ -17,9 +17,8 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 import sys
-
-import regex
 
 # ------------------------------------------------------------------ byte <-> unicode (GPT-2 byte-level BPE)
 def bytes_to_unicode() -> dict[int, str]:
@@ -64,6 +63,69 @@ QWEN35_PATTERN = (
 )
 
 
+# ------------------------------------------------------------------ the pattern with the standard library's `re`
+# The pattern is written the way llama.cpp and the `regex` module read it - `\p{L}`, `\p{N}`, `\p{M}`, `\s` as the
+# Unicode classes - and `re` has none of them.  compile_pattern() turns each into a character class built from the
+# ranges in unicode_classes.py (written by gen_unicode_classes.py from the `regex` module), so the server needs
+# nothing but Python, and the same text splits the same way on every Python version.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from unicode_classes import CLASSES as _CLASSES  # noqa: E402
+
+_PROPERTY = {"L": "L", "M": "M", "N": "N"}
+
+
+def _class_body(name: str) -> str:
+    r"""The inside of a [...] for one class: `\U0000004a-\U0000005a\U0000005f...`"""
+    return "".join("\\U%08x" % lo if lo == hi else "\\U%08x-\\U%08x" % (lo, hi) for lo, hi in _CLASSES[name])
+
+
+def translate_pattern(pattern: str) -> str:
+    r"""`\p{L}` `\p{N}` `\p{M}` `\s` `\S` `\P{..}` -> character classes `re` understands; the rest is kept.
+    Inside a [...] a class is spliced in (`\p{N}` and `\s`); a negated one (`\P`, `\S`) is refused there."""
+    out = []
+    i = 0
+    in_class = False
+    n = len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "\\" and i + 1 < n:
+            d = pattern[i + 1]
+            if d in "pP":
+                j = pattern.find("}", i)
+                if pattern[i + 2:i + 3] != "{" or j < 0 or pattern[i + 3:j] not in _PROPERTY:
+                    raise ValueError("unsupported property escape in %r at %d" % (pattern, i))
+                body = _class_body(_PROPERTY[pattern[i + 3:j]])
+                negated = d == "P"
+                i = j + 1
+            elif d in "sS":
+                body = _class_body("s")
+                negated = d == "S"
+                i += 2
+            else:
+                out.append(pattern[i:i + 2])
+                i += 2
+                continue
+            if in_class:
+                if negated:
+                    raise ValueError("a negated class inside [...] is not supported: %r" % (pattern,))
+                out.append(body)
+            else:
+                out.append("[" + ("^" if negated else "") + body + "]")
+            continue
+        if c == "[" and not in_class:
+            in_class = True
+        elif c == "]" and in_class:
+            in_class = False
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def compile_pattern(pattern: str):
+    r"""`re.compile` of a `regex`-style pattern that uses \p{L} \p{N} \p{M} \s (see translate_pattern)."""
+    return re.compile(translate_pattern(pattern))
+
+
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None):
@@ -86,7 +148,7 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        self._re = compile_pattern(QWEN35_PATTERN)
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -107,7 +169,7 @@ class Tokenizer:
                     self.special_tokens[tokens[i]] = i
         always = [t for t, i in self.special_tokens.items() if token_types and token_types[i] == 4]
         self.control_tokens = [t for t, i in self.special_tokens.items() if token_types and token_types[i] == 3]
-        # Longest literal first, or `<|im_end|>` could match a shorter prefix of itself.  `regex.escape` so a
+        # Longest literal first, or `<|im_end|>` could match a shorter prefix of itself.  `re.escape` so a
         # token containing regex metacharacters (several do: `<|`, `[`, `(`) is matched literally.
         self._always_re = self._alt(always)
         self._special_re = self._alt(list(self.special_tokens))
@@ -116,7 +178,7 @@ class Tokenizer:
     def _alt(literals: list[str]):
         if not literals:
             return None
-        return regex.compile("|".join(regex.escape(s) for s in sorted(literals, key=len, reverse=True)))
+        return re.compile("|".join(re.escape(s) for s in sorted(literals, key=len, reverse=True)))
 
     # -------------------------------------------------------------- constructors
     @classmethod
@@ -295,7 +357,8 @@ def extract(gguf_path, out_dir) -> dict:
     from gguf_reader import GGUFFile
     tpl = GGUFFile(pathlib.Path(gguf_path)).metadata.get("tokenizer.chat_template")
     if tpl:
-        (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
+        with open(out / "chat_template.jinja", "w", encoding="utf-8", newline="\n") as f:    # (Path.write_text has no newline= before 3.10)
+            f.write(tpl)
     return cfg
 
 

@@ -3793,7 +3793,7 @@ class AnswerBeforeTheBody(unittest.TestCase):
                         if not (chunk := s.recv(65536)):
                             break
                         answer += chunk
-                    except TimeoutError:
+                    except (TimeoutError, socket.timeout):       # (the two are one class from Python 3.10)
                         s.sendall(b"a")                      # a byte every 0.2 s keeps each read of the server alive
             self.assertEqual(answer.split(b"\r\n", 1)[0], b"HTTP/1.0 401 Unauthorized")
             self.assertLess(time.monotonic() - started, 5)

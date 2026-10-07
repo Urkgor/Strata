@@ -169,7 +169,7 @@ def synthetic_tokenizer(seed=268, n_merges=1500):
     have, merges = set(tokens), []
     words = []
     for _ in range(60):
-        for piece in ST.regex.compile(ST.QWEN35_PATTERN).findall(random_text(rng, 10)):
+        for piece in ST.compile_pattern(ST.QWEN35_PATTERN).findall(random_text(rng, 10)):
             words.append([ST.BYTE_TO_UNICODE[b] for b in piece.encode("utf-8")])
     words = [w for w in words if len(w) > 1]
     while len(merges) < n_merges:
@@ -206,7 +206,7 @@ class HeapBpe(unittest.TestCase):
         rng = random.Random(1)
         import strata_tokenizer as ST
         for _ in range(300):
-            for piece in ST.regex.compile(ST.QWEN35_PATTERN).findall(random_text(rng, 8)):
+            for piece in ST.compile_pattern(ST.QWEN35_PATTERN).findall(random_text(rng, 8)):
                 word = "".join(ST.BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
                 tok.HEAP_MIN = 10 ** 9
                 try:
