@@ -140,10 +140,13 @@ Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add a
 ## Qwen3.6-35B-A3B
 
 Strata also has an engine for **[Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)**, `strata-q35`: the same
-server, web app and APIs, the model's dense part on the graphics card and its experts in RAM, built from source on Linux
-(it is written to build on RHEL / CentOS 7 too). It is new and was checked against PyTorch on a tiny model of the same
-architecture, not yet on the real one: [what was checked and what was not](docs/Q35.md#what-was-checked-and-what-was-not),
-[how to build and run it](docs/Q35.md), [RHEL / CentOS 7](docs/RHEL7.md).
+server, web app and APIs, the model's dense part on the graphics card and its experts in RAM, with **a cache of the busiest
+experts on the card so that the CPU computes only the others** ([the expert cache](docs/Q35.md#the-expert-cache-what-makes-it-more-than-llamacpp)),
+built from source on Linux (it is written to build on RHEL / CentOS 7 too). It is new and was checked against PyTorch on a tiny
+model of the same architecture, not yet on the real one or on a graphics card, so its speed is not measured yet:
+[what was checked and what was not](docs/Q35.md#what-was-checked-and-what-was-not),
+[how to build and run it](docs/Q35.md), [how to measure what the cache gives you](docs/Q35.md#measuring-what-the-cache-gives-you),
+[RHEL / CentOS 7](docs/RHEL7.md).
 
 ## Using it
 
