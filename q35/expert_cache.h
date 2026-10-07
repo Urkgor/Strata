@@ -52,6 +52,7 @@ public:
         }
         slot_of_.assign((size_t) n_layer * (size_t) n_expert, -1);
         expert_at_.assign((size_t) off_[(size_t) n_layer], -1);
+        locked_.assign((size_t) off_[(size_t) n_layer], 0);
         score_.assign((size_t) n_layer * (size_t) n_expert, 0.0);
         stamp_.assign((size_t) n_layer * (size_t) n_expert, 0);
         missed_.resize((size_t) n_layer);
@@ -75,6 +76,24 @@ public:
     // the uses counted for an expert, in "uses now" (older ones weigh less)
     double uses(int l, int e) const { return score_[(size_t) l * (size_t) n_expert_ + (size_t) e] / inc_; }
 
+    // An expert placed by hand: it takes a free slot of layer l and is never replaced.  Returns true when a slot was filled (the caller copies
+    // the expert's weights into it); false when it was already cached (it is locked now) or the layer has no free slot left.
+    bool pin(int l, int e, CacheSwap& out) {
+        const int have = slot_of(l, e);
+        if (have >= 0) { locked_[(size_t) off_[(size_t) l] + (size_t) have] = 1; return false; }
+        for (int s = 0; s < slots_[(size_t) l]; ++s) {
+            const size_t at = (size_t) off_[(size_t) l] + (size_t) s;
+            if (expert_at_[at] >= 0 || locked_[at]) continue;
+            put(l, s, e);
+            locked_[at] = 1;
+            out.layer = l; out.slot = s; out.in = e; out.out = -1;
+            return true;
+        }
+        return false;
+    }
+    bool locked(int l, int s) const { return locked_[(size_t) off_[(size_t) l] + (size_t) s] != 0; }
+    // static: end_step() never moves anything (the cache is what was placed at the start)
+    void set_static(bool on) { static_ = on; }
     void set_fill_swaps(int n) { params_.fill_swaps = std::max(0, n); }
     void set_half_life(double tokens) {
         params_.half_life = std::max(1.0, tokens);
@@ -111,6 +130,7 @@ public:
     // this table.  The caller copies each swap's expert into its slot and rewrites the layer's tables.
     void end_step(std::vector<CacheSwap>& out, int budget = -1) {
         out.clear();
+        if (static_) { for (auto& m : missed_) m.clear(); return; }
         if (budget < 0) budget = full() ? params_.swaps_per_step : params_.fill_swaps;
         struct Cand { double gain; bool fill; int layer, expert, slot; };
         std::vector<Cand> cands;
@@ -126,8 +146,8 @@ public:
             std::vector<std::pair<double, int>> held;   // (score, slot)
             for (int s = 0; s < slots_[(size_t) l]; ++s) {
                 const int e = expert_at_[(size_t) off_[(size_t) l] + (size_t) s];
-                if (e < 0) frees.push_back(s);
-                else held.emplace_back(score_[base + (size_t) e], s);
+                if (e < 0) { if (!locked_[(size_t) off_[(size_t) l] + (size_t) s]) frees.push_back(s); }
+                else if (!locked_[(size_t) off_[(size_t) l] + (size_t) s]) held.emplace_back(score_[base + (size_t) e], s);
             }
             std::sort(held.begin(), held.end());
             size_t fi = 0, hi = 0;
@@ -191,12 +211,14 @@ public:
             std::vector<int> order((size_t) n_expert_);
             for (int e = 0; e < n_expert_; ++e) order[(size_t) e] = e;
             std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return score_[base + (size_t) a] > score_[base + (size_t) b]; });
+            size_t rank = 0;
             for (int s = 0; s < slots_[(size_t) l]; ++s) {
-                const int e = order[(size_t) s];
-                if (score_[base + (size_t) e] <= 0.0 || expert_at(l, s) == e || slot_of(l, e) >= 0) continue;
+                if (expert_at(l, s) >= 0 || locked_[(size_t) off_[(size_t) l] + (size_t) s]) continue;
+                while (rank < order.size() && score_[base + (size_t) order[rank]] > 0.0 && slot_of(l, order[rank]) >= 0) ++rank;
+                if (rank >= order.size() || score_[base + (size_t) order[rank]] <= 0.0) break;
                 CacheSwap sw;
-                sw.layer = l; sw.slot = s; sw.in = e; sw.out = expert_at(l, s);
-                put(l, s, e);
+                sw.layer = l; sw.slot = s; sw.in = order[rank++]; sw.out = -1;
+                put(l, s, sw.in);
                 out.push_back(sw);
             }
         }
@@ -214,6 +236,8 @@ private:
     CacheParams params_;
     std::vector<int> slots_, off_;
     std::vector<int> slot_of_, expert_at_;
+    std::vector<char> locked_;
+    bool static_ = false;
     std::vector<double> score_;
     std::vector<uint64_t> stamp_;
     std::vector<std::vector<int>> missed_;

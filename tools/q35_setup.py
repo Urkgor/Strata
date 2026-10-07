@@ -107,6 +107,10 @@ def engine_args(a: argparse.Namespace, gguf: Path, out: Path | None = None) -> l
         args += ["--expert-cache", a.expert_cache]
         if out is not None:
             args += ["--cache-profile", str(out / "hot-experts.bin")]   # what the model asked for: a warm cache at the next start
+        if a.cache_hot:
+            args += ["--cache-hot", str(Path(a.cache_hot).expanduser().resolve())]
+        if a.cache_static:
+            args.append("--cache-static")
     args += list(a.engine_arg or [])
     return args
 
@@ -168,6 +172,9 @@ def parse(argv=None) -> argparse.Namespace:
                     help="the experts the model asks for most are copied to the card and computed there, the CPU only does the "
                          "others (default auto: the card's free memory; off: llama.cpp's placement alone)")
     ap.add_argument("--no-expert-cache", dest="expert_cache", action="store_const", const="off", help="same as --expert-cache off")
+    ap.add_argument("--cache-hot", default=None, metavar="FILE",
+                    help="experts you place in the cache yourself, locked there: lines `layer expert expert ...` (docs/Q35.md)")
+    ap.add_argument("--cache-static", action="store_true", help="with --cache-hot: the cache is that list (and the profile's busiest) and nothing moves")
     ap.add_argument("--engine-arg", action="append", metavar="ARG", help="another strata-q35 argument (repeatable)")
     ap.add_argument("--force", action="store_true", help="write the files even for another architecture")
     a = ap.parse_args(argv)
@@ -175,6 +182,8 @@ def parse(argv=None) -> argparse.Namespace:
         ap.error("--cpu-moe and --n-cpu-moe are alternatives")
     if a.expert_cache not in ("auto", "off", "sim") and not (a.expert_cache.isdigit() and int(a.expert_cache) > 0):
         ap.error("--expert-cache takes auto, off, sim or a size in MiB")
+    if (a.cache_hot or a.cache_static) and a.expert_cache in ("off", "sim"):
+        ap.error("--cache-hot and --cache-static need the expert cache (--expert-cache auto or a size)")
     return a
 
 

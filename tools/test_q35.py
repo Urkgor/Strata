@@ -413,6 +413,59 @@ class Q35ExpertCache(unittest.TestCase):
         self.assertIn("% hits", out)
         self.assertIn("with cache generation", out)
 
+    @staticmethod
+    def dump_of(path):
+        out = {}
+        for line in Path(path).read_text().splitlines():
+            if line.strip() and not line.startswith("#"):
+                v = [int(x) for x in line.split()]
+                out[v[0]] = set(v[1:])
+        return out
+
+    def test_experts_placed_by_hand_stay_and_are_dumped(self):
+        with tempfile.TemporaryDirectory() as d:
+            hot, dump = str(Path(d) / "hot.txt"), str(Path(d) / "dump.txt")
+            Path(hot).write_text("# placed by hand\n0 1 2\n1: 3\n2, 4, 5   # commas and colons do as spaces\n")
+            e = Engine(*CACHE, "--cache-slots", "3", "--cache-tokens", "64", "--cache-hot", hot, "--cache-dump", dump)
+            try:
+                for _ in range(3):
+                    for r in REF:
+                        self.assertEqual(e.gen(r["ids"], len(r["gen"]))["tokens"], r["gen"])   # the answers do not depend on it
+            finally:
+                e.close()
+            got = self.dump_of(dump)
+            self.assertTrue({1, 2} <= got[0] and 3 in got[1] and {4, 5} <= got[2], got)         # the traffic never displaced them
+            self.assertTrue(all(len(v) <= 3 for v in got.values()), got)
+
+    def test_a_static_cache_is_the_hot_file_and_nothing_else(self):
+        with tempfile.TemporaryDirectory() as d:
+            hot, dump = str(Path(d) / "hot.txt"), str(Path(d) / "dump.txt")
+            Path(hot).write_text("0 1 2\n1 3\n2 4 5\n3 0\n")
+            e = Engine(*CACHE, "--cache-slots", "3", "--cache-tokens", "64", "--cache-hot", hot, "--cache-static", "--cache-dump", dump)
+            try:
+                for r in REF:
+                    got = e.gen(r["ids"], len(r["gen"]))
+                    self.assertEqual(got["tokens"], r["gen"])
+                    self.assertEqual(got["done"][15], "0")                 # nothing was ever copied in after the start
+                    self.assertLessEqual(int(got["done"][9]), int(got["done"][10]))
+            finally:
+                e.close()
+            self.assertEqual(self.dump_of(dump), {0: {1, 2}, 1: {3}, 2: {4, 5}, 3: {0}})
+
+    def test_a_bad_hot_file_costs_the_cache_and_says_where(self):
+        with tempfile.TemporaryDirectory() as d:
+            for text, why in (("9 1\n", "line 1: layer 9"), ("0 1\n1 99\n", "line 2: expert 99"), ("0 x\n", "not a number")):
+                hot = Path(d) / "hot.txt"
+                hot.write_text(text)
+                r = subprocess.run([ENGINE, "--native", GGUF, "-p", "hello world", "-n", "4", "--threads", "2", *CACHE[:2], "--expert-cache", "auto",
+                                    "--cache-in-ram", "--cache-slots", "3", "--cache-hot", str(hot)], capture_output=True, timeout=120)
+                err = r.stderr.decode(errors="replace")
+                self.assertEqual(r.returncode, 0, err[-300:])           # the engine still answers
+                self.assertIn("no expert cache", err)
+                self.assertIn(why, err)
+        r = subprocess.run([ENGINE, "--native", GGUF, "-p", "hi", "--expert-cache", "off", "--cache-static"], capture_output=True, timeout=60)
+        self.assertEqual(r.returncode, 2)
+
     def test_bad_cache_options_are_refused(self):
         for args in (["--expert-cache", "lots"], ["--expert-cache", "off", "--cache-slots", "2"], ["--sim-cache", "0"]):
             r = subprocess.run([ENGINE, "--native", GGUF, "-p", "hi", *args], capture_output=True, timeout=60)

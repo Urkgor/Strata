@@ -233,6 +233,39 @@ int main() {
         std::printf("7. long run: ok\n");
     }
 
+    // 8. an expert placed by hand is never replaced, however little the model asks for it; a static cache never moves
+    {
+        std::vector<int> slots((size_t) NL, 10);
+        slots[3] = 0;
+        HotSet h(NL, NE, slots);
+        Router r(NL, NE, NU, 0.9, 21);
+        const int rare = r.perm[0][(size_t) NE - 1];     // the least popular expert of layer 0
+        CacheSwap sw;
+        CHECK(h.pin(0, rare, sw));
+        CHECK(sw.layer == 0 && sw.in == rare && sw.out == -1);
+        CHECK(h.slot_of(0, rare) >= 0 && h.locked(0, h.slot_of(0, rare)));
+        CHECK(!h.pin(0, rare, sw));                      // already there
+        CHECK(!h.pin(3, 1, sw));                         // a layer without room
+        int placed = 0;
+        for (int e = 0; e < 20; ++e) if (e != rare && h.pin(1, e, sw)) ++placed;
+        CHECK(placed == 10);                             // the layer's room, no more
+        std::vector<CacheSwap> sws;
+        for (int i = 0; i < 4000; ++i) step(h, r, 1, sws);
+        CHECK(h.slot_of(0, rare) >= 0);                  // still there after 4000 steps of traffic that never asks for it
+        int still = 0;
+        for (int s = 0; s < h.slots(1); ++s) still += h.locked(1, s) && h.expert_at(1, s) >= 0;
+        CHECK(still == 10);                              // layer 1 was filled by hand: nothing in it moved
+        check_tables(h);
+
+        HotSet st(NL, NE, std::vector<int>((size_t) NL, 10));
+        st.set_static(true);
+        Router r2(NL, NE, NU, 0.9, 22);
+        size_t moved = 0;
+        for (int i = 0; i < 300; ++i) moved += step(st, r2, 1, sws);
+        CHECK(moved == 0 && st.used_slots() == 0);
+        std::printf("8. placed experts stay, a static cache does not move: ok\n");
+    }
+
     std::printf(g_fail ? "FAILED (%d)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

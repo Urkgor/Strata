@@ -137,6 +137,15 @@ class Q35Setup(unittest.TestCase):
                          ["--native", "m.gguf", "--max-context", "32768", "--ubatch", "2048", "--batch", "4096", "--no-repack",
                           "--pin-experts", "--spec", "lookup", "--main-gpu", "1", "--split-mode", "none"])
 
+    def test_experts_placed_by_hand(self):
+        a = q35_setup.parse(["--gguf", "x", "--cache-hot", "/tmp/hot.txt", "--cache-static"])
+        args = q35_setup.engine_args(a, Path("m.gguf"))
+        self.assertIn("--cache-hot", args)
+        self.assertEqual(args[args.index("--cache-hot") + 1], str(Path("/tmp/hot.txt").resolve()))
+        self.assertEqual(args[-1], "--cache-static")
+        with self.assertRaises(SystemExit):
+            q35_setup.parse(["--gguf", "x", "--cache-hot", "h.txt", "--no-expert-cache"])
+
     def test_the_expert_cache_is_on_by_default_and_takes_a_size(self):
         a = q35_setup.parse(["--gguf", "x"])
         self.assertEqual(q35_setup.engine_args(a, Path("m.gguf")),
