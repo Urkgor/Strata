@@ -5,6 +5,11 @@ normal PC: one NVIDIA or AMD graphics card plus system RAM, on Windows or Linux.
 (`src/`, `include/`), a Python server with an OpenAI- and Anthropic-compatible API and a web app (`serve/`), and a
 one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
 
+A second engine, `strata-q35` (`q35/`), runs Qwen3.6-35B-A3B (llama.cpp's `qwen35moe` graph, the same `--serve`
+protocol, so the server runs on it unchanged): [docs/Q35.md](docs/Q35.md), and for RHEL / CentOS 7
+[docs/RHEL7.md](docs/RHEL7.md). Its tests: `python -m unittest tools.test_q35_setup` (no engine needed) and
+`tools/test_q35.py` (needs the engine and the tiny model from `tools/q35_tiny_model.py`).
+
 ## Installing Strata for a user
 
 Follow **[docs/AI_SETUP.md](docs/AI_SETUP.md)**: check the PC, pick the model by RAM, run setup non-interactively,

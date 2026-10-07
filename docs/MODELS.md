@@ -7,6 +7,10 @@ The installer recommends one for your PC; this page explains the choice. Back to
 > **On this page:** [Pick by RAM](#pick-by-ram) · [Speed](#how-fast-is-each-size) · [The sizes](#the-sizes) ·
 > [Will it fit?](#will-it-fit) · [The versions](#the-versions) · [Adding another model](#adding-or-switching-models)
 
+> **Qwen3.6-35B-A3B** is a different model, on a different engine (`strata-q35`): [Q35.md](Q35.md). It is 35 billion
+> parameters (3 billion used per word); a Q4 file is about 20 GB, so it fits a 32 GB PC with room for the context.
+> Everything below this note is about Qwen3.8-Flash-Next and the `strata` engine.
+
 ## Pick by RAM
 
 | Your RAM | Take | Why |
