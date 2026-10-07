@@ -222,6 +222,9 @@ struct HybridExperts::Impl {
     bool init(llama_model* model, const std::string& gguf_path, const HybridConfig& c, std::string& err);
     void after_decode(int n);
     bool load_profile();
+    bool read_profile(std::vector<float>& p) const;
+    bool nonuniform = false;
+    int moe_layers = 0;                        // layers with routed experts, whether or not they take part
     bool save_profile() const;
 };
 
@@ -240,16 +243,22 @@ bool HybridExperts::Impl::save_profile() const {
     return std::rename(tmp.c_str(), cfg.profile.c_str()) == 0;
 }
 
-bool HybridExperts::Impl::load_profile() {
-    if (cfg.profile.empty() || !hs) return false;
+bool HybridExperts::Impl::read_profile(std::vector<float>& p) const {
+    if (cfg.profile.empty()) return false;
     FILE* f = std::fopen(cfg.profile.c_str(), "rb");
     if (!f) return false;
     int32_t head[4] = {0, 0, 0, 0};
-    std::vector<float> p((size_t) n_layer * (size_t) n_expert);
-    bool ok = std::fread(head, sizeof head, 1, f) == 1 && head[0] == 0x50355133 && head[1] == n_layer && head[2] == n_expert &&
-              head[3] == n_used && std::fread(p.data(), sizeof(float), p.size(), f) == p.size();
+    p.assign((size_t) n_layer * (size_t) n_expert, 0.0f);
+    const bool ok = std::fread(head, sizeof head, 1, f) == 1 && head[0] == 0x50355133 && head[1] == n_layer && head[2] == n_expert &&
+                    head[3] == n_used && std::fread(p.data(), sizeof(float), p.size(), f) == p.size();
     std::fclose(f);
-    if (!ok) return false;
+    return ok;
+}
+
+bool HybridExperts::Impl::load_profile() {
+    if (!hs) return false;
+    std::vector<float> p;
+    if (!read_profile(p)) return false;
     if (!hs->load_profile(p)) return false;
     std::vector<CacheSwap> sw;
     hs->fill_from_profile(sw);
@@ -279,12 +288,21 @@ bool HybridExperts::Impl::init(llama_model* model, const std::string& gguf_path,
         Layer L;
         L.il = il;
         if (!llama_model_expert_tensors(model, il, &L.t)) continue;
+        ++moe_layers;
         if (L.t.has_scales) { ++skipped_scales; continue; }
         if (!L.t.down->buffer || !L.t.gate_inp->buffer) continue;
         L.n_expert = (int) L.t.down->ne[2];
         if (n_expert == 0) n_expert = L.n_expert;
         if (L.n_expert != n_expert) continue;
-        const bool experts_in_ram = ggml_backend_buffer_is_host(L.t.down->buffer);
+        // in RAM: plain host memory, or llama.cpp's repacked CPU layout (its buffer type is not "host" because the data cannot be
+        // read back as it was, but it is the CPU's; the cache copies from the GGUF file, not from the tensor)
+        auto in_ram = [](const ggml_tensor* t) {
+            if (!t || !t->buffer) return true;
+            if (ggml_backend_buffer_is_host(t->buffer)) return true;
+            ggml_backend_dev_t d = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+            return d && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        };
+        const bool experts_in_ram = in_ram(L.t.down) && in_ram(L.t.up) && in_ram(L.t.gate) && in_ram(L.t.gate_up);
         ggml_backend_buffer_type_t lbuft = ggml_backend_buffer_get_type(L.t.gate_inp->buffer);
         const bool layer_on_card = !ggml_backend_buft_is_host(lbuft);
         if (want_cache && !cfg.in_ram && !(experts_in_ram && layer_on_card)) continue;   // nothing to cache for it
@@ -348,6 +366,45 @@ bool HybridExperts::Impl::init(llama_model* model, const std::string& gguf_path,
                 Layer& L = layers[(size_t) li];
                 size_t slots = cfg.slots_per_layer > 0 ? (size_t) cfg.slots_per_layer : avail / g.layers.size() / L.slot_bytes;
                 L.slots = (int) std::min<size_t>(slots, (size_t) L.n_expert);
+            }
+            // With a profile of an earlier run, the layers do not get the same share: the experts most used over all the layers
+            // of the card fill it (a layer whose routing is concentrated gets more of the cache than one that spreads over all
+            // its experts), so the same memory serves more of the uses.
+            std::vector<float> prof;
+            if (cfg.slots_per_layer == 0 && avail != SIZE_MAX && read_profile(prof)) {
+                struct Cand { double v; size_t li; };
+                std::vector<Cand> cands;
+                for (int li : g.layers) {
+                    const Layer& L = layers[(size_t) li];
+                    for (int e = 0; e < L.n_expert; ++e) {
+                        const double sc = prof[(size_t) L.il * (size_t) n_expert + (size_t) e];
+                        if (sc > 0) cands.push_back({sc / (double) L.slot_bytes, (size_t) li});
+                    }
+                }
+                std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.v != b.v ? a.v > b.v : a.li < b.li; });
+                std::vector<int> count(layers.size(), 0);
+                size_t used = 0;
+                for (const Cand& c : cands) {
+                    const Layer& L = layers[c.li];
+                    if (count[c.li] >= L.n_expert || used + L.slot_bytes > avail) continue;
+                    ++count[c.li];
+                    used += L.slot_bytes;
+                }
+                // what the profile does not ask for (experts never seen): spread over the layers that can still take some
+                for (bool progress = true; progress;) {
+                    progress = false;
+                    for (int li : g.layers) {
+                        const Layer& L = layers[(size_t) li];
+                        if (count[(size_t) li] < L.n_expert && used + L.slot_bytes <= avail) { ++count[(size_t) li]; used += L.slot_bytes; progress = true; }
+                    }
+                }
+                int lo = 1 << 30, hi = 0;
+                for (int li : g.layers) {
+                    layers[(size_t) li].slots = count[(size_t) li];
+                    lo = std::min(lo, count[(size_t) li]);
+                    hi = std::max(hi, count[(size_t) li]);
+                }
+                if (lo != hi) nonuniform = true;
             }
         }
         int total = 0;
@@ -544,9 +601,12 @@ std::string HybridExperts::describe() const {
     }
     const int slots = p_->hs->total_slots();
     const double pct = 100.0 * slots / std::max(1.0, (double) p_->layers.size() * p_->n_expert);
-    std::snprintf(buf, sizeof buf, "%d slots in %d layers (%.0f%% of their experts), %.2f GiB %s",
-                  slots, (int) p_->layers.size(), pct, (double) cache_bytes() / (1024.0 * MiB),
-                  p_->cfg.in_ram ? "in RAM" : "on the card");
+    int lo = 1 << 30, hi = 0;
+    for (const auto& L : p_->layers) { lo = std::min(lo, L.slots); hi = std::max(hi, L.slots); }
+    std::snprintf(buf, sizeof buf, "%d slots in %d of %d layers (%.0f%% of their experts%s), %.2f GiB %s",
+                  slots, (int) p_->layers.size(), p_->moe_layers, pct,
+                  p_->nonuniform ? (", shared out by the profile: " + std::to_string(lo) + " to " + std::to_string(hi) + " per layer").c_str() : "",
+                  (double) cache_bytes() / (1024.0 * MiB), p_->cfg.in_ram ? "in RAM" : "on the card");
     return buf;
 }
 
