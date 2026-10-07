@@ -81,6 +81,8 @@ struct Options {
     int64_t max_context = 4096;
     int threads = 0;             // 0: the physical cores
     int threads_batch = 0;       // 0: same as threads
+    int poll = 50;               // how long idle CPU threads spin before they sleep (0 - 100, llama.cpp's default 50)
+    bool no_threadpool = false;  // llama.cpp's per-call thread teams (the old behaviour, to compare)
     int gpu_layers = -1;         // -1: all (libllama's default); the fit may lower it
     bool gpu_layers_set = false;
     bool cpu_moe = false;
@@ -160,6 +162,7 @@ void usage() {
         "  --fit-margin-mib N     VRAM to leave free per card when fitting (default 1024)\n"
         "  --threads N            CPU threads for generation (default: the physical cores)\n"
         "  --threads-batch N      CPU threads for the prompt (default: same)\n"
+        "  --poll N               0-100: how long idle CPU threads spin before sleeping (default 50, llama.cpp's)\n"
         "  --numa MODE            distribute | isolate | numactl (multi-socket PCs)\n"
         "  --split-mode MODE      none | layer | row (several cards); --main-gpu N; --tensor-split a,b,..\n"
         "  --load MODE            auto | mmap | mlock | none | direct (how the file is read)\n"
@@ -275,6 +278,8 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--native" || a == "-m" || a == "--model") { if (!(v = need(i, a.c_str()))) return false; o.model = v; }
         else if (a == "--max-context" || a == "-c") { if (!num(a.c_str(), 64, 16LL << 20, n)) return false; o.max_context = n; }
         else if (a == "--threads" || a == "-t") { if (!num(a.c_str(), 1, 4096, n)) return false; o.threads = (int) n; }
+        else if (a == "--poll") { if (!num(a.c_str(), 0, 100, n)) return false; o.poll = (int) n; }
+        else if (a == "--no-threadpool") o.no_threadpool = true;
         else if (a == "--threads-batch" || a == "-tb") { if (!num(a.c_str(), 1, 4096, n)) return false; o.threads_batch = (int) n; }
         else if (a == "--gpu-layers" || a == "-ngl" || a == "--n-gpu-layers") {
             if (!(v = need(i, a.c_str()))) return false;
@@ -507,14 +512,37 @@ public:
     std::string placement = "all on the card";
     std::string offload_tag = "gpu";   // one word for the INFO line
     std::unique_ptr<q35::HybridExperts> hx;   // the hybrid expert cache (null: off)
+    ggml_threadpool_t tp = nullptr, tp_batch = nullptr;   // the CPU threads, kept between graphs
     bool cache_placed = false;         // the engine put every routed expert in RAM for the cache (not the user)
 
     ~Engine() {
         if (hx && model) hx->detach(model);
         if (batch.token) llama_batch_free(batch);
-        if (ctx) llama_free(ctx);
+        if (ctx) { llama_detach_threadpool(ctx); llama_free(ctx); }
+        if (tp_batch) ggml_threadpool_free(tp_batch);
+        if (tp) ggml_threadpool_free(tp);
         if (model) llama_model_free(model);
         hx.reset();   // after the model: it writes its profile
+    }
+
+    // Without a thread pool of its own, ggml starts a fresh team of threads for every graph it computes, and with the
+    // experts in RAM a token is some eighty graphs (the card's part, the CPU's part, layer after layer).  llama.cpp's own
+    // tools keep one pool; so does this.
+    void attach_threads() {
+        if (o.no_threadpool || !ctx) return;
+        const int nt = o.threads > 0 ? o.threads : physical_cores();
+        const int nb = o.threads_batch > 0 ? o.threads_batch : nt;
+        if (!tp) {
+            ggml_threadpool_params p = ggml_threadpool_params_default(nt);
+            p.poll = (uint32_t) o.poll;
+            tp = ggml_threadpool_new(&p);
+            if (nb != nt) {
+                ggml_threadpool_params pb = ggml_threadpool_params_default(nb);
+                pb.poll = (uint32_t) o.poll;
+                tp_batch = ggml_threadpool_new(&pb);
+            }
+        }
+        if (tp) llama_attach_threadpool(ctx, tp, tp_batch);
     }
 
     bool load(std::string& err) {
@@ -652,6 +680,7 @@ public:
         if (!ctx) { err = "could not create the context (not enough memory for --max-context " + std::to_string(o.max_context) + "?)"; return false; }
         mem = llama_get_memory(ctx);
         llama_set_abort_callback(ctx, abort_cb, nullptr);
+        attach_threads();
         batch = llama_batch_init((int32_t) cp.n_batch, 0, 1);
         cparams_ubatch = (int) cp.n_ubatch;
 
@@ -727,9 +756,9 @@ public:
     llama_context_params saved_cp{};
 
     void reset_context() {
-        if (ctx) llama_free(ctx);
+        if (ctx) { llama_detach_threadpool(ctx); llama_free(ctx); }
         ctx = llama_init_from_model(model, saved_cp);
-        if (ctx) { mem = llama_get_memory(ctx); llama_set_abort_callback(ctx, abort_cb, nullptr); }
+        if (ctx) { mem = llama_get_memory(ctx); llama_set_abort_callback(ctx, abort_cb, nullptr); attach_threads(); }
         live.clear();
         ckpts.clear();
     }
