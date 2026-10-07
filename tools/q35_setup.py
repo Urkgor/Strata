@@ -106,14 +106,15 @@ def make_config(a: argparse.Namespace, gguf: Path, out: Path, facts: dict) -> di
 def write_run_script(out: Path, port: int) -> Path:
     venv = ROOT / ".venv" / "bin" / "python"
     script = out / "run-q35.sh"
-    script.write_text(
-        "#!/bin/sh\n"
-        "# Starts the Strata server on strata-q35 (the web app, /v1/chat/completions, /v1/messages).\n"
-        f'cd {shlex.quote(str(ROOT))} || exit 1\n'
-        f'PY={shlex.quote(str(venv))}\n'
-        '[ -x "$PY" ] || PY=python3\n'
-        f'exec "$PY" serve/server.py --engine strata --config {shlex.quote(str(out / "config.json"))} '
-        f'--port {port} "$@"\n', encoding="utf-8", newline="\n")
+    text = ("#!/bin/sh\n"
+            "# Starts the Strata server on strata-q35 (the web app, /v1/chat/completions, /v1/messages).\n"
+            f'cd {shlex.quote(str(ROOT))} || exit 1\n'
+            f'PY={shlex.quote(str(venv))}\n'
+            '[ -x "$PY" ] || PY=python3\n'
+            f'exec "$PY" serve/server.py --engine strata --config {shlex.quote(str(out / "config.json"))} '
+            f'--port {port} "$@"\n')
+    with open(script, "w", encoding="utf-8", newline="\n") as f:        # (Path.write_text has no newline= before 3.10)
+        f.write(text)
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return script
 

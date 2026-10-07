@@ -86,14 +86,18 @@ Without a graphics card, or with a small one, the model's weights live in RAM: *
 
 ## 5. The server (web app, OpenAI and Anthropic APIs)
 
-The engine alone needs nothing but its binary. The Strata server around it (`serve/server.py`) is Python 3.10 or newer
-with `jinja2` and `regex` (nothing else; checked with a venv that has only those two); **RHEL 7's own packages stop at Python 3.6** (3.8 with the `rh-python38` collection, still too old).
-Python 3.10 or newer, from memory and not checked here: [Miniforge](https://github.com/conda-forge/miniforge) (conda-forge
-builds for old glibc), or building Python from source with the devtoolset.
+The engine alone needs nothing but its binary. The Strata server around it (`serve/server.py`) needs **Python 3.8 or newer
+and no package at all**: it renders the model's chat template with `serve/jinja_lite.py` and splits text for the tokenizer with
+`re` (`tools/unicode_classes.py`), so there is no Jinja2 and no `regex` to install, and no `pip`.
+
+RHEL 7's own Python is 3.6, too old; Red Hat's Software Collections have 3.8 (`rh-python38`; the package name is from memory,
+not checked here). The server's whole test suite (506 tests) and a real chat through `strata-q35` were run on Python 3.8.20
+with no third-party package; on 3.6 nothing was run, and the server's code does not fit it (it uses `from __future__ import annotations`).
 
 ```
-python3.12 -m venv .venv && .venv/bin/pip install jinja2 regex
-.venv/bin/python tools/q35_setup.py --gguf /models/model.gguf --engine build-q35/strata-q35 --max-context 65536 --cpu-moe
+sudo yum install rh-python38                               # the collection's name: from memory
+scl enable rh-python38 bash                                # python3 is now 3.8
+python3 tools/q35_setup.py --gguf /models/model.gguf --engine build-q35/strata-q35 --max-context 65536 --cpu-moe
 pack-q35/run-q35.sh --host 127.0.0.1                      # http://127.0.0.1:8095/
 ```
 
