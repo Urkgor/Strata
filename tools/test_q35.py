@@ -300,6 +300,17 @@ class Q35Engine(unittest.TestCase):
         r = subprocess.run([ENGINE, "--native", GGUF], capture_output=True, timeout=120)
         self.assertNotEqual(r.returncode, 0)         # no prompt, no --serve: says so
 
+    def test_the_thread_pool_options_change_nothing_but_speed(self):
+        for args in ([], ["--no-threadpool"], ["--poll", "0"], ["--poll", "100"], ["--threads", "3", "--threads-batch", "2"]):
+            e = Engine(*args)
+            try:
+                got = e.gen(REF[1]["ids"], len(REF[1]["gen"]))
+                self.assertEqual(got["tokens"], REF[1]["gen"], args)
+            finally:
+                e.close()
+        r = subprocess.run([ENGINE, "--native", GGUF, "-p", "hi", "--poll", "101"], capture_output=True, timeout=60)
+        self.assertEqual(r.returncode, 2)
+
     def test_a_missing_model_is_an_error(self):
         r = subprocess.run([ENGINE, "--native", str(Path(MODEL_DIR) / "no-such.gguf")], capture_output=True, timeout=60)
         self.assertNotEqual(r.returncode, 0)
