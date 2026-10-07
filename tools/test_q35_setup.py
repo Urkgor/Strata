@@ -106,7 +106,8 @@ class Q35Setup(unittest.TestCase):
         cfg = json.loads((out / "config.json").read_text())
         self.assertEqual(cfg["exe"], str(self.dir / "strata-q35"))
         self.assertEqual(cfg["args"], ["--native", str(self.gguf), "--max-context", "65536", "--n-cpu-moe", "12",
-                                       "--kv", "q8_0", "--threads", "16", "--numa", "distribute"])
+                                       "--kv", "q8_0", "--threads", "16", "--numa", "distribute",
+                                       "--expert-cache", "auto", "--cache-profile", str(out / "hot-experts.bin")])
         self.assertEqual((cfg["model_name"], cfg["tokenizer"]), ("q36", str(out / "tokenizer")))
         tok = out / "tokenizer"
         for name in ("vocab.json", "merges.txt", "token_type.json", "tokenizer.json", "chat_template.jinja"):
@@ -123,10 +124,22 @@ class Q35Setup(unittest.TestCase):
     def test_cpu_moe_and_n_cpu_moe_are_alternatives(self):
         with self.assertRaises(SystemExit):
             q35_setup.parse(["--gguf", "x", "--cpu-moe", "--n-cpu-moe", "3"])
-        a = q35_setup.parse(["--gguf", "x", "--cpu-moe", "--gpu-layers", "all", "--fit", "off", "--engine-arg=--verbose"])
+        a = q35_setup.parse(["--gguf", "x", "--cpu-moe", "--gpu-layers", "all", "--fit", "off", "--no-expert-cache",
+                             "--engine-arg=--verbose"])
         self.assertEqual(q35_setup.engine_args(a, Path("m.gguf")),
                          ["--native", "m.gguf", "--max-context", "32768", "--cpu-moe", "--gpu-layers", "all", "--fit",
                           "off", "--verbose"])
+
+    def test_the_expert_cache_is_on_by_default_and_takes_a_size(self):
+        a = q35_setup.parse(["--gguf", "x"])
+        self.assertEqual(q35_setup.engine_args(a, Path("m.gguf")),
+                         ["--native", "m.gguf", "--max-context", "32768", "--expert-cache", "auto"])
+        a = q35_setup.parse(["--gguf", "x", "--expert-cache", "6000"])
+        self.assertEqual(q35_setup.engine_args(a, Path("m.gguf"), Path("/o"))[-4:],
+                         ["--expert-cache", "6000", "--cache-profile", "/o/hot-experts.bin"])
+        for bad in ("lots", "0", "-5"):
+            with self.assertRaises(SystemExit):
+                q35_setup.parse(["--gguf", "x", "--expert-cache", bad])
 
     def test_another_architecture_is_refused_with_the_right_pointer(self):
         flash = write_gguf(self.dir / "flash.gguf", arch="qwen4exp")

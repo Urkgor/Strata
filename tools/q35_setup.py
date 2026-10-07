@@ -72,7 +72,7 @@ def sampling_block(facts: dict) -> dict:
     return {k: v for k, v in s.items() if v is not None}
 
 
-def engine_args(a: argparse.Namespace, gguf: Path) -> list[str]:
+def engine_args(a: argparse.Namespace, gguf: Path, out: Path | None = None) -> list[str]:
     args = ["--native", str(gguf), "--max-context", str(a.max_context)]
     if a.cpu_moe:
         args.append("--cpu-moe")
@@ -88,12 +88,17 @@ def engine_args(a: argparse.Namespace, gguf: Path) -> list[str]:
         args += ["--numa", a.numa]
     if a.fit:
         args += ["--fit", a.fit]
+    if a.expert_cache != "off":
+        # the hot experts on the card, the CPU computes only the rest (docs/Q35.md); the engine says why if it cannot
+        args += ["--expert-cache", a.expert_cache]
+        if out is not None:
+            args += ["--cache-profile", str(out / "hot-experts.bin")]   # what the model asked for: a warm cache at the next start
     args += list(a.engine_arg or [])
     return args
 
 
 def make_config(a: argparse.Namespace, gguf: Path, out: Path, facts: dict) -> dict:
-    cfg = {"exe": str(Path(a.engine).resolve()), "args": engine_args(a, gguf), "cwd": str(ROOT),
+    cfg = {"exe": str(Path(a.engine).resolve()), "args": engine_args(a, gguf, out), "cwd": str(ROOT),
            "tokenizer": str(out / "tokenizer"), "model_name": a.model_name, "log": str(out / "engine.log")}
     sampling = sampling_block(facts)
     if sampling:
@@ -135,11 +140,17 @@ def parse(argv=None) -> argparse.Namespace:
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--numa", default=None, choices=["distribute", "isolate", "numactl"])
     ap.add_argument("--fit", default=None, choices=["on", "off"])
+    ap.add_argument("--expert-cache", default="auto", metavar="auto|MIB|off",
+                    help="the experts the model asks for most are copied to the card and computed there, the CPU only does the "
+                         "others (default auto: the card's free memory; off: llama.cpp's placement alone)")
+    ap.add_argument("--no-expert-cache", dest="expert_cache", action="store_const", const="off", help="same as --expert-cache off")
     ap.add_argument("--engine-arg", action="append", metavar="ARG", help="another strata-q35 argument (repeatable)")
     ap.add_argument("--force", action="store_true", help="write the files even for another architecture")
     a = ap.parse_args(argv)
     if a.cpu_moe and a.n_cpu_moe:
         ap.error("--cpu-moe and --n-cpu-moe are alternatives")
+    if a.expert_cache not in ("auto", "off", "sim") and not (a.expert_cache.isdigit() and int(a.expert_cache) > 0):
+        ap.error("--expert-cache takes auto, off, sim or a size in MiB")
     return a
 
 
