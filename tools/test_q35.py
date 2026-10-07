@@ -305,5 +305,116 @@ class Q35Engine(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
 
 
+CACHE = ["--cpu-moe", "--no-repack", "--expert-cache", "auto", "--cache-in-ram", "--cache-check", "off"]
+
+
+@unittest.skipUnless(READY, "set STRATA_Q35_ENGINE and STRATA_Q35_MODEL_DIR (see the module docstring)")
+class Q35ExpertCache(unittest.TestCase):
+    """The hybrid expert cache (docs/Q35.md), with the cache in RAM: the graph, the tables, the copies from the GGUF file
+    and the policy all run as they do with a card, so what is checked here is that the cache never changes an answer."""
+
+    def test_the_tokens_do_not_depend_on_what_is_cached(self):
+        for slots in (1, 3, 5, 8):
+            for tokens in (1, 64):
+                e = Engine(*CACHE, "--cache-slots", str(slots), "--cache-tokens", str(tokens))
+                try:
+                    for r in REF:
+                        got = e.gen(r["ids"], len(r["gen"]))
+                        self.assertEqual(got["tokens"], r["gen"], f"{slots} slots, batches of up to {tokens}")
+                        hits, lookups = int(got["done"][9]), int(got["done"][10])
+                        self.assertLessEqual(hits, lookups)
+                finally:
+                    e.close()
+
+    def test_logits_are_the_same_to_the_last_digit(self):
+        ids = ",".join(map(str, REF[1]["ids"]))
+        plain = Engine("--cpu-moe", "--no-repack")
+        cached = Engine(*CACHE, "--cache-slots", "3", "--cache-tokens", "64")
+        try:
+            want = plain.ask("LOGITS " + ids, "LOGITS")
+            for _ in range(3):                                   # the first call fills the cache, the others use it
+                self.assertEqual(cached.ask("LOGITS " + ids, "LOGITS"), want)
+        finally:
+            plain.close()
+            cached.close()
+
+    def test_the_cache_learns_what_the_model_asks_for(self):
+        e = Engine(*CACHE, "--cache-slots", "4", "--cache-tokens", "64")
+        try:
+            rates = []
+            for _ in range(4):
+                done = e.gen(REF[0]["ids"], N_GEN)["done"]
+                rates.append(int(done[9]) / max(1, int(done[10])))
+            self.assertGreater(rates[-1], rates[0])
+            self.assertGreater(rates[-1], 0.5)                   # 4 of the 8 experts of a layer, the 4 it uses
+            self.assertEqual(e.info["expert_slots"], "16")       # 4 layers x 4 slots
+        finally:
+            e.close()
+
+    def test_a_profile_warms_the_next_start(self):
+        with tempfile.TemporaryDirectory() as d:
+            profile = str(Path(d) / "hot.bin")
+            args = (*CACHE, "--cache-slots", "3", "--cache-tokens", "64", "--cache-profile", profile)
+            e = Engine(*args)
+            try:
+                first = e.gen(REF[0]["ids"], N_GEN)["done"]
+                for _ in range(3):
+                    e.gen(REF[0]["ids"], N_GEN)
+            finally:
+                e.close()
+            self.assertTrue(Path(profile).exists())
+            e = Engine(*args)
+            try:
+                warm = e.gen(REF[0]["ids"], N_GEN)["done"]
+            finally:
+                e.close()
+            self.assertGreater(int(warm[9]) / max(1, int(warm[10])), int(first[9]) / max(1, int(first[10])))
+
+    def test_a_profile_of_another_model_is_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            profile = Path(d) / "hot.bin"
+            profile.write_bytes(b"not a profile at all")
+            e = Engine(*CACHE, "--cache-slots", "3", "--cache-profile", str(profile))
+            try:
+                self.assertEqual(e.gen(REF[0]["ids"], N_GEN)["tokens"], REF[0]["gen"])
+            finally:
+                e.close()
+
+    def test_sim_measures_without_a_cache(self):
+        r = subprocess.run([ENGINE, "--native", GGUF, "-p", "the quick brown fox jumps over the lazy dog", "-n", "12", "--threads", "2",
+                            "--expert-cache", "sim", "--sim-cache", "25,50,100"], capture_output=True, timeout=120)
+        err = r.stderr.decode(errors="replace")
+        self.assertEqual(r.returncode, 0, err[-400:])
+        self.assertIn("a cache of  25%", err)
+        self.assertIn("would have served", err)
+        rates = [float(x.rstrip("%")) for x in err.split("would have served")[1].split("of the expert uses")[0].split()]
+        self.assertEqual(len(rates), 3)
+        self.assertEqual(rates[2], 100.0)                        # every expert cached: every use is a hit (after the first fills)
+        self.assertLessEqual(rates[0], rates[1])
+
+    def test_bench_runs_with_and_without_the_cache(self):
+        r = subprocess.run([ENGINE, "--native", GGUF, "--bench", "--bench-pp", "24", "--bench-tg", "6", "--bench-reps", "2",
+                            "--bench-compare", "--threads", "2", *CACHE, "--cache-slots", "3"], capture_output=True, timeout=240)
+        out = r.stdout.decode(errors="replace")
+        self.assertEqual(r.returncode, 0, r.stderr.decode(errors="replace")[-400:])
+        self.assertIn("bench[cache] 2/2", out)
+        self.assertIn("bench[usual] 2/2", out)
+        self.assertIn("% hits", out)
+        self.assertIn("the cache makes generation", out)
+
+    def test_bad_cache_options_are_refused(self):
+        for args in (["--expert-cache", "lots"], ["--expert-cache", "off", "--cache-slots", "2"], ["--sim-cache", "0"]):
+            r = subprocess.run([ENGINE, "--native", GGUF, "-p", "hi", *args], capture_output=True, timeout=60)
+            self.assertEqual(r.returncode, 2, args)
+
+    def test_a_check_that_passes_leaves_the_cache_on(self):
+        r = subprocess.run([ENGINE, "--native", GGUF, "-p", "hello world", "-n", "4", "--threads", "2", "--cpu-moe", "--no-repack",
+                            "--expert-cache", "auto", "--cache-in-ram", "--cache-slots", "3"], capture_output=True, timeout=120)
+        err = r.stderr.decode(errors="replace")
+        self.assertEqual(r.returncode, 0, err[-400:])
+        self.assertIn("expert cache check passed", err)
+        self.assertIn("expert cache: 12 slots in 4 layers", err)
+
+
 if __name__ == "__main__":
     unittest.main()

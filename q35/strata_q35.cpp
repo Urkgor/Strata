@@ -24,6 +24,8 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#include "hybrid_experts.h"
+
 #ifdef STRATA_Q35_FIT
 #include "fit.h"
 #endif
@@ -94,12 +96,28 @@ struct Options {
     int main_gpu = 0;
     std::vector<float> tensor_split;
     bool no_op_offload = false;
+    bool no_repack = false;      // llama.cpp's CPU weight repacking (faster kernels for some quantizations)
     bool no_kv_offload = false;
     bool eos_set = false;
     std::vector<int64_t> eos_ids;
     int ckpt_slots = 4;          // state checkpoints kept for the conversation cache
     int ckpt_every = 8192;       // tokens between checkpoints inside a long prompt (0: only at its end)
     int n_rs_seq = 0;            // recurrent snapshots for rollback (llama.cpp experimental)
+    // the hybrid expert cache (docs/Q35.md): the hot experts on the card, the CPU computes only the rest
+    std::string expert_cache = "off";   // off | auto | sim | <MiB>
+    int cache_slots = 0;         // experts per layer (instead of a size in MiB)
+    int cache_tokens = 16;       // batches up to this size use the hybrid graph
+    bool cache_in_ram = false;   // the cache in RAM: tests on a PC without a card
+    q35::CacheParams cache_policy;
+    std::string cache_profile;
+    bool cache_check = true;
+    std::vector<int> sim_pct;
+    // measuring
+    bool bench = false;
+    int bench_pp = 512;
+    int bench_tg = 64;
+    int bench_reps = 3;
+    bool bench_compare = false;  // with a cache: also run without it
     // one-shot generation (no --serve)
     std::string prompt;
     std::string prompt_file;
@@ -141,7 +159,22 @@ void usage() {
         "  --split-mode MODE      none | layer | row (several cards); --main-gpu N; --tensor-split a,b,..\n"
         "  --load MODE            auto | mmap | mlock | none | direct (how the file is read)\n"
         "  --no-op-offload        do not let the card compute the CPU's weights during long prompts\n"
+        "  --no-repack            do not let llama.cpp rearrange the CPU's weights (tests; the default is faster)\n"
         "  --no-kv-offload        keep the K/V cache in RAM\n"
+        "\n"
+        "hybrid expert cache (experts in RAM, the hot ones also on the card; see docs/Q35.md)\n"
+        "  --expert-cache MODE    off (default) | auto (the card's free memory) | MIB | sim (measure only: no cache)\n"
+        "  --cache-slots N        N experts per layer instead of a size;  --cache-tokens N  batch size up to which it is used (16)\n"
+        "  --cache-profile FILE   keep what the model asked for between runs: a warm cache at start\n"
+        "  --cache-swaps N        experts moved into the cache after a decode step once it is full (default 2)\n"
+        "  --cache-half-life N    tokens after which a use counts half (default 512)\n"
+        "  --cache-check on|off   compare the first tokens with and without the cache at start (default on)\n"
+        "  --sim-cache A,B,..     with any mode: the hit rate that caches of A%, B%.. of the experts would have had\n"
+        "\n"
+        "measuring\n"
+        "  --bench                read a prompt and generate, print tokens/s (needs --native; -p/-f for the text)\n"
+        "  --bench-pp N, --bench-tg N, --bench-reps N     prompt tokens (512), generated tokens (64), repeats (3)\n"
+        "  --bench-compare        with a cache: run it again without, to show what the cache gives\n"
         "\n"
         "serving\n"
         "  --eos-ids a,b          token ids that end an answer (default: the model's end-of-turn tokens)\n"
@@ -277,6 +310,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
             while (std::getline(ss, tok, ',')) o.tensor_split.push_back(std::strtof(tok.c_str(), nullptr));
         }
         else if (a == "--no-op-offload") o.no_op_offload = true;
+        else if (a == "--no-repack") o.no_repack = true;
         else if (a == "--no-kv-offload") o.no_kv_offload = true;
         else if (a == "--eos-ids") {
             if (!(v = need(i, a.c_str()))) return false;
@@ -287,6 +321,36 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--ckpt-slots") { if (!num(a.c_str(), 0, 64, n)) return false; o.ckpt_slots = (int) n; }
         else if (a == "--ckpt-every") { if (!num(a.c_str(), 0, 1LL << 30, n)) return false; o.ckpt_every = (int) n; }
         else if (a == "--rs-snapshots") { if (!num(a.c_str(), 0, 64, n)) return false; o.n_rs_seq = (int) n; }
+        else if (a == "--expert-cache") { if (!(v = need(i, a.c_str()))) return false; o.expert_cache = v; }
+        else if (a == "--cache-slots") { if (!num(a.c_str(), 0, 4096, n)) return false; o.cache_slots = (int) n; }
+        else if (a == "--cache-tokens") { if (!num(a.c_str(), 1, 4096, n)) return false; o.cache_tokens = (int) n; }
+        else if (a == "--cache-in-ram") o.cache_in_ram = true;
+        else if (a == "--cache-profile") { if (!(v = need(i, a.c_str()))) return false; o.cache_profile = v; }
+        else if (a == "--cache-swaps") { if (!num(a.c_str(), 0, 4096, n)) return false; o.cache_policy.swaps_per_step = (int) n; }
+        else if (a == "--cache-fill") { if (!num(a.c_str(), 1, 1 << 20, n)) return false; o.cache_policy.fill_swaps = (int) n; }
+        else if (a == "--cache-half-life") { if (!num(a.c_str(), 1, 1 << 30, n)) return false; o.cache_policy.half_life = (double) n; }
+        else if (a == "--cache-check") {
+            if (!(v = need(i, a.c_str()))) return false;
+            const std::string s2 = v;
+            if (s2 == "on") o.cache_check = true; else if (s2 == "off") o.cache_check = false;
+            else { err = "--cache-check takes on or off"; return false; }
+        }
+        else if (a == "--sim-cache") {
+            if (!(v = need(i, a.c_str()))) return false;
+            std::stringstream ss(v);
+            std::string tok;
+            o.sim_pct.clear();
+            while (std::getline(ss, tok, ',')) {
+                const int pct = std::atoi(tok.c_str());
+                if (pct < 1 || pct > 100) { err = "--sim-cache takes percentages between 1 and 100"; return false; }
+                o.sim_pct.push_back(pct);
+            }
+        }
+        else if (a == "--bench") o.bench = true;
+        else if (a == "--bench-compare") o.bench_compare = true;
+        else if (a == "--bench-pp") { if (!num(a.c_str(), 1, 1 << 20, n)) return false; o.bench_pp = (int) n; }
+        else if (a == "--bench-tg") { if (!num(a.c_str(), 1, 1 << 20, n)) return false; o.bench_tg = (int) n; }
+        else if (a == "--bench-reps") { if (!num(a.c_str(), 1, 1000, n)) return false; o.bench_reps = (int) n; }
         else if (a == "--prompt" || a == "-p") { if (!(v = need(i, a.c_str()))) return false; o.prompt = v; }
         else if (a == "--file" || a == "-f") { if (!(v = need(i, a.c_str()))) return false; o.prompt_file = v; }
         else if (a == "--system") { if (!(v = need(i, a.c_str()))) return false; o.system = v; }
@@ -307,6 +371,12 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else { err = "unknown option " + a; return false; }
     }
     if (o.model.empty()) { err = "--native MODEL.gguf is required"; return false; }
+    {
+        const std::string& c = o.expert_cache;
+        const bool digits = !c.empty() && c.find_first_not_of("0123456789") == std::string::npos && std::atoll(c.c_str()) > 0;
+        if (c != "off" && c != "auto" && c != "sim" && !digits) { err = "--expert-cache takes off, auto, sim or a size in MiB"; return false; }
+        if (o.cache_slots > 0 && c == "off") { err = "--cache-slots needs --expert-cache auto or a size"; return false; }
+    }
     return true;
 }
 
@@ -371,14 +441,22 @@ public:
     std::vector<size_t> margins;
     std::string placement = "all on the card";
     std::string offload_tag = "gpu";   // one word for the INFO line
+    std::unique_ptr<q35::HybridExperts> hx;   // the hybrid expert cache (null: off)
+    bool cache_placed = false;         // the engine put every routed expert in RAM for the cache (not the user)
 
     ~Engine() {
+        if (hx && model) hx->detach(model);
         if (batch.token) llama_batch_free(batch);
         if (ctx) llama_free(ctx);
         if (model) llama_model_free(model);
+        hx.reset();   // after the model: it writes its profile
     }
 
     bool load(std::string& err) {
+        override_strings.clear();
+        overrides.clear();
+        margins.clear();
+        cache_placed = false;
         if (!llama_supports_gpu_offload()) { placement = "CPU only (this build has no GPU backend)"; offload_tag = "cpu"; }
         const size_t max_ovr = llama_max_tensor_buft_overrides();
         ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
@@ -386,6 +464,12 @@ public:
             override_strings.push_back(re);
             overrides.push_back({override_strings.back().c_str(), cpu_buft});
         };
+        const bool placed_by_hand = o.cpu_moe || o.n_cpu_moe > 0 || o.gpu_layers_set;
+        const bool cache_req = o.expert_cache != "off" && o.expert_cache != "sim";
+        // the hybrid cache wants every routed expert in RAM and the card's free memory for itself, unless the whole model
+        // fits the card
+        const bool cache_places = cache_req && !placed_by_hand && llama_supports_gpu_offload() && !o.cache_in_ram;
+        bool all_fits = false;
         if (o.cpu_moe) {
             add_override("\\.ffn_(up|down|gate|gate_up)_(ch|)exps");
             placement = "routed experts in RAM, the rest on the card";
@@ -416,9 +500,11 @@ public:
         for (size_t i = 0; i < o.tensor_split.size() && i < tensor_split.size(); ++i) tensor_split[i] = o.tensor_split[i];
         mp.tensor_split = tensor_split.data();
         mp.tensor_buft_overrides = overrides.data();   // an all-null list is the same as none
+        if (o.no_repack) mp.use_extra_bufts = false;
         if (o.info) mp.n_gpu_layers = 0;                // --info: the file's facts; nothing goes to the card
 
         llama_context_params cp = llama_context_default_params();
+        auto keep_cp = [&] { saved_cp = cp; };
         cp.n_ctx = (uint32_t) o.max_context;
         cp.n_batch = (uint32_t) o.n_batch;
         cp.n_ubatch = (uint32_t) std::min(o.n_ubatch, o.n_batch);
@@ -437,8 +523,8 @@ public:
         cp.type_v = kt;
 
 #ifdef STRATA_Q35_FIT
-        const bool placed_by_hand = o.cpu_moe || o.n_cpu_moe > 0 || o.gpu_layers_set;
         if (o.fit && !placed_by_hand && llama_supports_gpu_offload()) {
+            const int ngl_before = mp.n_gpu_layers;
             margins.assign(llama_max_devices(), (size_t) o.fit_margin_mib << 20);
             std::vector<llama_model_tensor_buft_override> fit_ovr(max_ovr, llama_model_tensor_buft_override{nullptr, nullptr});
             const common_params_fit_status st =
@@ -450,6 +536,7 @@ public:
                 mp.tensor_buft_overrides = overrides.data();
                 size_t n = 0;
                 while (n < overrides.size() && overrides[n].pattern) ++n;
+                all_fits = n == 0 && mp.n_gpu_layers == ngl_before;
                 placement = "fitted to the free VRAM: " + std::to_string(mp.n_gpu_layers) + " layers on the card, " +
                             std::to_string(n) + " expert overrides to RAM";
                 offload_tag = "fit";
@@ -463,6 +550,18 @@ public:
             }
         }
 #endif
+        if (cache_places && !all_fits) {
+            overrides.clear();
+            override_strings.clear();
+            add_override("\\.ffn_(up|down|gate|gate_up)_(ch|)exps");
+            while (overrides.size() < max_ovr) overrides.push_back({nullptr, nullptr});
+            mp.tensor_buft_overrides = overrides.data();
+            mp.n_gpu_layers = -1;
+            placement = "routed experts in RAM, the rest on the card, and the card's free memory is the experts' cache";
+            offload_tag = "cpu-moe+cache";
+            cache_placed = true;
+        }
+        keep_cp();
         model = llama_model_load_from_file(o.model.c_str(), mp);
         if (!model) { err = "could not load " + o.model; return false; }
         vocab = llama_model_get_vocab(model);
@@ -477,10 +576,19 @@ public:
         }
         if (o.info) return true;
         ctx = llama_init_from_model(model, cp);
+        if (!ctx && cache_placed) {
+            // the dense part, the K/V cache and the compute buffers did not fit with every expert in RAM: as the fit placed it
+            std::fprintf(stderr, "strata-q35: the context does not fit the card with every expert in RAM; trying the fitted placement, without the cache\n");
+            llama_model_free(model);
+            model = nullptr;
+            o.expert_cache = "off";
+            return load(err);
+        }
         if (!ctx) { err = "could not create the context (not enough memory for --max-context " + std::to_string(o.max_context) + "?)"; return false; }
         mem = llama_get_memory(ctx);
         llama_set_abort_callback(ctx, abort_cb, nullptr);
         batch = llama_batch_init((int32_t) cp.n_batch, 0, 1);
+        cparams_ubatch = (int) cp.n_ubatch;
 
         if (o.eos_set) for (int64_t t : o.eos_ids) eos.insert((llama_token) t);
         else {
@@ -492,6 +600,132 @@ public:
                 eos.insert(248046);
             }
         }
+        setup_hybrid();
+        return true;
+    }
+
+    int cparams_ubatch = 512;
+
+    // ------------------------------------------------------------------------------ the hybrid expert cache
+
+    // Allocates the cache in what the card has left, attaches it to the model and, unless told not to, checks on the
+    // first tokens that the hybrid graphs give the usual answers.  A failure leaves the engine as it was without a cache.
+    void setup_hybrid() {
+        if (o.expert_cache == "off" || o.info) return;
+        q35::HybridConfig hc;
+        const bool sim = o.expert_cache == "sim";
+        hc.mode = sim ? "sim" : "cache";
+        if (!sim && o.expert_cache != "auto") hc.budget_mib = std::atoll(o.expert_cache.c_str());
+        hc.slots_per_layer = o.cache_slots;
+        hc.margin_mib = o.fit_margin_mib;
+        hc.in_ram = o.cache_in_ram;
+        hc.max_tokens = o.cache_tokens;
+        if (!o.cache_in_ram && hc.max_tokens > 31) {
+            // llama.cpp hands an operation on a batch of 32 or more tokens to the card, copying the CPU's weights over PCIe
+            std::fprintf(stderr, "strata-q35: --cache-tokens %d lowered to 31 (batches of 32 tokens or more are computed by the card as llama.cpp does)\n", hc.max_tokens);
+            hc.max_tokens = 31;
+        }
+        hc.n_ubatch = cparams_ubatch;
+        hc.policy = o.cache_policy;
+        hc.profile = o.cache_profile;
+        hc.sim_pct = o.sim_pct;
+        hc.verbose = o.verbose;
+        std::unique_ptr<q35::HybridExperts> h(new q35::HybridExperts);
+        std::string why;
+        if (!h->init(model, o.model, hc, why)) {
+            std::fprintf(stderr, "strata-q35: no expert cache: %s\n", why.c_str());
+            if (cache_placed) std::fprintf(stderr, "strata-q35: (the experts are in RAM anyway; run with --expert-cache off to let the fit place them)\n");
+            return;
+        }
+        hx = std::move(h);
+        hx->attach(model);
+        if (hx->caching() && o.cache_check && !check_hybrid(why)) {
+            std::fprintf(stderr, "strata-q35: the expert cache was switched off: %s\n", why.c_str());
+            hx->detach(model);
+            hx.reset();
+            // graphs built so far may include the cache: a fresh context
+            reset_context();
+            return;
+        }
+        if (hx) {
+            placement += "; expert cache: " + hx->describe();
+            if (!hx->caching()) offload_tag += "+sim";
+        }
+    }
+
+    llama_context_params saved_cp{};
+
+    void reset_context() {
+        if (ctx) llama_free(ctx);
+        ctx = llama_init_from_model(model, saved_cp);
+        if (ctx) { mem = llama_get_memory(ctx); llama_set_abort_callback(ctx, abort_cb, nullptr); }
+        live.clear();
+        ckpts.clear();
+    }
+
+    // The same tokens through the usual graphs and through the hybrid ones: the same answers, up to float rounding.
+    bool check_hybrid(std::string& why) {
+        if (o.cache_tokens < 2) { std::fprintf(stderr, "strata-q35: expert cache check skipped (--cache-tokens 1)\n"); return true; }
+        const std::string text = "The quick brown fox jumps over the lazy dog. Mixture of experts models route each token to a few experts.";
+        std::vector<llama_token> toks(text.size() + 8);
+        int n = llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), toks.data(), (int32_t) toks.size(), true, true);
+        if (n < 2) { why = "the check text did not tokenize"; return false; }
+        toks.resize((size_t) std::min(n, o.cache_tokens));
+        const int steps = 6;
+        auto forward = [&](std::vector<std::vector<float>>& out, std::vector<llama_token>& picked) -> bool {
+            clear_all();
+            if (decode(toks.data(), (int) toks.size(), true) != 0) return false;
+            for (int i = 0; i <= steps; ++i) {
+                const float* lg = llama_get_logits_ith(ctx, -1);
+                if (!lg) return false;
+                out.emplace_back(lg, lg + n_vocab);
+                if (i == steps) break;
+                const llama_token next = (llama_token) (std::max_element(lg, lg + n_vocab) - lg);
+                picked.push_back(next);
+                if (decode(&next, 1, true) != 0) return false;
+            }
+            return true;
+        };
+        const int fill0 = hx->fill_swaps();
+        hx->set_fill_swaps(1 << 20);            // the first pass fills the cache with what the prompt used
+        std::vector<std::vector<float>> a, b;
+        std::vector<llama_token> pa, pb;
+        hx->set_enabled(false);
+        bool ok = forward(a, pa);
+        hx->set_enabled(true);
+        hx->reset_stats();
+        if (ok) ok = forward(b, pb);
+        const q35::CacheStats cs = hx->stats();
+        hx->set_fill_swaps(fill0);
+        clear_all();
+        if (!ok) { why = "a decode failed during the check"; return false; }
+        double worst = 0;
+        for (size_t i = 0; i < a.size() && i < b.size(); ++i) {
+            const auto top = std::max_element(a[i].begin(), a[i].end());
+            double sum = 0;
+            int cnt = 0;
+            for (size_t v = 0; v < a[i].size(); ++v) {
+                if (a[i][v] < *top - 8.0f) continue;     // the tokens that matter
+                sum += std::fabs((double) a[i][v] - (double) b[i][v]);
+                ++cnt;
+            }
+            worst = std::max(worst, cnt ? sum / cnt : 0.0);
+            const llama_token ta = (llama_token) (top - a[i].begin());
+            const llama_token tb = (llama_token) (std::max_element(b[i].begin(), b[i].end()) - b[i].begin());
+            if (ta != tb) {
+                std::vector<float> s = a[i];
+                std::partial_sort(s.begin(), s.begin() + 2, s.end(), std::greater<float>());
+                if (s[0] - s[1] > 0.05f) {
+                    why = "step " + std::to_string(i) + ": the best token is " + std::to_string(ta) + " without the cache and " +
+                          std::to_string(tb) + " with it";
+                    return false;
+                }
+            }
+        }
+        if (worst > 0.1) { why = "the logits differ by " + std::to_string(worst) + " on average (more than rounding)"; return false; }
+        std::fprintf(stderr, "strata-q35: expert cache check passed (mean logit difference %.4f, %.0f%% of the expert uses were cache hits)\n",
+                     worst, cs.lookups ? 100.0 * (double) cs.hits / (double) cs.lookups : 0.0);
+        hx->reset_stats();
         return true;
     }
 
@@ -553,7 +787,26 @@ public:
 
     // Feeds toks[0, n) at positions live.size() ...; `want_logits` asks for the last one's logits.
     // Returns 0, or the llama_decode code; on an abort (2) `live` has grown by what the memory really holds.
+    // With the expert cache, one llama_decode runs one micro-batch, so the routing it recorded is whole.
+    bool hybrid_on = true;   // false while a measurement runs without the cache
+    bool hx_live() const { return hx && hx->ready() && hybrid_on; }
+
     int decode(const llama_token* toks, int n, bool want_logits) {
+        if (!hx_live() || n <= cparams_ubatch) {
+            const int rc = decode_piece(toks, n, want_logits);
+            if (rc == 0 && hx_live()) hx->after_decode(n);
+            return rc;
+        }
+        for (int off = 0; off < n; off += cparams_ubatch) {
+            const int len = std::min(cparams_ubatch, n - off);
+            const int rc = decode_piece(toks + off, len, want_logits && off + len == n);
+            if (rc != 0) return rc;
+            hx->after_decode(len);
+        }
+        return 0;
+    }
+
+    int decode_piece(const llama_token* toks, int n, bool want_logits) {
         const int32_t p0 = (int32_t) live.size();
         batch.n_tokens = n;
         for (int i = 0; i < n; ++i) {
@@ -762,9 +1015,11 @@ public:
             }
         }
         const std::string arch = meta_str(model, "general.architecture");
-        std::printf("INFO context=%lld kv=%s kv_resident=0 expert_slots=0 expert_cache_mib=0 spec=0 vram_free_mib=%lld "
+        const int slots = hx && hx->caching() ? hx->slots_total() : 0;
+        const long long cache_mib = hx && hx->caching() ? (long long) (hx->cache_bytes() >> 20) : 0;
+        std::printf("INFO context=%lld kv=%s kv_resident=0 expert_slots=%d expert_cache_mib=%lld spec=0 vram_free_mib=%lld "
                     "arch=%s n_expert=%s n_expert_used=%s offload=%s engine=q35-" STRATA_Q35_VERSION "\n",
-                    (long long) o.max_context, o.kv.c_str(), (long long) (vfree >> 20), arch.c_str(),
+                    (long long) o.max_context, o.kv.c_str(), slots, cache_mib, (long long) (vfree >> 20), arch.c_str(),
                     meta_str(model, (arch + ".expert_count").c_str()).c_str(),
                     meta_str(model, (arch + ".expert_used_count").c_str()).c_str(), offload_tag.c_str());
         (void) vtotal;
@@ -867,16 +1122,20 @@ public:
             std::printf("PP %d %d %.0f %.1f\n", done, total, ms, rate);
             std::fflush(stdout);
         };
+        const q35::CacheStats cs0 = hx ? hx->stats() : q35::CacheStats();
         const bool ok = run(ids, r, res, hk, err);
         if (!ok) {
             std::printf("ERR %s\n", err.c_str());
             std::fflush(stdout);
             return;
         }
+        const q35::CacheStats cs1 = hx ? hx->stats() : q35::CacheStats();
         // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused>
         //      [hits] [lookups] [RAM blobs] [file blobs] [file MB] [prompt tokens read] [offloaded]
-        std::printf("DONE %lld %lld %.1f %.1f %s 0 0 %lld 0 0 0 0 0.0 %lld 0\n", res.produced, (long long) n, res.prompt_ms,
-                    res.decode_ms, res.finish, res.resume, res.read_n);
+        // with the expert cache: the expert uses the card served, all expert uses, and the experts copied into the cache
+        std::printf("DONE %lld %lld %.1f %.1f %s 0 0 %lld %llu %llu 0 0 0.0 %lld %llu\n", res.produced, (long long) n, res.prompt_ms,
+                    res.decode_ms, res.finish, res.resume, (unsigned long long) (cs1.hits - cs0.hits),
+                    (unsigned long long) (cs1.lookups - cs0.lookups), res.read_n, (unsigned long long) (cs1.swaps - cs0.swaps));
         std::fflush(stdout);
     }
 
@@ -1003,14 +1262,170 @@ public:
             std::fwrite(s.data(), 1, s.size(), stdout);
             std::fflush(stdout);
         };
+        const q35::CacheStats cs0 = hx ? hx->stats() : q35::CacheStats();
         const bool ok = run(ids, r, res, hk, err);
         std::printf("\n");
         if (!ok) { std::fprintf(stderr, "strata-q35: %s\n", err.c_str()); return 1; }
+        if (hx_live()) report_cache(cs0);
         const double ptok = res.prompt_ms > 0 ? (double) res.read_n * 1000.0 / res.prompt_ms : 0.0;
         const double dtok = res.decode_ms > 0 ? (double) res.produced * 1000.0 / res.decode_ms : 0.0;
         std::fprintf(stderr, "strata-q35: prompt %lld tokens at %.1f tokens/s, answer %lld tokens at %.1f tokens/s (%s)\n",
                      (long long) res.read_n, ptok, (long long) res.produced, dtok, res.finish);
         return 0;
+    }
+
+
+    // ------------------------------------------------------------------------------ measuring
+
+    void print_sims(FILE* f) {
+        if (!hx) return;
+        const auto sims = hx->sims();
+        if (sims.empty()) return;
+        std::fprintf(f, "strata-q35: a cache of  ");
+        for (const auto& s : sims) std::fprintf(f, "%d%% (%d per layer)  ", s.pct, s.slots);
+        std::fprintf(f, "\nstrata-q35: would have served ");
+        for (const auto& s : sims) std::fprintf(f, "%.1f%%  ", 100.0 * s.stats.rate());
+        std::fprintf(f, "of the expert uses of the tokens generated so far\n");
+    }
+
+    void report_cache(const q35::CacheStats& before) {
+        const q35::CacheStats now = hx->stats();
+        if (hx->caching()) {
+            const unsigned long long l = now.lookups - before.lookups, h = now.hits - before.hits;
+            std::fprintf(stderr,
+                         "strata-q35: expert cache: %.1f%% of the expert uses were served by the card (%llu of %llu); %llu experts copied in; "
+                         "%d of %d slots used; %.0f ms of upkeep in all\n",
+                         l ? 100.0 * (double) h / (double) l : 0.0, h, l, (unsigned long long) (now.swaps - before.swaps), hx->slots_used(),
+                         hx->slots_total(), hx->update_ms());
+        }
+        print_sims(stderr);
+    }
+
+    std::vector<llama_token> text_tokens(const std::string& text) {
+        std::vector<llama_token> t(text.size() + 16);
+        int n = llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), t.data(), (int32_t) t.size(), false, false);
+        if (n < 0) {
+            t.resize((size_t) -n);
+            n = llama_tokenize(vocab, text.c_str(), (int32_t) text.size(), t.data(), (int32_t) t.size(), false, false);
+        }
+        t.resize((size_t) std::max(n, 0));
+        return t;
+    }
+
+    struct BenchRow {
+        double pp_ms = 0, tg_ms = 0;
+        std::vector<double> tok_ms;
+        q35::CacheStats cs;
+        double upkeep_ms = 0;
+    };
+
+    // One prompt of `prompt`, then `n_gen` greedy tokens, timed.
+    bool bench_once(const std::vector<llama_token>& prompt, int n_gen, BenchRow& row) {
+        clear_all();
+        g_stop.store(false);
+        const int n = (int) prompt.size();
+        const auto t0 = Clock::now();
+        for (int pos = 0; pos < n;) {
+            const int chunk = std::min(o.n_batch, n - pos);
+            if (decode(prompt.data() + pos, chunk, pos + chunk == n) != 0) return false;
+            pos += chunk;
+        }
+        row.pp_ms = ms_since(t0);
+        if (hx_live()) hx->reset_stats();
+        Request r;
+        llama_sampler* smpl = make_sampler(r, prompt);
+        const auto t1 = Clock::now();
+        bool ok = true;
+        for (int i = 0; i < n_gen; ++i) {
+            const llama_token tok = llama_sampler_sample(smpl, ctx, -1);
+            const auto ta = Clock::now();
+            if (decode(&tok, 1, true) != 0) { ok = false; break; }
+            row.tok_ms.push_back(ms_since(ta));
+        }
+        row.tg_ms = ms_since(t1);
+        llama_sampler_free(smpl);
+        if (hx_live()) { row.cs = hx->stats(); row.upkeep_ms = hx->update_ms(); }
+        return ok;
+    }
+
+    static double percentile(std::vector<double> v, double q) {
+        if (v.empty()) return 0;
+        std::sort(v.begin(), v.end());
+        return v[(size_t) std::min<double>((double) v.size() - 1, std::floor(q * (double) v.size()))];
+    }
+
+    // Returns the median generation speed, tokens/s (0: failed).
+    double bench_run(const char* label, const std::vector<llama_token>& prompt) {
+        std::vector<double> speeds;
+        for (int rep = 1; rep <= o.bench_reps; ++rep) {
+            BenchRow row;
+            if (hx_live()) hx->reset_stats();
+            if (!bench_once(prompt, o.bench_tg, row)) { std::fprintf(stderr, "strata-q35: bench: a decode failed\n"); return 0; }
+            const double pp = row.pp_ms > 0 ? (double) prompt.size() * 1000.0 / row.pp_ms : 0.0;
+            const double tg = row.tg_ms > 0 ? (double) row.tok_ms.size() * 1000.0 / row.tg_ms : 0.0;
+            speeds.push_back(tg);
+            std::printf("bench[%s] %d/%d  prompt %zu tokens %.1f tok/s | generation %zu tokens %.2f tok/s (%.1f ms/token, median %.1f, p95 %.1f)",
+                        label, rep, o.bench_reps, prompt.size(), pp, row.tok_ms.size(), tg,
+                        row.tok_ms.empty() ? 0.0 : row.tg_ms / (double) row.tok_ms.size(), percentile(row.tok_ms, 0.5), percentile(row.tok_ms, 0.95));
+            if (hx_live() && hx->caching())
+                std::printf(" | cache: %.1f%% hits, %.2f copies/token, %.2f ms upkeep/token, %d/%d slots",
+                            100.0 * row.cs.rate(), row.tok_ms.empty() ? 0.0 : (double) row.cs.swaps / (double) row.tok_ms.size(),
+                            row.tok_ms.empty() ? 0.0 : row.upkeep_ms / (double) (row.tok_ms.size() + 1), hx->slots_used(), hx->slots_total());
+            std::printf("\n");
+            std::fflush(stdout);
+        }
+        std::sort(speeds.begin(), speeds.end());
+        const double med = speeds[speeds.size() / 2];
+        std::printf("bench[%s] generation: median %.2f tok/s (best %.2f, worst %.2f)\n", label, med, speeds.back(), speeds.front());
+        std::fflush(stdout);
+        return med;
+    }
+
+    int bench() {
+        std::string text = o.prompt;
+        if (!o.prompt_file.empty()) {
+            std::ifstream f(o.prompt_file, std::ios::binary);
+            if (!f) { std::fprintf(stderr, "strata-q35: cannot read %s\n", o.prompt_file.c_str()); return 1; }
+            std::stringstream ss;
+            ss << f.rdbuf();
+            text = ss.str();
+        }
+        if (text.empty())
+            text = "Mixture-of-experts language models send every token to a few of many small feed-forward networks. "
+                   "Which experts a token needs depends on its meaning: code, prose, numbers and several languages each prefer "
+                   "their own. A server that keeps the popular experts close to the processor can skip most of the memory traffic. "
+                   "Write a short essay explaining how such a cache could decide what to keep, and give a small example in Python. ";
+        const std::vector<llama_token> base = text_tokens(text);
+        if (base.empty()) { std::fprintf(stderr, "strata-q35: the bench text has no tokens\n"); return 1; }
+        if (o.bench_pp < 2) { std::fprintf(stderr, "strata-q35: --bench-pp must be at least 2\n"); return 1; }
+        if ((int64_t) o.bench_pp + o.bench_tg + 8 > o.max_context) {
+            std::fprintf(stderr, "strata-q35: --bench-pp + --bench-tg exceed --max-context (%lld)\n", (long long) o.max_context);
+            return 1;
+        }
+        std::vector<llama_token> prompt((size_t) o.bench_pp);
+        for (size_t i = 0; i < prompt.size(); ++i) prompt[i] = base[i % base.size()];
+        std::printf("bench: %s; prompt %d tokens, generate %d, %d runs, %d threads\n", placement.c_str(), o.bench_pp, o.bench_tg, o.bench_reps,
+                    o.threads > 0 ? o.threads : physical_cores());
+        double with_cache = 0, without = 0;
+        const bool cached = hx && hx->caching();
+        if (cached) with_cache = bench_run("cache", prompt);
+        else if (hx) with_cache = bench_run("sim", prompt);
+        else with_cache = bench_run("usual", prompt);
+        if (hx) { std::fflush(stdout); print_sims(stdout); }
+        if (cached && o.bench_compare) {
+            // the usual graphs on a fresh context: what llama.cpp alone does with the same placement
+            hybrid_on = false;
+            hx->detach(model);
+            reset_context();
+            without = bench_run("usual", prompt);
+            hx->attach(model);
+            hybrid_on = true;
+            reset_context();
+            if (with_cache > 0 && without > 0)
+                std::printf("bench: the cache makes generation %.2fx the speed of the usual graphs (%.2f vs %.2f tok/s)\n", with_cache / without,
+                            with_cache, without);
+        }
+        return with_cache > 0 ? 0 : 1;
     }
 
     void print_info() {
@@ -1065,6 +1480,7 @@ int main(int argc, char** argv) {
     if (!o.info) std::fprintf(stderr, "strata-q35: %s; context %lld, K/V %s\n", eng.placement.c_str(), (long long) o.max_context,
                               o.kv.c_str());
     if (o.info) eng.print_info();
+    else if (o.bench) rc = eng.bench();
     else if (o.serve) eng.serve();
     else rc = eng.generate_text();
     engp.reset();   // the model goes before the backends do

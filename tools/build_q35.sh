@@ -134,6 +134,27 @@ else
     echo "build_q35: WARNING: $LLAMA_DIR is not at $SHA; the engine was written against that commit and may not build" >&2
 fi
 
+# ---- the patches (q35/patches): the hybrid expert cache is a change to llama.cpp's graph builder and CPU kernels
+for PATCH in q35/patches/*.patch; do
+  [ -f "$PATCH" ] || continue
+  STAMP="$LLAMA_DIR/.strata-patched-$(basename "$PATCH" .patch)"
+  [ -f "$STAMP" ] && continue
+  PATCH_ABS="$(cd "$(dirname "$PATCH")" && pwd)/$(basename "$PATCH")"
+  if command -v patch >/dev/null 2>&1; then
+    if (cd "$LLAMA_DIR" && patch -p1 -R --dry-run -s -f < "$PATCH_ABS" >/dev/null 2>&1); then :   # already in
+    else (cd "$LLAMA_DIR" && patch -p1 -s -f < "$PATCH_ABS") || { echo "build_q35: $PATCH does not apply to $LLAMA_DIR (is it at $SHA?)" >&2; exit 1; }
+    fi
+  elif command -v git >/dev/null 2>&1; then
+    if (cd "$LLAMA_DIR" && git apply --reverse --check "$PATCH_ABS" >/dev/null 2>&1); then :
+    else (cd "$LLAMA_DIR" && git apply "$PATCH_ABS") || { echo "build_q35: $PATCH does not apply to $LLAMA_DIR (is it at $SHA?)" >&2; exit 1; }
+    fi
+  else
+    echo "build_q35: needs patch(1) or git to apply $PATCH (yum install patch)" >&2; exit 1
+  fi
+  touch "$STAMP"
+  echo "build_q35: applied $PATCH"
+done
+
 [ "$CLEAN" = 1 ] && rm -rf "$BUILD_DIR"
 [ -n "$JOBS" ] || JOBS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
 

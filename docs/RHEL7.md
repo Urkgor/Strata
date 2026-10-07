@@ -27,7 +27,7 @@ Red Hat's Software Collections give GCC 11 beside the system's:
 # RHEL 7:    sudo subscription-manager repos --enable rhel-server-rhscl-7-rpms
 # CentOS 7:  sudo yum install centos-release-scl         (CentOS 7 ended in 2024: its repositories moved to vault.centos.org)
 sudo yum install devtoolset-11-gcc-c++ devtoolset-11-binutils
-sudo yum install cmake3 git      # EPEL's cmake3 is 3.17: enough for a CPU build. For CUDA (3.18+): python3 -m pip install --user cmake
+sudo yum install cmake3 git patch      # EPEL's cmake3 is 3.17: enough for a CPU build. For CUDA (3.18+): python3 -m pip install --user cmake
 ```
 
 `devtoolset-11` also brings the newer binutils that AVX-512 and VNNI code needs. `tools/build_q35.sh` enables
@@ -60,6 +60,8 @@ tools/check_glibc_symbols.sh build-q35/strata-q35           # RHEL 7: nothing ab
 The script fetches llama.cpp (one commit, about 30 MB) into `third_party/llama.cpp-src`: with `git fetch --depth 1`, else
 with `curl` and the tarball. **Offline or behind a proxy:** clone `https://github.com/ggml-org/llama.cpp` elsewhere, check out the
 commit in `third_party/ggml/VERSION.txt`, copy it over and pass `--llama-cpp DIR`.
+
+The build applies the engine's patch to those sources (the [expert cache](Q35.md#the-expert-cache-what-makes-it-more-than-llamacpp); it needs `patch` or `git`).
 
 The first build takes 5 to 20 minutes (llama.cpp and its CUDA kernels); later ones rebuild only what changed.
 `--portable` builds for an AVX2 baseline instead of the build machine's CPU, so one binary serves several servers of the
@@ -114,4 +116,5 @@ but `127.0.0.1`, set an API key (`STRATA_API_KEY`).
 | `illegal instruction` | built with `GGML_NATIVE` on a newer CPU than this one: rebuild with `--portable` |
 | `CUDA error: no kernel image is available` | `--arch` missed your card's compute capability: rebuild with `--arch "<yours>"` |
 | `could not create the context` | not enough memory for `--max-context`: lower it, use `--kv q8_0`, or `--cpu-moe` |
-| the model loads, but writing is slow | the experts do not fit the card: `--cpu-moe` and `--threads` = physical cores; `numactl` on several sockets |
+| the model loads, but writing is slow | the experts do not fit the card: `--expert-cache auto` (with `--cpu-moe` or on its own), `--threads` = physical cores; `numactl` on several sockets; [measure what the cache gives](Q35.md#measuring-what-the-cache-gives-you) |
+| `no expert cache: ...` | the line says why (the whole model fits the card, no card in this build, per-expert scales); `the expert cache was switched off` means its first-tokens check failed on your card: please report it with `--verbose` |

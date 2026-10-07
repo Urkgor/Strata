@@ -1,0 +1,416 @@
+diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
+index f5e419c..4565aba 100644
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -4171,11 +4171,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+                     size = GGML_PAD(size, sizeof(int64_t)); // + padding for next block.
+ 
+                     const int64_t ne02 = op->src[0]->ne[2]; // n_as, n_expert
+-                    const int64_t ne12 = op->src[1]->ne[2]; // n_tokens
++                    // room for every (slot, token) pair of `ids` in each expert's list: an expert may be named by
++                    // several slots of one token (Strata's hybrid expert cache does), not only once per token
++                    const int64_t n_pairs = op->src[2]->ne[0] * op->src[2]->ne[1];
+ 
+                     const size_t sizeof_mmid_row_mapping = sizeof(int64_t);
+ 
+-                    size += sizeof_mmid_row_mapping*ne02*(ne12 + 1);
++                    size += sizeof_mmid_row_mapping*ne02*(n_pairs + 1);
+ 
+                     return true;
+                 }
+@@ -4425,17 +4427,20 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+             int32_t i2;
+         };
+ 
++        // room for every (slot, token) pair in each expert's list (see work_size)
++        const int64_t n_pairs = ids->ne[0] * ids->ne[1];
++
+         GGML_ASSERT(params->wsize >=
+                 (GGML_PAD(nbw3, sizeof(int64_t)) +
+-                 n_as*(ne12 + 1)*sizeof(mmid_row_mapping))
++                 n_as*(n_pairs + 1)*sizeof(mmid_row_mapping))
+                 );
+ 
+         auto * wdata          = (char *)params->wdata;
+         auto * wdata_src1_end = (char *)wdata + GGML_PAD(nbw3, sizeof(int64_t));
+ 
+-        // total of [n_as][ne12 + 1] elements of type mmid_row_mapping (2*int32_t = int64_t)
++        // total of [n_as][n_pairs + 1] elements of type mmid_row_mapping (2*int32_t = int64_t)
+         auto * matrix_row_counts = (int64_t *) (wdata_src1_end);                                        // [n_as]
+-        struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (matrix_row_counts + n_as); // [n_as][ne12]
++        struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (matrix_row_counts + n_as); // [n_as][n_pairs]
+ 
+         // src1: float32 => param type
+         for (int64_t i12 = 0; i12 < ne12; ++i12) {
+@@ -4446,7 +4451,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+             }
+         }
+ 
+-#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id) * ne12 + (i1)]
++#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id) * n_pairs + (i1)]
+ 
+         if (ith == 0) {
+             // initialize matrix_row_counts
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index ef53728..f1d7289 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -9,6 +9,7 @@
+ #include "llama-memory.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
++#include "llama-hybrid.h"
+ #include "llama-ext.h"
+ #include "llama-sampler.h"
+ #include "llama.h"
+@@ -2514,6 +2515,8 @@ llm_graph_params llama_context::graph_params(
+         /*.n_outputs   =*/ n_outputs,
+         /*.cb          =*/ graph_get_cb(),
+         /*.res         =*/ res,
++        /*.hybrid      =*/ model.hybrid,
++        /*.hybrid_on   =*/ model.hybrid && model.hybrid->enabled,
+     };
+ }
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index fd4290c..b87f849 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -4,6 +4,7 @@
+ #include "llama-model.h"
+ #include "llama-batch.h"
+ #include "llama-cparams.h"
++#include "llama-hybrid.h"
+ #include "llama-sampler.h"
+ 
+ #include "llama-kv-cache.h"
+@@ -1490,6 +1491,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     mctx             (params.mctx),
+     cross            (params.cross),
+     samplers         (params.samplers),
++    hybrid           (params.hybrid),
++    hybrid_on        (params.hybrid_on),
+     cb_func          (params.cb),
+     res              (params.res),
+     ctx0             (res->get_ctx()),
+@@ -2154,6 +2157,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     //call early so that topk-moe can be used
+     ggml_build_forward_expand(gf, weights);
+ 
++    // Strata's hybrid expert cache (llama-hybrid.h): the routing is recorded for the host, and a small batch is built
++    // with the cached experts on the card and the others on the CPU
++    if (hybrid) {
++        const bool plain = !weight_before_ffn && !gate_inp_b && !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b &&
++                           !up_exps_s && !gate_exps_s && !down_exps_s;
++        if (ggml_tensor * hybrid_out = build_moe_hybrid(cur, selected_experts, weights, up_exps, gate_exps, gate_up_exps, down_exps,
++                                                        n_expert, n_expert_used, type_op, plain, il)) {
++            return hybrid_out;
++        }
++    }
++
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+ 
+     if (weight_before_ffn) {
+@@ -2354,6 +2368,107 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     return moe_out;
+ }
+ 
++// Strata's hybrid expert cache: see llama-hybrid.h
++ggml_tensor * llm_graph_context::build_moe_hybrid(
++         ggml_tensor * cur,
++         ggml_tensor * ids,
++         ggml_tensor * weights,
++         ggml_tensor * up_exps,
++         ggml_tensor * gate_exps,
++         ggml_tensor * gate_up_exps,
++         ggml_tensor * down_exps,
++             int64_t   n_expert,
++             int64_t   n_expert_used,
++     llm_ffn_op_type   type_op,
++                bool   plain,
++                 int   il) const {
++    const llama_hybrid * hy = hybrid;
++    if (!hy || il < 0 || (size_t) il >= hy->layers.size()) {
++        return nullptr;
++    }
++    const llama_hybrid_layer & L = hy->layers[il];
++    const int64_t n_embd   = cur->ne[0];
++    const int64_t n_tokens = cur->ne[1];
++    GGML_UNUSED(n_expert);
++
++    // the router's choice, for the host: also while the layer is built the usual way (a long prompt teaches the cache)
++    if (L.trace && n_tokens <= hy->trace_tokens && L.trace->ne[0] == n_expert_used && il < L.trace->ne[1]) {
++        ggml_tensor * dst = ggml_view_2d(ctx0, L.trace, n_expert_used, n_tokens, L.trace->nb[2], (size_t) il * L.trace->nb[1]);
++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ids, dst));
++    }
++
++    if (!hybrid_on || !plain || !L.hit_f || !L.slot_i || !L.miss_f || !L.cpu_i || !L.down ||
++        n_tokens > hy->max_tokens || cur->ne[2] != 1 || type_op != LLM_FFN_SILU) {
++        return nullptr;
++    }
++    if (hparams.swiglu_clamp_exp[il] > 1e-6f) {
++        return nullptr;
++    }
++    const bool merged = gate_up_exps != nullptr;
++    if (merged ? !L.gate_up : !(L.up && L.gate && up_exps && gate_exps)) {
++        return nullptr;
++    }
++
++    ggml_tensor * ids_c    = ggml_is_contiguous(ids) ? ids : ggml_cont(ctx0, ids);
++    ggml_tensor * ids_flat = ggml_reshape_2d(ctx0, ids_c, n_expert_used * n_tokens, 1);
++    auto lookup = [&](ggml_tensor * table) { return ggml_get_rows(ctx0, table, ids_flat); };   // [1, n_used * n_tokens]
++    auto per_slot = [&](ggml_tensor * t) { return ggml_reshape_3d(ctx0, t, 1, n_expert_used, n_tokens); };
++
++    // One half of the layer: `ids2` [n_used, n_tokens] picks the experts out of up_t / gate_t / down_t, `w3` weighs them.
++    // Returns [n_embd, n_used, n_tokens]: what every slot of every token contributes.
++    auto half = [&](ggml_tensor * up_t, ggml_tensor * gate_t, ggml_tensor * gate_up_t, ggml_tensor * down_t,
++                    ggml_tensor * ids2, ggml_tensor * w3, const char * part) -> ggml_tensor * {
++        ggml_tensor * x = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
++        ggml_tensor * g = nullptr;
++        ggml_tensor * u = nullptr;
++        if (gate_up_t) {
++            ggml_tensor * gu = ggml_mul_mat_id(ctx0, gate_up_t, x, ids2);
++            const int64_t n_ff = gu->ne[0] / 2;
++            g = ggml_view_3d(ctx0, gu, n_ff, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], 0);
++            u = ggml_view_3d(ctx0, gu, n_ff, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], n_ff * gu->nb[0]);
++        } else {
++            u = ggml_mul_mat_id(ctx0, up_t, x, ids2);
++            g = ggml_mul_mat_id(ctx0, gate_t, x, ids2);
++        }
++        cb(u, (std::string("ffn_moe_up_") + part).c_str(), il);
++        ggml_tensor * h = ggml_swiglu_split(ctx0, g, u);
++        ggml_tensor * e = ggml_mul_mat_id(ctx0, down_t, h, ids2);   // [n_embd, n_used, n_tokens]
++        e = ggml_mul(ctx0, e, w3);
++        cb(e, (std::string("ffn_moe_down_") + part).c_str(), il);
++        ggml_build_forward_expand(gf, e);
++        return e;
++    };
++
++    // The card first: the experts that are in the cache (the others get weight 0 and slot 0).
++    ggml_tensor * slot  = ggml_reshape_2d(ctx0, lookup(L.slot_i), n_expert_used, n_tokens);
++    ggml_tensor * w_hit = ggml_mul(ctx0, weights, per_slot(lookup(L.hit_f)));
++    ggml_tensor * e_card = half(L.up, L.gate, L.gate_up, L.down, slot, w_hit, "hot");
++
++    // Then the CPU: the experts that are not.  The cached ones are replaced by one stand-in expert with weight 0, so a
++    // token may name the same expert several times.  The CPU's mul_mat_id keeps room for that: the generic one always
++    // did, and the repacked one (ggml-cpu/repack.cpp) does since the same patch.
++    ggml_tensor * rid    = ggml_reshape_2d(ctx0, lookup(L.cpu_i), n_expert_used, n_tokens);
++    ggml_tensor * w_miss = ggml_mul(ctx0, weights, per_slot(lookup(L.miss_f)));
++    ggml_tensor * e_cpu  = half(up_exps, gate_exps, gate_up_exps, down_exps, rid, w_miss, "cold");
++
++    // For every slot exactly one of the two is not zero, so the sum is exact; the slots are then added in the order
++    // build_moe_ffn adds them, which makes the result the same as without the cache (up to the kernels' own differences).
++    ggml_tensor * e = ggml_add(ctx0, e_card, e_cpu);
++    ggml_build_forward_expand(gf, e);
++
++    ggml_tensor * moe_out = ggml_view_2d(ctx0, e, n_embd, n_tokens, e->nb[2], 0);
++    ggml_build_forward_expand(gf, moe_out);
++    for (int64_t i = 1; i < n_expert_used; ++i) {
++        moe_out = ggml_add(ctx0, moe_out, ggml_view_2d(ctx0, e, n_embd, n_tokens, e->nb[2], i * e->nb[1]));
++        ggml_build_forward_expand(gf, moe_out);
++    }
++    if (n_expert_used == 1) {
++        moe_out = ggml_cont(ctx0, moe_out);
++    }
++    cb(moe_out, "ffn_moe_out", il);
++    return moe_out;
++}
++
+ // input embeddings with optional lora
+ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
+     const int64_t n_embd_inp = hparams.n_embd_inp();
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index cc41106..f13bec5 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -810,6 +810,11 @@ struct llm_graph_params {
+ 
+     llm_graph_result * res;
+ 
++    // Strata's hybrid expert cache (llama-hybrid.h); `hybrid_on`: the layers are built with it (a change of either
++    // is a different graph)
++    const struct llama_hybrid * hybrid = nullptr;
++    bool hybrid_on = false;
++
+     // return true if the "other" params would result in a graph with the same topology as with the current params
+     //   having the same topology allows us to reuse the graph in some cases
+     bool allow_reuse(const llm_graph_params & other) const {
+@@ -878,6 +883,8 @@ struct llm_graph_params {
+             cparams.causal_attn             == other.cparams.causal_attn             &&
+             arch  == other.arch  &&
+             gtype == other.gtype &&
++            hybrid    == other.hybrid    &&
++            hybrid_on == other.hybrid_on &&
+             cvec  == other.cvec  &&
+             loras == other.loras &&
+             cross == other.cross;
+@@ -1029,6 +1036,9 @@ struct llm_graph_context {
+ 
+     std::map<llama_seq_id, llama_sampler *> samplers;
+ 
++    const struct llama_hybrid * hybrid;   // llama-hybrid.h: null when off
++    const bool hybrid_on;
++
+     const llm_graph_cb & cb_func;
+ 
+     llm_graph_result * res;
+@@ -1110,6 +1120,23 @@ struct llm_graph_context {
+                      int   il) const;
+ 
+     // build MoE FFN without bias tensors
++    // Strata's hybrid expert cache (llama-hybrid.h): records the routing and, for a small batch, builds the layer with
++    // the cached experts on the card and the others on the CPU.  Returns the layer's output, or null when the layer
++    // is to be built the usual way.  `ids` [n_used, n_tokens] I32, `weights` [1, n_used, n_tokens] F32.
++    ggml_tensor * build_moe_hybrid(
++             ggml_tensor * cur,
++             ggml_tensor * ids,
++             ggml_tensor * weights,
++             ggml_tensor * up_exps,
++             ggml_tensor * gate_exps,
++             ggml_tensor * gate_up_exps,
++             ggml_tensor * down_exps,
++                 int64_t   n_expert,
++                 int64_t   n_expert_used,
++         llm_ffn_op_type   type_op,
++                    bool   plain,
++                     int   il) const;
++
+     ggml_tensor * build_moe_ffn(
+              ggml_tensor * cur,
+              ggml_tensor * gate_inp,
+diff --git a/src/llama-hybrid.h b/src/llama-hybrid.h
+new file mode 100644
+index 0000000..3dc57f3
+--- /dev/null
++++ b/src/llama-hybrid.h
+@@ -0,0 +1,69 @@
++#pragma once
++
++// Strata's hybrid expert cache (q35/patches/0001-hybrid-expert-cache.patch).
++//
++// The routed experts of a MoE layer that live in RAM are computed by the CPU.  Here, a few of them are also copied to
++// the graphics card; for those the card does the work and the CPU is asked for the others only.  The graph of a layer
++// is built like this when the batch is small (decoding):
++//
++//     ids [n_used, n_tokens]  the experts the router picked
++//     card:  slot  = slot_i[ids]            where in the cache an expert sits (0 when it is not there)
++//            w_hit = weights * hit_f[ids]   its weight, or exactly 0 when it is not in the cache
++//            out_card = sum_k  w_hit_k * down_cache[slot_k] (swiglu(gate_cache[slot_k] x, up_cache[slot_k] x))
++//     CPU:   id    = cpu_i[ids]             the expert itself, or one fixed stand-in when it is in the cache
++//            w_miss = weights * miss_f[ids]  its weight, or exactly 0 when it is in the cache
++//            out_cpu  = the same with the experts in RAM
++//     out = out_card + out_cpu
++//
++// An expert that is in the cache contributes w * E(x) on the card and 0 * E'(x) on the CPU (E' is the stand-in, read
++// once whatever the number of hits); one that is not contributes the other way round, so the output is the plain
++// mixture of experts, up to the order of the float additions.  The four small tables are rewritten by the host between
++// two decode calls; the weights of the experts are copied into the cache slots by the host too.
++//
++// The routing of every token (the ids) is also copied into `trace`, so the host learns which experts are hot.
++//
++// The host side is q35/hybrid_experts.cpp; the policy that decides what is cached is q35/expert_cache.h.
++
++#include "ggml.h"
++#include "llama.h"
++
++#include <vector>
++
++struct llama_hybrid_layer {
++    // the cache: [ne0, ne1, n_slots] like the model's own tensor, in the card's memory (null: no cache for this layer)
++    ggml_tensor * up      = nullptr;
++    ggml_tensor * gate    = nullptr;
++    ggml_tensor * gate_up = nullptr;   // when the model's gate and up are one tensor
++    ggml_tensor * down    = nullptr;
++
++    ggml_tensor * hit_f   = nullptr;   // F32 [1, n_expert] on the card: 1 when the expert is in the cache, else 0
++    ggml_tensor * slot_i  = nullptr;   // I32 [1, n_expert] on the card: its slot (0 when absent)
++    ggml_tensor * miss_f  = nullptr;   // F32 [1, n_expert] in RAM: 0 when the expert is in the cache, else 1
++    ggml_tensor * cpu_i   = nullptr;   // I32 [1, n_expert] in RAM: the expert's own id, or the stand-in when it is cached
++
++    // I32 [n_used, n_layer, trace_tokens] (token-major, one per card): the router's choice is copied to
++    // trace[:, il, token] by the graph; null: not recorded
++    ggml_tensor * trace   = nullptr;
++};
++
++struct llama_hybrid {
++    bool enabled      = false;   // false: every layer is built as in stock llama.cpp (the trace is still recorded)
++    int  max_tokens   = 16;      // the hybrid graph is used for batches of up to this many tokens
++    int  trace_tokens = 0;       // rows (tokens) of each trace tensor; a larger batch is not recorded
++    std::vector<llama_hybrid_layer> layers;   // by layer index (empty entries: no cache there)
++};
++
++// the experts of MoE layer il as the model holds them; false for a layer without routed experts
++struct llama_hybrid_experts {
++    ggml_tensor * gate_inp = nullptr;
++    ggml_tensor * up       = nullptr;
++    ggml_tensor * gate     = nullptr;
++    ggml_tensor * gate_up  = nullptr;
++    ggml_tensor * down     = nullptr;
++    bool          has_scales = false;   // per-expert scale tensors (not supported by the cache)
++};
++
++LLAMA_API bool llama_model_expert_tensors(const struct llama_model * model, int il, struct llama_hybrid_experts * out);
++
++// attaches `h` to the model (not owned; null detaches).  Call before the first decode of a context.
++LLAMA_API void llama_model_set_hybrid(struct llama_model * model, struct llama_hybrid * h);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index e195f50..0eb1a71 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3,6 +3,7 @@
+ #include "llama-arch.h"
+ #include "llama-ext.h"
+ #include "llama-hparams.h"
++#include "llama-hybrid.h"
+ #include "llama-impl.h"
+ #include "llama-mmap.h"
+ #include "llama-cparams.h"
+@@ -3357,3 +3358,25 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
+ 
+     return (uint32_t) nelements;
+ }
++
++bool llama_model_expert_tensors(const llama_model * model, int il, llama_hybrid_experts * out) {
++    if (!model || !out || il < 0 || (size_t) il >= model->layers.size()) {
++        return false;
++    }
++    const llama_layer & l = model->layers[il];
++    if (!l.ffn_gate_inp || !l.ffn_down_exps || !(l.ffn_up_exps || l.ffn_gate_up_exps)) {
++        return false;
++    }
++    out->gate_inp   = l.ffn_gate_inp;
++    out->up         = l.ffn_up_exps;
++    out->gate       = l.ffn_gate_exps;
++    out->gate_up    = l.ffn_gate_up_exps;
++    out->down       = l.ffn_down_exps;
++    out->has_scales = l.ffn_up_exps_s || l.ffn_gate_exps_s || l.ffn_down_exps_s ||
++                      l.ffn_up_exps_b || l.ffn_gate_exps_b || l.ffn_down_exps_b || l.ffn_gate_up_exps_b;
++    return true;
++}
++
++void llama_model_set_hybrid(llama_model * model, llama_hybrid * h) {
++    model->hybrid = h;
++}
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 984b2cf..f8bd387 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -609,6 +609,8 @@ struct llama_meta_device_get_split_state_userdata {
+ 
+ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
+ 
++struct llama_hybrid;   // llama-hybrid.h
++
+ struct llama_model {
+     llm_type type = LLM_TYPE_UNKNOWN;
+     llm_arch arch = LLM_ARCH_UNKNOWN;
+@@ -693,6 +695,9 @@ struct llama_model {
+ 
+     std::vector<llama_layer> layers;
+ 
++    // Strata's hybrid expert cache (llama-hybrid.h): not owned, null when off
++    struct llama_hybrid * hybrid = nullptr;
++
+     //Dense linear projections for SentenceTransformers models like embeddinggemma
+     // For Sentence Transformers models structure see
+     // https://sbert.net/docs/sentence_transformer/usage/custom_models.html#structure-of-sentence-transformer-models
