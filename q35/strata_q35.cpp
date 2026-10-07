@@ -23,6 +23,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "ggml-alloc.h"
 
 #include "hybrid_experts.h"
 #include "llama-hybrid.h"   // third_party/llama.cpp/src, added by the patch
@@ -132,6 +133,8 @@ struct Options {
     int bench_tg = 64;
     int bench_reps = 3;
     bool bench_compare = false;  // with a cache: also run without it
+    bool diag = false;           // --diag: what limits this PC (memory bandwidth, PCIe, the card), then a bench and a thread sweep
+    std::vector<int> bench_threads;   // --bench-threads: the same bench at each of these thread counts
     // one-shot generation (no --serve)
     std::string prompt;
     std::string prompt_file;
@@ -195,6 +198,9 @@ void usage() {
         "  --bench                read a prompt and generate, print tokens/s (needs --native; -p/-f for the text)\n"
         "  --bench-pp N, --bench-tg N, --bench-reps N     prompt tokens (512), generated tokens (64), repeats (3)\n"
         "  --bench-compare        with a cache: run it again without, to show what the cache gives\n"
+        "  --bench-threads A,B,.. the bench again at each CPU thread count (the best is not always all the cores)\n"
+        "  --diag                 what limits this PC: RAM bandwidth, the card's, PCIe; the bytes a token needs; a bench and a thread\n"
+        "                         sweep; where the time of a token goes (about a minute after the model loads)\n"
         "\n"
         "speculation (the model's answer is the same; some steps write several tokens)\n"
         "  --spec off|lookup      off (default) | lookup: guess the next tokens from a repeat in the prompt and the answer so far\n"
@@ -384,6 +390,18 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--no-probe") o.no_probe = true;
         else if (a == "--bench") o.bench = true;
         else if (a == "--bench-compare") o.bench_compare = true;
+        else if (a == "--diag") { o.diag = true; o.bench = true; }
+        else if (a == "--bench-threads") {
+            if (!(v = need(i, a.c_str()))) return false;
+            std::stringstream ss(v);
+            std::string tok;
+            o.bench_threads.clear();
+            while (std::getline(ss, tok, ',')) {
+                const int t = std::atoi(tok.c_str());
+                if (t < 1 || t > 4096) { err = "--bench-threads takes thread counts like 4,8,12"; return false; }
+                o.bench_threads.push_back(t);
+            }
+        }
         else if (a == "--bench-pp") { if (!num(a.c_str(), 1, 1 << 20, n)) return false; o.bench_pp = (int) n; }
         else if (a == "--bench-tg") { if (!num(a.c_str(), 1, 1 << 20, n)) return false; o.bench_tg = (int) n; }
         else if (a == "--bench-reps") { if (!num(a.c_str(), 1, 1000, n)) return false; o.bench_reps = (int) n; }
@@ -601,6 +619,18 @@ public:
             }
         }
         if (tp) llama_attach_threadpool(ctx, tp, tp_batch);
+    }
+
+    // A new CPU pool of `n` threads for both the answer and the prompt (the sweep of --bench-threads / --diag).
+    void apply_threads(int n) {
+        if (!ctx) return;
+        llama_detach_threadpool(ctx);
+        if (tp_batch) { ggml_threadpool_free(tp_batch); tp_batch = nullptr; }
+        if (tp) { ggml_threadpool_free(tp); tp = nullptr; }
+        o.threads = n;
+        o.threads_batch = n;
+        llama_set_n_threads(ctx, n, n);
+        attach_threads();
     }
 
     bool load(std::string& err) {
@@ -1655,6 +1685,186 @@ public:
         return med;
     }
 
+
+    // ------------------------------------------------------------------------------ --diag
+
+    // Bytes the CPU reads per second with `nt` threads (each sums its own slice of `buf`).
+    static double ram_read_gbs(const std::vector<uint64_t>& buf, int nt) {
+        const size_t per = buf.size() / (size_t) nt;
+        std::vector<uint64_t> sink((size_t) nt, 0);
+        auto work = [&](int ti) {
+            const uint64_t* p = buf.data() + (size_t) ti * per;
+            uint64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            for (size_t i = 0; i + 4 <= per; i += 4) { a0 += p[i]; a1 += p[i + 1]; a2 += p[i + 2]; a3 += p[i + 3]; }
+            sink[(size_t) ti] = a0 + a1 + a2 + a3;
+        };
+        double best = 0;
+        for (int rep = 0; rep < 3; ++rep) {
+            const auto t0 = Clock::now();
+            std::vector<std::thread> th;
+            for (int ti = 1; ti < nt; ++ti) th.emplace_back(work, ti);
+            work(0);
+            for (auto& t : th) t.join();
+            const double ms = ms_since(t0);
+            best = std::max(best, (double) per * (double) nt * 8.0 / 1e9 / (ms / 1000.0));
+        }
+        volatile uint64_t keep = 0;
+        for (uint64_t x : sink) keep = keep + x;
+        return best;
+    }
+
+    // What the PC can do, and what a token of this model needs; then the numbers that say where a token's time goes.
+    void diag_hardware(double& ram_peak, double& gpu_bw, double& h2d_pageable, double& h2d_pinned) {
+        ram_peak = gpu_bw = h2d_pageable = h2d_pinned = 0;
+        const int phys = physical_cores();
+        std::printf("diag: %d physical cores\n", phys);
+        std::vector<uint64_t> buf((size_t) 512 << 17 /* 512 MiB */, 1);   // touched: the pages exist
+        std::vector<int> counts;
+        for (int t = 1; t < phys; t *= 2) counts.push_back(t);
+        counts.push_back(phys);
+        std::printf("diag: RAM read bandwidth by thread count:");
+        std::vector<double> bw;
+        for (int t : counts) {
+            const double g = ram_read_gbs(buf, t);
+            bw.push_back(g);
+            ram_peak = std::max(ram_peak, g);
+            std::printf("  %d: %.1f GB/s", t, g);
+        }
+        int t95 = counts.back();
+        for (size_t i = 0; i < counts.size(); ++i) if (bw[i] >= 0.95 * ram_peak) { t95 = counts[i]; break; }
+        std::printf("\ndiag: RAM reaches 95%% of its peak (%.1f GB/s) with %d threads: that is the speed of the CPU's part of a token\n", ram_peak, t95);
+        std::fflush(stdout);
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (!dev) { std::printf("diag: no graphics card in this build\n"); return; }
+        size_t f = 0, t = 0;
+        ggml_backend_dev_memory(dev, &f, &t);
+        std::printf("diag: card %s (%s), %.1f GiB free of %.1f\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+                    (double) f / (1 << 30), (double) t / (1 << 30));
+        const size_t bytes = (size_t) 256 << 20;
+        ggml_init_params ip{ggml_tensor_overhead() * 4 + 1024, nullptr, true};
+        ggml_context* c = ggml_init(ip);
+        ggml_tensor* x = ggml_new_tensor_1d(c, GGML_TYPE_I8, (int64_t) bytes);
+        ggml_backend_buffer_t buf_dev = ggml_backend_alloc_ctx_tensors_from_buft(c, ggml_backend_dev_buffer_type(dev));
+        if (buf_dev) {
+            auto timed = [&](const std::function<void()>& fn) {
+                fn();                                                         // the first call pays for set-up
+                double best = 0;
+                for (int i = 0; i < 4; ++i) { const auto t0 = Clock::now(); fn(); best = std::max(best, (double) bytes / 1e9 / (ms_since(t0) / 1000.0)); }
+                return best;
+            };
+            gpu_bw = timed([&] { ggml_backend_buffer_clear(buf_dev, 0); });
+            std::vector<uint8_t> pageable(bytes, 1);
+            h2d_pageable = timed([&] { ggml_backend_tensor_set(x, pageable.data(), 0, bytes); });
+            ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(dev);
+            ggml_backend_buffer_t pin = hb ? ggml_backend_buft_alloc_buffer(hb, bytes) : nullptr;
+            if (pin) {
+                std::memset(ggml_backend_buffer_get_base(pin), 1, bytes);
+                h2d_pinned = timed([&] { ggml_backend_tensor_set(x, ggml_backend_buffer_get_base(pin), 0, bytes); });
+                ggml_backend_buffer_free(pin);
+            }
+            ggml_backend_buffer_free(buf_dev);
+        }
+        ggml_free(c);
+        std::printf("diag: the card writes memory at %.0f GB/s (its memory bandwidth is about twice that); RAM -> card over PCIe: %.1f GB/s from ordinary memory, %.1f GB/s from page-locked memory\n",
+                    gpu_bw, h2d_pageable, h2d_pinned);
+        std::fflush(stdout);
+    }
+
+    int diag_run(const std::vector<llama_token>& prompt) {
+        double ram_peak = 0, gpu_bw = 0, pg = 0, pin = 0;
+        diag_hardware(ram_peak, gpu_bw, pg, pin);
+
+        // the bytes of a token
+        double expert_tok = 0, expert_all = 0;
+        const int n_layer = llama_model_n_layer(model);
+        const int used = std::atoi(meta_str(model, (meta_str(model, "general.architecture") + ".expert_used_count").c_str()).c_str());
+        for (int il = 0; il < n_layer; ++il) {
+            llama_hybrid_experts t;
+            if (!llama_model_expert_tensors(model, il, &t)) continue;
+            double one = (double) t.down->nb[2] + (t.gate_up ? (double) t.gate_up->nb[2] : (double) t.up->nb[2] + (double) t.gate->nb[2]);
+            expert_tok += one * used;
+            expert_all += one * (double) t.down->ne[2];
+        }
+        const double dense = (double) llama_model_size(model) - expert_all;
+        std::printf("diag: the model: %.1f GiB, of which %.1f GiB are routed experts; a token reads %.2f GB of experts (%d per layer) and about %.2f GB of the rest\n",
+                    (double) llama_model_size(model) / (1 << 30), expert_all / (1 << 30), expert_tok / 1e9, used, dense / 1e9);
+        if (ram_peak > 0)
+            std::printf("diag: so, with every expert computed by the CPU, RAM alone caps writing at %.0f tokens/s\n", ram_peak * 1e9 / std::max(1.0, expert_tok));
+        std::fflush(stdout);
+
+        // a bench as the engine runs, with what the cache served
+        o.bench_reps = std::max(2, std::min(o.bench_reps, 3));
+        const std::string label = hx && hx->caching() ? "cache" : "usual";
+        BenchRow last;
+        double med = 0;
+        {
+            std::vector<double> speeds;
+            for (int r = 0; r < o.bench_reps; ++r) {
+                BenchRow row;
+                if (!bench_once(prompt, o.bench_tg, row)) return 1;
+                last = row;
+                speeds.push_back(row.tg_ms > 0 ? (double) row.produced * 1000.0 / row.tg_ms : 0.0);
+            }
+            std::sort(speeds.begin(), speeds.end());
+            med = speeds[speeds.size() / 2];
+        }
+        const double ms_tok = med > 0 ? 1000.0 / med : 0.0;
+        const double hit = hx && hx->caching() ? last.cs.rate() : 0.0;
+        std::printf("diag: measured %s: %.1f tokens/s (%.1f ms a token)%s\n", label.c_str(), med, ms_tok,
+                    hx && hx->caching() ? (std::string(", ") + std::to_string((int) (100.0 * hit)) + "% of the expert uses served by the card").c_str() : "");
+        if (ram_peak > 0) {
+            const double t_cpu = (1.0 - hit) * expert_tok / (ram_peak * 1e9) * 1000.0;
+            const double t_gpu = gpu_bw > 0 ? dense / (gpu_bw * 2.0 * 1e9) * 1000.0 : 0.0;   // reads at about twice the write speed
+            std::printf("diag: where a token's %.1f ms go, at best: CPU experts (the misses) %.1f ms at the RAM's peak; the card's part %.1f ms at its memory speed; "
+                        "the rest, %.1f ms, is launching kernels, waiting between the two and whatever neither bandwidth explains\n",
+                        ms_tok, t_cpu, t_gpu, std::max(0.0, ms_tok - t_cpu - t_gpu));
+            if (hx && hx->caching() && hit < 0.5)
+                std::printf("diag: only %.0f%% of the expert uses are served by the card: a larger cache (a smaller --ubatch / --max-context / --kv q8_0 frees card memory; a smaller file "
+                            "holds more experts in it) is what makes the CPU's part shrink\n", 100.0 * hit);
+            if (pg > 0 && pin > 1.3 * pg)
+                std::printf("diag: page-locked memory moves %.1fx the bytes of ordinary memory to the card: --pin-experts (with --no-repack) speeds long prompts\n", pin / pg);
+        }
+        std::fflush(stdout);
+
+        // the thread sweep
+        std::vector<int> counts = o.bench_threads;
+        if (counts.empty()) {
+            const int phys = physical_cores();
+            for (int t : {std::max(1, phys / 4), std::max(1, phys / 2), std::max(1, phys * 3 / 4), phys})
+                if (std::find(counts.begin(), counts.end(), t) == counts.end()) counts.push_back(t);
+        }
+        return sweep_threads(prompt, counts, true) ? 0 : 1;
+    }
+
+    // The bench at each thread count; prints the table and the best.
+    bool sweep_threads(const std::vector<llama_token>& prompt, const std::vector<int>& counts, bool quiet) {
+        std::printf("bench: %s at %zu thread counts\n", quiet ? "decode speed" : "decode speed", counts.size());
+        double best = 0;
+        int best_t = counts.empty() ? 0 : counts[0];
+        std::vector<std::pair<int, double>> rows;
+        const int orig_reps = o.bench_reps;
+        o.bench_reps = 2;
+        for (int t : counts) {
+            apply_threads(t);
+            std::vector<double> speeds;
+            for (int r = 0; r < o.bench_reps; ++r) {
+                BenchRow row;
+                if (!bench_once(prompt, std::min(o.bench_tg, 32), row)) { o.bench_reps = orig_reps; return false; }
+                speeds.push_back(row.tg_ms > 0 ? (double) row.produced * 1000.0 / row.tg_ms : 0.0);
+            }
+            std::sort(speeds.begin(), speeds.end());
+            const double v = speeds.back();                     // the better of two: the first one may pay for the pool
+            rows.emplace_back(t, v);
+            std::printf("bench: %2d threads: %.2f tok/s\n", t, v);
+            std::fflush(stdout);
+            if (v > best) { best = v; best_t = t; }
+        }
+        o.bench_reps = orig_reps;
+        if (!rows.empty()) std::printf("bench: the fastest of these is --threads %d (%.2f tok/s)\n", best_t, best);
+        std::fflush(stdout);
+        return true;
+    }
+
     int bench() {
         std::string text = o.prompt;
         if (!o.prompt_file.empty()) {
@@ -1680,6 +1890,7 @@ public:
         for (size_t i = 0; i < prompt.size(); ++i) prompt[i] = base[i % base.size()];
         std::printf("bench: %s; prompt %d tokens, generate %d, %d runs, %d threads\n", placement.c_str(), o.bench_pp, o.bench_tg, o.bench_reps,
                     o.threads > 0 ? o.threads : physical_cores());
+        if (o.diag) return diag_run(prompt);
         double with_cache = 0, without = 0;
         const bool cached = hx && hx->caching();
         const char* label = cached ? "cache" : spec_on ? "spec" : hx ? "sim" : "usual";
@@ -1703,6 +1914,7 @@ public:
                 std::printf("bench: with %s generation is %.2fx the speed of the usual graphs (%.2f vs %.2f tok/s)\n", label, with_cache / without,
                             with_cache, without);
         }
+        if (!o.bench_threads.empty() && !sweep_threads(prompt, o.bench_threads, false)) return 1;
         return with_cache > 0 ? 0 : 1;
     }
 

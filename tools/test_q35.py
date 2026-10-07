@@ -424,7 +424,7 @@ class Q35ExpertCache(unittest.TestCase):
         err = r.stderr.decode(errors="replace")
         self.assertEqual(r.returncode, 0, err[-400:])
         self.assertIn("expert cache check passed", err)
-        self.assertIn("expert cache: 12 slots in 4 layers", err)
+        self.assertIn("expert cache: 12 slots in 4 of 4 layers", err)
 
 
 @unittest.skipUnless(READY, "set STRATA_Q35_ENGINE and STRATA_Q35_MODEL_DIR (see the module docstring)")
