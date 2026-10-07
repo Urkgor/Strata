@@ -20,6 +20,14 @@ if(STRATA_ENABLE_SYCL)
   add_subdirectory(sycl)
   return()
 endif()
+# The Qwen3.6-35B-A3B engine (q35/): llama.cpp's qwen35moe graph with Strata's serve protocol, a project of its own that
+# builds on an old PC too (RHEL 7: it needs only CMake 3.14, `cmake -S q35 -B build` works without this option).  With
+# this on, nothing below is configured - it is the one target, strata-q35.  docs/Q35.md.
+option(STRATA_ENABLE_Q35 "build strata-q35, the Qwen3.6-35B-A3B engine from q35/ - docs/Q35.md" OFF)
+if(STRATA_ENABLE_Q35)
+  add_subdirectory(q35)
+  return()
+endif()
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
