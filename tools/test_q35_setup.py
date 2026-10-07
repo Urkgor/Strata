@@ -130,6 +130,13 @@ class Q35Setup(unittest.TestCase):
                          ["--native", "m.gguf", "--max-context", "32768", "--cpu-moe", "--gpu-layers", "all", "--fit",
                           "off", "--verbose"])
 
+    def test_speed_options_are_passed_on(self):
+        a = q35_setup.parse(["--gguf", "x", "--ubatch", "2048", "--batch", "4096", "--no-repack", "--pin-experts", "--spec", "lookup",
+                             "--main-gpu", "1", "--split-mode", "none", "--no-expert-cache"])
+        self.assertEqual(q35_setup.engine_args(a, Path("m.gguf")),
+                         ["--native", "m.gguf", "--max-context", "32768", "--ubatch", "2048", "--batch", "4096", "--no-repack",
+                          "--pin-experts", "--spec", "lookup", "--main-gpu", "1", "--split-mode", "none"])
+
     def test_the_expert_cache_is_on_by_default_and_takes_a_size(self):
         a = q35_setup.parse(["--gguf", "x"])
         self.assertEqual(q35_setup.engine_args(a, Path("m.gguf")),

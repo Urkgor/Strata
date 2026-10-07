@@ -82,6 +82,20 @@ def engine_args(a: argparse.Namespace, gguf: Path, out: Path | None = None) -> l
         args += ["--gpu-layers", str(a.gpu_layers)]
     if a.kv:
         args += ["--kv", a.kv]
+    if a.ubatch:
+        args += ["--ubatch", str(a.ubatch)]
+    if a.batch:
+        args += ["--batch", str(a.batch)]
+    if a.no_repack:
+        args.append("--no-repack")
+    if a.pin_experts:
+        args.append("--pin-experts")
+    if a.spec != "off":
+        args += ["--spec", a.spec]
+    if a.main_gpu is not None:
+        args += ["--main-gpu", str(a.main_gpu)]
+    if a.split_mode:
+        args += ["--split-mode", a.split_mode]
     if a.threads:
         args += ["--threads", str(a.threads)]
     if a.numa:
@@ -137,6 +151,16 @@ def parse(argv=None) -> argparse.Namespace:
     ap.add_argument("--n-cpu-moe", type=int, default=0, metavar="N", help="the experts of the first N layers in RAM")
     ap.add_argument("--gpu-layers", default=None, metavar="N|all")
     ap.add_argument("--kv", default=None, help="K/V cache type: f16 (the engine's default), q8_0, q4_0")
+    ap.add_argument("--ubatch", type=int, default=0, metavar="N",
+                    help="prompt micro-batch (engine default 512). With the experts in RAM the card is handed them once per micro-batch: "
+                         "2048 or 4096 read long prompts several times faster")
+    ap.add_argument("--batch", type=int, default=0, metavar="N", help="prompt batch (engine default 2048; at least --ubatch)")
+    ap.add_argument("--no-repack", action="store_true",
+                    help="keep the CPU's weights as in the file, so the card can compute them for long prompts (otherwise the CPU does)")
+    ap.add_argument("--pin-experts", action="store_true", help="page-lock the experts in RAM: faster PCIe copies for long prompts (experimental)")
+    ap.add_argument("--spec", default="off", choices=["off", "lookup"], help="speculation from repeats in the context (docs/Q35.md)")
+    ap.add_argument("--main-gpu", type=int, default=None, metavar="N", help="the card that holds the model when there are several")
+    ap.add_argument("--split-mode", default=None, choices=["none", "layer", "row"], help="several cards: none (one card), layer, row")
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--numa", default=None, choices=["distribute", "isolate", "numactl"])
     ap.add_argument("--fit", default=None, choices=["on", "off"])

@@ -25,6 +25,7 @@
 #include "ggml-cpu.h"
 
 #include "hybrid_experts.h"
+#include "llama-hybrid.h"   // third_party/llama.cpp/src, added by the patch
 
 #ifdef STRATA_Q35_FIT
 #include "fit.h"
@@ -103,6 +104,7 @@ struct Options {
     std::vector<float> tensor_split;
     bool no_op_offload = false;
     bool no_repack = false;      // llama.cpp's CPU weight repacking (faster kernels for some quantizations)
+    bool pin_experts = false;    // page-lock the experts in RAM so the card reads them over PCIe at full speed (long prompts)
     bool no_kv_offload = false;
     bool eos_set = false;
     std::vector<int64_t> eos_ids;
@@ -172,7 +174,10 @@ void usage() {
         "  --split-mode MODE      none | layer | row (several cards); --main-gpu N; --tensor-split a,b,..\n"
         "  --load MODE            auto | mmap | mlock | none | direct (how the file is read)\n"
         "  --no-op-offload        do not let the card compute the CPU's weights during long prompts\n"
-        "  --no-repack            do not let llama.cpp rearrange the CPU's weights (tests; the default is faster)\n"
+        "  --no-repack            keep the CPU's weights as in the file: llama.cpp's repacked layout (the default) makes the CPU's matrix\n"
+        "                         products faster but hides the weights from the card, so long prompts are read by the CPU alone\n"
+        "  --pin-experts          page-lock the experts in RAM (long prompts: the card reads them over PCIe at full speed; use with\n"
+        "                         --no-repack; experimental)\n"
         "  --no-kv-offload        keep the K/V cache in RAM\n"
         "\n"
         "hybrid expert cache (experts in RAM, the hot ones also on the card; see docs/Q35.md)\n"
@@ -332,6 +337,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         }
         else if (a == "--no-op-offload") o.no_op_offload = true;
         else if (a == "--no-repack") o.no_repack = true;
+        else if (a == "--pin-experts") o.pin_experts = true;
         else if (a == "--no-kv-offload") o.no_kv_offload = true;
         else if (a == "--eos-ids") {
             if (!(v = need(i, a.c_str()))) return false;
@@ -522,6 +528,8 @@ public:
     std::string offload_tag = "gpu";   // one word for the INFO line
     std::unique_ptr<q35::HybridExperts> hx;   // the hybrid expert cache (null: off)
     ggml_threadpool_t tp = nullptr, tp_batch = nullptr;   // the CPU threads, kept between graphs
+    std::vector<std::pair<void*, size_t>> pinned;         // RAM ranges page-locked for the card (--pin-experts)
+    bool (*unpin_fn)(void*) = nullptr;
     bool cache_placed = false;         // the engine put every routed expert in RAM for the cache (not the user)
 
     ~Engine() {
@@ -530,8 +538,49 @@ public:
         if (ctx) { llama_detach_threadpool(ctx); llama_free(ctx); }
         if (tp_batch) ggml_threadpool_free(tp_batch);
         if (tp) ggml_threadpool_free(tp);
+        if (unpin_fn) for (auto& r : pinned) unpin_fn(r.first);
         if (model) llama_model_free(model);
         hx.reset();   // after the model: it writes its profile
+    }
+
+    // --pin-experts: the routed experts that stay in RAM are copied to the card by llama.cpp for every long prompt batch;
+    // from ordinary ("pageable") memory the driver stages every copy through a small pinned buffer, from page-locked memory
+    // it is a direct transfer.  llama.cpp's CUDA backend can page-lock a range (cudaHostRegister) but nothing calls it.
+    void pin_experts() {
+        if (!o.pin_experts || !model) return;
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+        if (!reg) reg = ggml_backend_reg_by_name("ROCm");
+        if (!reg) { std::fprintf(stderr, "strata-q35: --pin-experts: no CUDA backend in this build\n"); return; }
+        auto reg_fn = (bool (*)(void*, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
+        unpin_fn = (bool (*)(void*)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
+        if (!reg_fn || !unpin_fn) { std::fprintf(stderr, "strata-q35: --pin-experts: this backend cannot page-lock memory\n"); unpin_fn = nullptr; return; }
+        setenv("GGML_CUDA_REGISTER_HOST", "1", 1);                     // the backend's own switch for it
+        const uintptr_t page = 4096;
+        std::vector<std::pair<uintptr_t, uintptr_t>> ranges;           // [begin, end) rounded out to pages
+        for (int il = 0; il < llama_model_n_layer(model); ++il) {
+            llama_hybrid_experts t;
+            if (!llama_model_expert_tensors(model, il, &t)) continue;
+            for (const ggml_tensor* x : {t.up, t.gate, t.gate_up, t.down}) {
+                if (!x || !x->buffer || !ggml_backend_buffer_is_host(x->buffer) || !x->data) continue;
+                const uintptr_t b = (uintptr_t) x->data & ~(page - 1);
+                const uintptr_t e = ((uintptr_t) x->data + ggml_nbytes(x) + page - 1) & ~(page - 1);
+                ranges.emplace_back(b, e);
+            }
+        }
+        std::sort(ranges.begin(), ranges.end());
+        std::vector<std::pair<uintptr_t, uintptr_t>> runs;
+        for (const auto& r : ranges) {
+            if (!runs.empty() && r.first <= runs.back().second) runs.back().second = std::max(runs.back().second, r.second);
+            else runs.push_back(r);
+        }
+        size_t ok_bytes = 0, bad_bytes = 0;
+        for (const auto& r : runs) {
+            if (reg_fn((void*) r.first, (size_t) (r.second - r.first))) { pinned.emplace_back((void*) r.first, (size_t) (r.second - r.first)); ok_bytes += r.second - r.first; }
+            else bad_bytes += r.second - r.first;
+        }
+        if (runs.empty()) std::fprintf(stderr, "strata-q35: --pin-experts: no expert is in plain RAM (add --cpu-moe and --no-repack)\n");
+        else std::fprintf(stderr, "strata-q35: --pin-experts: %.2f GiB of the experts page-locked%s\n", (double) ok_bytes / (1024.0 * 1024 * 1024),
+                          bad_bytes ? (", " + std::to_string(bad_bytes >> 20) + " MiB could not be (ulimit -l? the driver?): they stay as they were").c_str() : "");
     }
 
     // Without a thread pool of its own, ggml starts a fresh team of threads for every graph it computes, and with the
@@ -677,6 +726,7 @@ public:
             return false;
         }
         if (o.info) return true;
+        pin_experts();
         ctx = llama_init_from_model(model, cp);
         if (!ctx && cache_placed) {
             // the dense part, the K/V cache and the compute buffers did not fit with every expert in RAM: as the fit placed it
