@@ -519,6 +519,7 @@ public:
         const size_t got = llama_state_seq_get_data_ext(ctx, c.data.data(), sz, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         if (got == 0) return;
         c.data.resize(got);
+        if (g_verbose) std::fprintf(stderr, "strata-q35: checkpoint at %d tokens, %.2f MiB\n", n, (double) got / (1024.0 * 1024.0));
         while ((int) ckpts.size() >= o.ckpt_slots) ckpts.erase(ckpts.begin());
         ckpts.push_back(std::move(c));
     }
@@ -1027,7 +1028,6 @@ public:
                     meta_str(model, (arch + ".expert_used_count").c_str()).c_str());
         std::printf("context       %d trained\n", (int) llama_model_n_ctx_train(model));
         std::printf("vocabulary    %d tokens\n", (int) n_vocab);
-        std::printf("placement     %s\n", placement.c_str());
     }
 };
 
@@ -1062,6 +1062,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     int rc = 0;
+    if (!o.info) std::fprintf(stderr, "strata-q35: %s; context %lld, K/V %s\n", eng.placement.c_str(), (long long) o.max_context,
+                              o.kv.c_str());
     if (o.info) eng.print_info();
     else if (o.serve) eng.serve();
     else rc = eng.generate_text();
