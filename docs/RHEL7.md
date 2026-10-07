@@ -117,4 +117,5 @@ but `127.0.0.1`, set an API key (`STRATA_API_KEY`).
 | `CUDA error: no kernel image is available` | `--arch` missed your card's compute capability: rebuild with `--arch "<yours>"` |
 | `could not create the context` | not enough memory for `--max-context`: lower it, use `--kv q8_0`, or `--cpu-moe` |
 | the model loads, but writing is slow | the experts do not fit the card: `--expert-cache auto` (with `--cpu-moe` or on its own), `--threads` = physical cores; `numactl` on several sockets; [measure what the cache gives](Q35.md#measuring-what-the-cache-gives-you) |
+| `CUDA error: an illegal memory access ...` while loading | the expert cache met a kernel of your card it cannot use: add `--expert-cache off` (`q35_setup.py --no-expert-cache`) and report it with `--verbose`; the current build tries the cache in a second process first and leaves it off by itself if that dies |
 | `no expert cache: ...` | the line says why (the whole model fits the card, no card in this build, per-expert scales); `the expert cache was switched off` means its first-tokens check failed on your card: please report it with `--verbose` |
