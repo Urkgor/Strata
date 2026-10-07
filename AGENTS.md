@@ -7,8 +7,11 @@ one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
 
 A second engine, `strata-q35` (`q35/`), runs Qwen3.6-35B-A3B (llama.cpp's `qwen35moe` graph, the same `--serve`
 protocol, so the server runs on it unchanged): [docs/Q35.md](docs/Q35.md), and for RHEL / CentOS 7
-[docs/RHEL7.md](docs/RHEL7.md). Its tests: `python -m unittest tools.test_q35_setup` (no engine needed) and
-`tools/test_q35.py` (needs the engine and the tiny model from `tools/q35_tiny_model.py`).
+[docs/RHEL7.md](docs/RHEL7.md). It is llama.cpp's graph plus a patch of ours (`q35/patches/`, applied by the build): the
+expert cache and the code that drives it are `q35/expert_cache.h`, `q35/hybrid_experts.cpp`, `q35/strata_q35.cpp`. Its tests:
+`python -m unittest tools.test_q35_setup` (no engine needed), `build-q35/test-expert-cache` (the cache's policy, no engine) and
+`tools/test_q35.py` (needs the engine and the tiny model from `tools/q35_tiny_model.py`; the cache runs there with `--cache-in-ram`).
+When the patch changes, regenerate it from the patched llama.cpp checkout (`git add -N src/llama-hybrid.h && git diff`).
 
 The Python server (`serve/`) and `tools/strata_tokenizer.py` use **only the standard library**: chat templates are
 rendered by `serve/jinja_lite.py`, the tokenizer's Unicode classes come from `tools/unicode_classes.py` (made by
