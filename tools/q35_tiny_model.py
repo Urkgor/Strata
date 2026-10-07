@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A tiny random-weight Qwen3.5-MoE model, as a GGUF and as PyTorch reference outputs, for testing strata-q35.
+"""A small random-weight Qwen3.5-MoE model, as a GGUF and as PyTorch reference outputs, for testing strata-q35.
 
 Qwen3.6-35B-A3B is `model_type qwen3_5_moe`: Gated DeltaNet layers (3 of 4) and gated attention (1 of 4), a
 plain residual, 256 experts with top-8 and a shared expert.  This builds the same architecture at 350 thousand
@@ -7,7 +7,13 @@ parameters, so the whole chain can be checked on any PC in seconds:
 
     transformers (reference)  ->  llama.cpp's convert_hf_to_gguf.py  ->  strata-q35  ->  the same tokens
 
-    python tools/q35_tiny_model.py OUTDIR --llama-cpp /path/to/llama.cpp
+    python tools/q35_tiny_model.py OUTDIR --llama-cpp /path/to/llama.cpp [--preset tiny|real-shape]
+
+`--preset real-shape` keeps Qwen3.6-35B-A3B's own geometry - hidden size 2048, head dimension 256 with a quarter of it
+rotated (M-RoPE sections 11/11/10), 16 query and 2 key/value heads, Gated DeltaNet with 16 key and 32 value heads of
+128, 512-wide experts with top-8 and a 512-wide shared expert - but only 2 layers (one of each kind) and 32 experts:
+about 0.3 billion parameters, 1.2 GB as F32.  Its matrices are multiples of 256, so llama.cpp's K-quants (Q4_K,
+Q5_K, Q6_K, IQ4_XS) apply to it: `llama-quantize` it and compare logits to see them on the real shapes.
 
 needs `torch`, `transformers` (5.x, with qwen3_5_moe), `tokenizers` and `numpy`; llama.cpp's checkout is only used
 for its converter (the commit in third_party/ggml/VERSION.txt).  OUTDIR gets `hf/` (the model), `tiny-f32.gguf` and
@@ -23,8 +29,21 @@ import sys
 SEQ_LENS = (5, 40, 200)
 N_GEN = 24
 
+PRESETS = {
+    "tiny": dict(hidden_size=64, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2, head_dim=32,
+                 linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=16, linear_value_head_dim=16,
+                 num_experts=8, num_experts_per_tok=2, moe_intermediate_size=32, shared_expert_intermediate_size=32,
+                 layer_types=["linear_attention"] * 3 + ["full_attention"], mrope_section=[2, 1, 1],
+                 init=("fixed", 0.35)),
+    "real-shape": dict(hidden_size=2048, num_hidden_layers=2, num_attention_heads=16, num_key_value_heads=2, head_dim=256,
+                       linear_num_key_heads=16, linear_num_value_heads=32, linear_key_head_dim=128,
+                       linear_value_head_dim=128, num_experts=32, num_experts_per_tok=8, moe_intermediate_size=512,
+                       shared_expert_intermediate_size=512, layer_types=["linear_attention", "full_attention"],
+                       mrope_section=[11, 11, 10], init=("fanin", 2.0)),
+}
 
-def make_model(out):
+
+def make_model(out, preset="tiny"):
     import torch
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
     from transformers import PreTrainedTokenizerFast
@@ -48,22 +67,21 @@ def make_model(out):
     vocab = len(fast)
 
     torch.manual_seed(1234)
+    pr = dict(PRESETS[preset])
+    kind, amount = pr.pop("init")
+    mrope = pr.pop("mrope_section")
     cfg = Qwen3_5MoeTextConfig(
-        vocab_size=vocab, hidden_size=64, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
-        head_dim=32, linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=16,
-        linear_value_head_dim=16, linear_conv_kernel_dim=4, num_experts=8, num_experts_per_tok=2,
-        moe_intermediate_size=32, shared_expert_intermediate_size=32, max_position_embeddings=512,
-        rms_norm_eps=1e-6, tie_word_embeddings=False,
-        layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        vocab_size=vocab, linear_conv_kernel_dim=4, max_position_embeddings=512, rms_norm_eps=1e-6,
+        tie_word_embeddings=False,
         rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.25,
-                         "mrope_section": [2, 1, 1], "mrope_interleaved": True},
-        eos_token_id=fast.eos_token_id, pad_token_id=fast.convert_tokens_to_ids("<|endoftext|>"))
+                         "mrope_section": mrope, "mrope_interleaved": True},
+        eos_token_id=fast.eos_token_id, pad_token_id=fast.convert_tokens_to_ids("<|endoftext|>"), **pr)
     cfg.architectures = ["Qwen3_5MoeForCausalLM"]
     model = Qwen3_5MoeForCausalLM(cfg).eval()
     with torch.no_grad():   # peaked logits: the greedy path must not hang on near-ties
         for name, p in model.named_parameters():
             if p.ndim >= 2:
-                p.normal_(0, 0.35)
+                p.normal_(0, amount if kind == "fixed" else amount / p.shape[-1] ** 0.5)
             elif "norm" in name:
                 if p.mean() > 0.5:
                     p.fill_(1.0)
@@ -114,9 +132,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("outdir")
     ap.add_argument("--llama-cpp", required=True, help="a llama.cpp checkout (only its converter is used)")
+    ap.add_argument("--preset", choices=sorted(PRESETS), default="tiny")
     a = ap.parse_args()
     hf = os.path.join(a.outdir, "hf")
-    vocab = make_model(hf)
+    vocab = make_model(hf, a.preset)
     print(f"model: vocabulary {vocab}")
     gguf = os.path.join(a.outdir, "tiny-f32.gguf")
     convert(a.llama_cpp, hf, gguf)
