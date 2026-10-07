@@ -3,7 +3,8 @@
 #
 #   * a C++17 compiler (GCC 9 or newer): on RHEL 7 it enables devtoolset-11 (or 10, 9) from /opt/rh when the stock
 #     GCC 4.8 is what `gcc` is
-#   * CMake 3.14 or newer: cmake3 (EPEL), cmake, or the one `pip install cmake` gives
+#   * CMake 3.14 or newer (3.18 for CUDA): cmake3 (EPEL, 3.17 on RHEL 7: enough for the CPU), cmake, or the one
+#     `python3 -m pip install --user cmake` gives
 #   * CUDA: nvcc on PATH or in /usr/local/cuda*/bin turns the NVIDIA backend on; --cuda off builds for the CPU only
 #
 #     tools/build_q35.sh                       # CUDA when nvcc is there, else CPU; build-q35/strata-q35
@@ -63,20 +64,6 @@ if [ "${major:-0}" -lt 9 ]; then
   exit 1
 fi
 
-# ---- CMake
-CMAKE_BIN=""
-for c in cmake3 cmake; do
-  if command -v "$c" >/dev/null 2>&1; then
-    v=$("$c" --version | head -1 | sed 's/[^0-9.]*//; s/-.*//')
-    maj=${v%%.*}; rest=${v#*.}; min=${rest%%.*}
-    if [ "$maj" -gt 3 ] || { [ "$maj" -eq 3 ] && [ "$min" -ge 14 ]; }; then CMAKE_BIN=$c; break; fi
-  fi
-done
-if [ -z "$CMAKE_BIN" ]; then
-  echo "build_q35: needs CMake 3.14 or newer.  sudo yum install cmake3   (EPEL),  or  python3 -m pip install --user cmake" >&2
-  exit 1
-fi
-
 # ---- CUDA
 if [ "$CUDA" = auto ]; then
   CUDA=off
@@ -100,6 +87,22 @@ if [ "$CUDA" = on ]; then
   echo "build_q35: CUDA on ($(nvcc --version | sed -n 's/.*release \([0-9.]*\).*/\1/p'))${ARCH:+, architectures $ARCH}"
 else
   echo "build_q35: CUDA off (CPU only)"
+fi
+
+# ---- CMake: 3.14 is enough for the CPU build; ggml's CUDA backend asks for 3.18
+MIN_MINOR=14
+[ "$CUDA" = on ] && MIN_MINOR=18
+CMAKE_BIN=""
+for c in cmake3 cmake; do
+  if command -v "$c" >/dev/null 2>&1; then
+    v=$("$c" --version | head -1 | sed 's/[^0-9.]*//; s/-.*//')
+    maj=${v%%.*}; rest=${v#*.}; min=${rest%%.*}
+    if [ "$maj" -gt 3 ] || { [ "$maj" -eq 3 ] && [ "$min" -ge "$MIN_MINOR" ]; }; then CMAKE_BIN=$c; break; fi
+  fi
+done
+if [ -z "$CMAKE_BIN" ]; then
+  echo "build_q35: needs CMake 3.$MIN_MINOR or newer$( [ "$CUDA" = on ] && echo ' (3.18 for the CUDA backend; the cmake3 of EPEL on RHEL 7 is 3.17)').  python3 -m pip install --user cmake" >&2
+  exit 1
 fi
 
 # ---- llama.cpp's source: the commit this engine was written against (its API moves from week to week)

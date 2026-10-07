@@ -5,6 +5,11 @@ set up Strata on their PC. Strata runs the Qwen3.8-Flash-Next model locally on o
 system RAM, and serves an OpenAI- and Anthropic-compatible API on `http://127.0.0.1:8080`. The human-oriented
 version of everything below is [INSTALL.md](INSTALL.md).
 
+**If the user wants Qwen3.6-35B-A3B** (not Qwen3.8-Flash-Next), this page does not apply: that model runs on a second
+engine that is built from source (`tools/build_q35.sh`) and set up with `tools/q35_setup.py`. Follow
+[Q35.md](Q35.md), and [RHEL7.md](RHEL7.md) on RHEL / CentOS 7. The user brings the GGUF; nothing is installed by the
+steps below for it.
+
 Work through the steps in order. Tell the user what you are doing in plain words; they may not be technical.
 
 ## 0. Ground rules

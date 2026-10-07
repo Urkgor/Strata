@@ -11,8 +11,8 @@ How to build and run [`strata-q35`](Q35.md) (Qwen3.6-35B-A3B) on RHEL 7 or CentO
 ## What RHEL 7 is
 
 glibc 2.17, kernel 3.10, GCC 4.8.5, CMake 2.8 (3.17 as `cmake3` from EPEL), Python 3.6. The engine needs a **C++17
-compiler (GCC 9 or newer)** and **CMake 3.14 or newer**; both are one package away (below), and neither changes the
-system's own compiler or C library.
+compiler (GCC 9 or newer)** and **CMake 3.14 or newer (3.18 for the CUDA backend)**; both are one package away (below),
+and neither changes the system's own compiler or C library.
 
 What the sources use from the system, read in the engine and in llama.cpp at the pinned commit (`mmap`, `posix_fadvise`,
 `posix_madvise`, pthreads, `std::filesystem`): nothing newer than glibc 2.17 or Linux 3.10. `io_uring`, `memfd_create`,
@@ -27,7 +27,7 @@ Red Hat's Software Collections give GCC 11 beside the system's:
 # RHEL 7:    sudo subscription-manager repos --enable rhel-server-rhscl-7-rpms
 # CentOS 7:  sudo yum install centos-release-scl         (CentOS 7 ended in 2024: its repositories moved to vault.centos.org)
 sudo yum install devtoolset-11-gcc-c++ devtoolset-11-binutils
-sudo yum install cmake3 git                               # cmake3 from EPEL; or:  python3 -m pip install --user cmake
+sudo yum install cmake3 git      # EPEL's cmake3 is 3.17: enough for a CPU build. For CUDA (3.18+): python3 -m pip install --user cmake
 ```
 
 `devtoolset-11` also brings the newer binutils that AVX-512 and VNNI code needs. `tools/build_q35.sh` enables
