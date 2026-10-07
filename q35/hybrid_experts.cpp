@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <regex>
 
@@ -224,6 +225,9 @@ struct HybridExperts::Impl {
     bool load_profile();
     bool read_profile(std::vector<float>& p) const;
     bool nonuniform = false;
+    std::vector<std::vector<int>> hot;         // by layer: the experts of the hot file
+    bool parse_hot(std::string& err);
+    void save_dump() const;
     int moe_layers = 0;                        // layers with routed experts, whether or not they take part
     bool save_profile() const;
 };
@@ -269,6 +273,58 @@ bool HybridExperts::Impl::load_profile() {
         s.set->fill_from_profile(ignore);
     }
     return true;
+}
+
+// The hot file: `layer expert expert ...` per line (spaces, commas or colons between; # starts a comment).
+bool HybridExperts::Impl::parse_hot(std::string& err) {
+    hot.assign((size_t) n_layer, std::vector<int>());
+    if (cfg.hot_file.empty()) return true;
+    std::ifstream f(cfg.hot_file);
+    if (!f) { err = "cannot read the hot file " + cfg.hot_file; return false; }
+    std::string line;
+    int no = 0;
+    while (std::getline(f, line)) {
+        ++no;
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line.resize(hash);
+        std::vector<long> v;
+        const char* c = line.c_str();
+        while (*c) {
+            while (*c == ' ' || *c == '\t' || *c == ',' || *c == ':' || *c == '\r') ++c;
+            if (!*c) break;
+            char* e = nullptr;
+            const long x = std::strtol(c, &e, 10);
+            if (e == c) { err = cfg.hot_file + " line " + std::to_string(no) + ": not a number near \"" + std::string(c, std::min<size_t>(8, std::strlen(c))) + "\""; return false; }
+            v.push_back(x);
+            c = e;
+        }
+        if (v.empty()) continue;
+        if (v[0] < 0 || v[0] >= n_layer) { err = cfg.hot_file + " line " + std::to_string(no) + ": layer " + std::to_string(v[0]) + " (the model has " + std::to_string(n_layer) + ")"; return false; }
+        for (size_t i = 1; i < v.size(); ++i) {
+            if (v[i] < 0 || v[i] >= n_expert) { err = cfg.hot_file + " line " + std::to_string(no) + ": expert " + std::to_string(v[i]) + " (a layer has " + std::to_string(n_expert) + ")"; return false; }
+            std::vector<int>& h = hot[(size_t) v[0]];
+            if (std::find(h.begin(), h.end(), (int) v[i]) == h.end()) h.push_back((int) v[i]);
+        }
+    }
+    return true;
+}
+
+void HybridExperts::Impl::save_dump() const {
+    if (cfg.dump_file.empty() || !hs) return;
+    const std::string tmp = cfg.dump_file + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "w");
+    if (!f) return;
+    std::fprintf(f, "# experts in the cache, layer by layer: a hot file for --cache-hot (edit it, or keep what the model asked for)\n");
+    for (const Layer& L : layers) {
+        std::vector<int> es;
+        for (int e = 0; e < L.n_expert; ++e) if (hs->slot_of(L.il, e) >= 0) es.push_back(e);
+        if (es.empty()) continue;
+        std::fprintf(f, "%d", L.il);
+        for (int e : es) std::fprintf(f, " %d", e);
+        std::fprintf(f, "\n");
+    }
+    const bool ok = std::fclose(f) == 0;
+    if (ok) std::rename(tmp.c_str(), cfg.dump_file.c_str()); else std::remove(tmp.c_str());
 }
 
 // -------------------------------------------------------------------------------------------------- init
@@ -346,6 +402,7 @@ bool HybridExperts::Impl::init(llama_model* model, const std::string& gguf_path,
 
     // ---- how many experts each layer can hold
     if (want_cache) {
+        if (!parse_hot(err)) return false;
         for (Group& g : groups) {
             size_t avail = 0;
             if (cfg.slots_per_layer > 0) {
@@ -362,31 +419,42 @@ bool HybridExperts::Impl::init(llama_model* model, const std::string& gguf_path,
                 return false;
             }
             g.budget = avail;
+            // the experts the user placed come first; the rest of the memory is for the policy
+            size_t locked_bytes = 0;
+            for (int li : g.layers) locked_bytes += hot[(size_t) layers[(size_t) li].il].size() * layers[(size_t) li].slot_bytes;
+            if (avail != SIZE_MAX && locked_bytes > avail) {
+                err = "the hot file asks for " + std::to_string(locked_bytes >> 20) + " MiB of cache and there are " + std::to_string(avail >> 20) + " MiB";
+                return false;
+            }
+            const size_t avail_rest = avail == SIZE_MAX ? SIZE_MAX : avail - locked_bytes;
             for (int li : g.layers) {
                 Layer& L = layers[(size_t) li];
-                size_t slots = cfg.slots_per_layer > 0 ? (size_t) cfg.slots_per_layer : avail / g.layers.size() / L.slot_bytes;
-                L.slots = (int) std::min<size_t>(slots, (size_t) L.n_expert);
+                const size_t nh = hot[(size_t) L.il].size();
+                size_t slots = cfg.slots_per_layer > 0 ? (size_t) cfg.slots_per_layer : nh + avail_rest / g.layers.size() / L.slot_bytes;
+                L.slots = (int) std::min<size_t>(std::max<size_t>(slots, nh), (size_t) L.n_expert);
             }
             // With a profile of an earlier run, the layers do not get the same share: the experts most used over all the layers
             // of the card fill it (a layer whose routing is concentrated gets more of the cache than one that spreads over all
             // its experts), so the same memory serves more of the uses.
             std::vector<float> prof;
-            if (cfg.slots_per_layer == 0 && avail != SIZE_MAX && read_profile(prof)) {
+            if (cfg.slots_per_layer == 0 && avail_rest != SIZE_MAX && read_profile(prof)) {
                 struct Cand { double v; size_t li; };
                 std::vector<Cand> cands;
                 for (int li : g.layers) {
                     const Layer& L = layers[(size_t) li];
                     for (int e = 0; e < L.n_expert; ++e) {
                         const double sc = prof[(size_t) L.il * (size_t) n_expert + (size_t) e];
-                        if (sc > 0) cands.push_back({sc / (double) L.slot_bytes, (size_t) li});
+                        const std::vector<int>& h = hot[(size_t) L.il];
+                        if (sc > 0 && std::find(h.begin(), h.end(), e) == h.end()) cands.push_back({sc / (double) L.slot_bytes, (size_t) li});
                     }
                 }
                 std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.v != b.v ? a.v > b.v : a.li < b.li; });
                 std::vector<int> count(layers.size(), 0);
                 size_t used = 0;
+                for (int li : g.layers) count[(size_t) li] = (int) hot[(size_t) layers[(size_t) li].il].size();   // the placed ones are counted
                 for (const Cand& c : cands) {
                     const Layer& L = layers[c.li];
-                    if (count[c.li] >= L.n_expert || used + L.slot_bytes > avail) continue;
+                    if (count[c.li] >= L.n_expert || used + L.slot_bytes > avail_rest) continue;
                     ++count[c.li];
                     used += L.slot_bytes;
                 }
@@ -395,7 +463,7 @@ bool HybridExperts::Impl::init(llama_model* model, const std::string& gguf_path,
                     progress = false;
                     for (int li : g.layers) {
                         const Layer& L = layers[(size_t) li];
-                        if (count[(size_t) li] < L.n_expert && used + L.slot_bytes <= avail) { ++count[(size_t) li]; used += L.slot_bytes; progress = true; }
+                        if (count[(size_t) li] < L.n_expert && used + L.slot_bytes <= avail_rest) { ++count[(size_t) li]; used += L.slot_bytes; progress = true; }
                     }
                 }
                 int lo = 1 << 30, hi = 0;
@@ -471,6 +539,20 @@ bool HybridExperts::Impl::init(llama_model* model, const std::string& gguf_path,
         hs.reset(new HotSet(n_layer, n_expert, slots, cfg.policy));
         if (!index_file(gguf_path, err)) return false;
         for (Layer& L : layers) push_tables(L);
+        {   // the experts the user placed: copied in first and never replaced
+            std::vector<CacheSwap> pins;
+            int ignored = 0;
+            for (int il = 0; il < n_layer; ++il) {
+                const bool takes_part = std::any_of(layers.begin(), layers.end(), [&](const Layer& L) { return L.il == il; });
+                for (int e : hot[(size_t) il]) {
+                    CacheSwap sw;
+                    if (!takes_part) { ++ignored; continue; }
+                    if (hs->pin(il, e, sw)) pins.push_back(sw);
+                }
+            }
+            apply(pins);
+            if (ignored) std::fprintf(stderr, "strata-q35: the hot file names %d experts in layers that take no part in the cache (their experts are not in RAM): ignored\n", ignored);
+        }
     } else {
         // the tables are never read: the graph is the usual one
         for (Layer& L : layers) {
@@ -487,7 +569,13 @@ bool HybridExperts::Impl::init(llama_model* model, const std::string& gguf_path,
         for (const Layer& L : layers) ss[(size_t) L.il] = std::max(1, n_expert * pct / 100);
         sims.push_back({pct, std::unique_ptr<HotSet>(new HotSet(n_layer, n_expert, ss, cfg.policy))});
     }
-    if (want_cache) load_profile();
+    if (want_cache) {
+        load_profile();
+        if (cfg.static_cache) {
+            hs->set_static(true);
+            if (hs->used_slots() == 0) std::fprintf(stderr, "strata-q35: --cache-static with nothing placed (no --cache-hot, no profile): the cache stays empty\n");
+        }
+    }
 
     // ---- what the graph sees
     hy.enabled = false;
@@ -539,14 +627,14 @@ void HybridExperts::Impl::after_decode(int n) {
         s.set->end_step(ignore, b);
     }
     if (decode_like) decode_tokens += (uint64_t) n;
-    if (cfg.profile.size() && decode_tokens - saved_at >= 4096) { saved_at = decode_tokens; save_profile(); }
+    if ((cfg.profile.size() || cfg.dump_file.size()) && decode_tokens - saved_at >= 4096) { saved_at = decode_tokens; save_dump(); save_profile(); }
     update_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
 // -------------------------------------------------------------------------------------------------- the public face
 
 HybridExperts::HybridExperts() : p_(new Impl) {}
-HybridExperts::~HybridExperts() { if (p_ && p_->ready) p_->save_profile(); }
+HybridExperts::~HybridExperts() { if (p_ && p_->ready) { p_->save_dump(); p_->save_profile(); } }
 
 bool HybridExperts::init(llama_model* model, const std::string& gguf_path, const HybridConfig& cfg, std::string& err) {
     return p_->init(model, gguf_path, cfg, err);
@@ -590,7 +678,10 @@ void HybridExperts::reset_stats() {
     for (auto& s : p_->sims) s.set->reset_stats();
     p_->update_ms = 0;
 }
-bool HybridExperts::save_profile() const { return p_->save_profile(); }
+bool HybridExperts::save_profile() const {
+    p_->save_dump();
+    return p_->save_profile();
+}
 
 std::string HybridExperts::describe() const {
     char buf[512];

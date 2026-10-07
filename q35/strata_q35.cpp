@@ -123,6 +123,9 @@ struct Options {
     bool cache_in_ram = false;   // the cache in RAM: tests on a PC without a card
     q35::CacheParams cache_policy;
     std::string cache_profile;
+    std::string cache_hot;       // --cache-hot FILE: experts placed in the cache by hand (and locked there)
+    std::string cache_dump;      // --cache-dump FILE: the experts in the cache, in that format
+    bool cache_static = false;   // --cache-static: nothing moves after the start
     bool cache_check = true;
     bool probe_child = false;    // --probe-cache: the process the engine starts to try the cache before it relies on it
     bool no_probe = false;       // --no-probe: do not
@@ -187,6 +190,9 @@ void usage() {
         "  --expert-cache MODE    off (default) | auto (the card's free memory) | MIB | sim (measure only: no cache)\n"
         "  --cache-slots N        N experts per layer instead of a size;  --cache-tokens N  batch size up to which it is used (4, the most a card takes)\n"
         "  --cache-profile FILE   keep what the model asked for between runs: a warm cache at start\n"
+        "  --cache-hot FILE       experts you place in the cache yourself, locked there: lines `layer expert expert ...`\n"
+        "  --cache-dump FILE      writes the experts in the cache (now and at the end) in that format: edit it, then --cache-hot it\n"
+        "  --cache-static         nothing moves after the start: the cache is the hot file plus the profile's busiest experts\n"
         "  --cache-swaps N        experts moved into the cache after a decode step once it is full (default 2)\n"
         "  --cache-half-life N    tokens after which a use counts half (default 512)\n"
         "  --cache-check on|off   compare the first tokens with and without the cache at start (default on)\n"
@@ -366,6 +372,9 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--cache-tokens") { if (!num(a.c_str(), 1, 4096, n)) return false; o.cache_tokens = (int) n; }
         else if (a == "--cache-in-ram") o.cache_in_ram = true;
         else if (a == "--cache-profile") { if (!(v = need(i, a.c_str()))) return false; o.cache_profile = v; }
+        else if (a == "--cache-hot") { if (!(v = need(i, a.c_str()))) return false; o.cache_hot = v; }
+        else if (a == "--cache-dump") { if (!(v = need(i, a.c_str()))) return false; o.cache_dump = v; }
+        else if (a == "--cache-static") o.cache_static = true;
         else if (a == "--cache-swaps") { if (!num(a.c_str(), 0, 4096, n)) return false; o.cache_policy.swaps_per_step = (int) n; }
         else if (a == "--cache-fill") { if (!num(a.c_str(), 1, 1 << 20, n)) return false; o.cache_policy.fill_swaps = (int) n; }
         else if (a == "--cache-half-life") { if (!num(a.c_str(), 1, 1 << 30, n)) return false; o.cache_policy.half_life = (double) n; }
@@ -430,6 +439,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         const bool digits = !c.empty() && c.find_first_not_of("0123456789") == std::string::npos && std::atoll(c.c_str()) > 0;
         if (c != "off" && c != "auto" && c != "sim" && !digits) { err = "--expert-cache takes off, auto, sim or a size in MiB"; return false; }
         if (o.cache_slots > 0 && c == "off") { err = "--cache-slots needs --expert-cache auto or a size"; return false; }
+        if ((!o.cache_hot.empty() || o.cache_static || !o.cache_dump.empty()) && (c == "off" || c == "sim")) { err = "--cache-hot, --cache-dump and --cache-static need --expert-cache auto or a size"; return false; }
     }
     return true;
 }
@@ -823,6 +833,9 @@ public:
         hc.n_ubatch = cparams_ubatch;
         hc.policy = o.cache_policy;
         hc.profile = o.cache_profile;
+        hc.hot_file = o.cache_hot;
+        hc.dump_file = o.cache_dump;
+        hc.static_cache = o.cache_static;
         hc.sim_pct = o.sim_pct;
         hc.verbose = o.verbose;
         std::unique_ptr<q35::HybridExperts> h(new q35::HybridExperts);
@@ -2067,7 +2080,7 @@ int main(int argc, char** argv) {
             o.expert_cache = "off";
         }
     }
-    if (o.probe_child) o.cache_profile.clear();     // the probe's own traffic must not become the cache's profile
+    if (o.probe_child) { o.cache_profile.clear(); o.cache_dump.clear(); }     // the probe's own traffic must not become the cache's profile
     auto engp = std::make_unique<Engine>();
     Engine& eng = *engp;
     eng.o = o;

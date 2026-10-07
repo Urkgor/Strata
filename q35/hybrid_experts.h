@@ -34,6 +34,9 @@ struct HybridConfig {
     int n_ubatch = 512;         // the largest batch llama_decode runs at once
     CacheParams policy;
     std::string profile;        // read at start, written at stop (and now and then): the uses of every expert
+    std::string hot_file;       // experts the user places in the cache, locked there: lines `layer expert expert ...`
+    std::string dump_file;      // written like the profile: the experts in the cache now, in the hot file's format
+    bool static_cache = false;  // nothing is moved after the start: the cache is the hot file (and the profile's busiest)
     std::vector<int> sim_pct;   // capacities (% of the experts per layer) to simulate on the same traffic
     bool verbose = false;
 };
