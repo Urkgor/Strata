@@ -427,6 +427,59 @@ class Q35ExpertCache(unittest.TestCase):
         self.assertIn("expert cache: 12 slots in 4 layers", err)
 
 
+@unittest.skipUnless(READY, "set STRATA_Q35_ENGINE and STRATA_Q35_MODEL_DIR (see the module docstring)")
+class Q35Probe(unittest.TestCase):
+    """The engine tries the expert cache in a second process before it relies on it, so a card that faults ("illegal memory
+    access") costs the cache and not the engine.  Here the "card" is RAM and the fault is an abort(), through test-only
+    environment variables."""
+
+    ARGS = ["-p", "hello world", "-n", "4", "--threads", "2", "--cpu-moe", "--no-repack", "--expert-cache", "auto", "--cache-in-ram", "--cache-slots", "3"]
+
+    def run_engine(self, cache_dir, *args, crash=False):
+        env = dict(os.environ, XDG_CACHE_HOME=cache_dir, STRATA_Q35_PROBE_TEST="1")
+        if crash:
+            env["STRATA_Q35_PROBE_CRASH"] = "1"
+        r = subprocess.run([ENGINE, "--native", GGUF, *self.ARGS, *args], capture_output=True, timeout=240, env=env)
+        return r.returncode, r.stderr.decode(errors="replace")
+
+    def test_a_good_cache_is_probed_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            code, err = self.run_engine(d)
+            self.assertEqual(code, 0, err[-400:])
+            self.assertIn("trying the expert cache in a second process", err)
+            self.assertIn("probe passed", err)
+            self.assertIn("expert cache: 12 slots", err)                 # and then it is used
+            files = list(Path(d, "strata-q35").glob("probe-*.txt"))
+            self.assertEqual([f.read_text() for f in files], ["ok\n"])
+            code, err = self.run_engine(d)                               # the verdict is kept
+            self.assertEqual(code, 0, err[-400:])
+            self.assertNotIn("second process", err)
+            self.assertIn("expert cache: 12 slots", err)
+
+    def test_a_card_that_faults_costs_the_cache_not_the_engine(self):
+        with tempfile.TemporaryDirectory() as d:
+            code, err = self.run_engine(d, crash=True)
+            self.assertEqual(code, 0, err[-400:])                        # the engine itself went on and answered
+            self.assertIn("the expert cache is left off: the probe died from signal 6", err)
+            self.assertNotIn("expert cache: 12 slots", err)
+            code, err = self.run_engine(d)                               # remembered: no second try, still off
+            self.assertEqual(code, 0, err[-400:])
+            self.assertIn("an earlier probe of this card, model and options failed", err)
+            self.assertNotIn("expert cache: 12 slots", err)
+            code, err = self.run_engine(d, "--no-probe")                 # --no-probe skips the probe and the verdict
+            self.assertEqual(code, 0, err[-400:])
+            self.assertIn("expert cache: 12 slots", err)
+
+    def test_the_probe_is_for_the_cache_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, XDG_CACHE_HOME=d, STRATA_Q35_PROBE_TEST="1")
+            r = subprocess.run([ENGINE, "--native", GGUF, "-p", "hello world", "-n", "4", "--threads", "2", "--expert-cache", "off"],
+                               capture_output=True, timeout=120, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr.decode(errors="replace")[-400:])
+            self.assertNotIn(b"second process", r.stderr)
+            self.assertFalse(Path(d, "strata-q35").exists())
+
+
 SPEC = ["--spec", "lookup", "--spec-match", "1", "--spec-max", "4"]
 
 

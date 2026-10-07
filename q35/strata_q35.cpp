@@ -56,6 +56,9 @@
 #include <vector>
 
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <unistd.h>
 
 #ifndef STRATA_Q35_VERSION
@@ -108,16 +111,18 @@ struct Options {
     int n_rs_seq = 0;            // recurrent snapshots for rollback (llama.cpp experimental)
     // speculation: guesses from the context, checked in one batch (docs/Q35.md)
     std::string spec = "off";   // off | lookup
-    int spec_max = 4;            // guessed tokens per step
+    int spec_max = 3;            // guessed tokens per step
     int spec_match = 2;          // shortest repeat of the context that makes a guess
     // the hybrid expert cache (docs/Q35.md): the hot experts on the card, the CPU computes only the rest
     std::string expert_cache = "off";   // off | auto | sim | <MiB>
     int cache_slots = 0;         // experts per layer (instead of a size in MiB)
-    int cache_tokens = 16;       // batches up to this size use the hybrid graph
+    int cache_tokens = 4;        // batches up to this size use the hybrid graph (a card: at most 4, see setup_hybrid)
     bool cache_in_ram = false;   // the cache in RAM: tests on a PC without a card
     q35::CacheParams cache_policy;
     std::string cache_profile;
     bool cache_check = true;
+    bool probe_child = false;    // --probe-cache: the process the engine starts to try the cache before it relies on it
+    bool no_probe = false;       // --no-probe: do not
     std::vector<int> sim_pct;
     // measuring
     bool bench = false;
@@ -172,12 +177,14 @@ void usage() {
         "\n"
         "hybrid expert cache (experts in RAM, the hot ones also on the card; see docs/Q35.md)\n"
         "  --expert-cache MODE    off (default) | auto (the card's free memory) | MIB | sim (measure only: no cache)\n"
-        "  --cache-slots N        N experts per layer instead of a size;  --cache-tokens N  batch size up to which it is used (16)\n"
+        "  --cache-slots N        N experts per layer instead of a size;  --cache-tokens N  batch size up to which it is used (4, the most a card takes)\n"
         "  --cache-profile FILE   keep what the model asked for between runs: a warm cache at start\n"
         "  --cache-swaps N        experts moved into the cache after a decode step once it is full (default 2)\n"
         "  --cache-half-life N    tokens after which a use counts half (default 512)\n"
         "  --cache-check on|off   compare the first tokens with and without the cache at start (default on)\n"
         "  --sim-cache A,B,..     with any mode: the hit rate that caches of A%, B%.. of the experts would have had\n"
+        "  --no-probe             the first time (and when the card, the model or these options change) a second process loads the\n"
+        "                         model and tries the cache; if the card faults, the cache is left off instead of the engine dying\n"
         "\n"
         "measuring\n"
         "  --bench                read a prompt and generate, print tokens/s (needs --native; -p/-f for the text)\n"
@@ -367,6 +374,8 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
                 o.sim_pct.push_back(pct);
             }
         }
+        else if (a == "--probe-cache") o.probe_child = true;
+        else if (a == "--no-probe") o.no_probe = true;
         else if (a == "--bench") o.bench = true;
         else if (a == "--bench-compare") o.bench_compare = true;
         else if (a == "--bench-pp") { if (!num(a.c_str(), 1, 1 << 20, n)) return false; o.bench_pp = (int) n; }
@@ -720,11 +729,17 @@ public:
         hc.margin_mib = o.fit_margin_mib;
         hc.in_ram = o.cache_in_ram;
         hc.max_tokens = o.cache_tokens;
-        if (!o.cache_in_ram && hc.max_tokens > 31) {
-            // llama.cpp hands an operation on a batch of 32 or more tokens to the card, copying the CPU's weights over PCIe
-            std::fprintf(stderr, "strata-q35: --cache-tokens %d lowered to 31 (batches of 32 tokens or more are computed by the card as llama.cpp does)\n", hc.max_tokens);
-            hc.max_tokens = 31;
+        if (!o.cache_in_ram && hc.max_tokens > 4) {
+            // CUDA's mul_mat_id has several kernels. The one for a few tokens (up to 4 for every quantization and every
+            // card; 8 for most) handles each (token, expert) pair on its own; the one for more sorts the pairs by expert and
+            // assumes that no token names an expert twice. The cache names the same stand-in slot for every expert it
+            // does not hold, so a larger batch would corrupt that sort (an "illegal memory access" at the first one).
+            std::fprintf(stderr, "strata-q35: --cache-tokens %d lowered to 4 (on a card the cache can only take batches of up to 4 tokens)\n", hc.max_tokens);
+            hc.max_tokens = 4;
         }
+        if (spec_on && !o.cache_in_ram && o.spec_max + 1 > hc.max_tokens)
+            std::fprintf(stderr, "strata-q35: --spec-max %d makes batches of %d tokens, more than the cache takes (%d): they run without it; --spec-max %d keeps it\n",
+                         o.spec_max, o.spec_max + 1, hc.max_tokens, hc.max_tokens - 1);
         hc.n_ubatch = cparams_ubatch;
         hc.policy = o.cache_policy;
         hc.profile = o.cache_profile;
@@ -761,6 +776,34 @@ public:
         if (ctx) { mem = llama_get_memory(ctx); llama_set_abort_callback(ctx, abort_cb, nullptr); attach_threads(); }
         live.clear();
         ckpts.clear();
+    }
+
+    // What the probe process does once the cache is loaded and has passed its check: the paths a real run takes - a
+    // prompt, single tokens while the cache learns and swaps, batches of 2 to 4 tokens as speculation makes them, a long
+    // prompt again.  Anything the card cannot take ends this process; the engine that started it then goes without the cache.
+    bool probe_exercise() {
+        if (!hx || !hx->caching()) return false;
+        if (std::getenv("STRATA_Q35_PROBE_CRASH")) std::abort();      // tools/test_q35.py: a card that faults
+        const std::string text = "Mixture-of-experts models send every token to a few of many small networks. Which ones depends on the "
+                                 "meaning of the word: code, prose, numbers and several languages each prefer their own. Write one sentence.";
+        std::vector<llama_token> toks = text_tokens(text);
+        if (toks.size() < 8) return false;
+        for (int round = 0; round < 3; ++round) {
+            clear_all();
+            if (decode(toks.data(), (int) toks.size(), true) != 0) return false;           // the prompt (usually the usual path)
+            llama_token next = (llama_token) (std::max_element(llama_get_logits_ith(ctx, -1), llama_get_logits_ith(ctx, -1) + n_vocab) - llama_get_logits_ith(ctx, -1));
+            for (int i = 0; i < 24; ++i) {                                                  // one token at a time: the cache learns and swaps
+                if (decode(&next, 1, true) != 0) return false;
+                const float* lg = llama_get_logits_ith(ctx, -1);
+                next = (llama_token) (std::max_element(lg, lg + n_vocab) - lg);
+            }
+            for (int n = 2; n <= std::min(4, o.cache_tokens); ++n) {                       // what a speculation step feeds
+                std::vector<llama_token> b(toks.begin(), toks.begin() + n);
+                if (decode(b.data(), n, true, true) != 0) return false;
+            }
+        }
+        clear_all();
+        return true;
     }
 
     // The same tokens through the usual graphs and through the hybrid ones: the same answers, up to float rounding.
@@ -1631,6 +1674,109 @@ public:
     }
 };
 
+
+// ----------------------------------------------------------------------------------------------------- the probe
+//
+// The expert cache runs kernels of the card in ways llama.cpp itself never does, and a card that cannot take one does
+// not say so: CUDA reports an "illegal memory access" some operations later and the process dies.  So the first time -
+// and whenever the card, the model, the build or the cache's options change - the engine starts a copy of itself that
+// loads the model, switches the cache on, checks it and exercises it; if that copy ends with anything but success, the
+// engine goes on without the cache instead of dying.  The verdict is kept in ~/.cache/strata-q35/ (a "failed" one is
+// forgotten by deleting the file, or by --no-probe, which also skips the probe).
+
+std::string fnv_hex(const std::string& s) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    char b[32];
+    std::snprintf(b, sizeof b, "%016llx", (unsigned long long) h);
+    return b;
+}
+
+bool probe_wanted(const Options& o) {
+    if (o.no_probe || o.info || o.probe_child) return false;
+    if (o.expert_cache == "off" || o.expert_cache == "sim") return false;
+    if (std::getenv("STRATA_Q35_PROBE_TEST")) return true;       // tools/test_q35.py: the probe's own plumbing, on a PC without a card
+    return !o.cache_in_ram && llama_supports_gpu_offload();
+}
+
+std::string probe_file(const Options& o) {
+    std::string key = std::string("strata-q35 ") + STRATA_Q35_VERSION + " llama.cpp " + llama_version() + " model " + o.model;
+    struct stat st;
+    if (stat(o.model.c_str(), &st) == 0) key += " " + std::to_string((long long) st.st_size) + " " + std::to_string((long long) st.st_mtime);
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+        size_t f = 0, t = 0;
+        ggml_backend_dev_memory(d, &f, &t);
+        key += std::string(" ") + ggml_backend_dev_name(d) + " " + ggml_backend_dev_description(d) + " " + std::to_string(t >> 28);
+    }
+    key += " cache " + o.expert_cache + " " + std::to_string(o.cache_slots) + " " + std::to_string(o.cache_tokens) + " " + (o.cpu_moe ? "cpu-moe" : "")
+           + " " + std::to_string(o.n_cpu_moe) + " " + std::to_string(o.gpu_layers_set ? o.gpu_layers : -2) + " " + o.kv + " " + std::to_string(o.max_context);
+    const char* xdg = std::getenv("XDG_CACHE_HOME");
+    const char* home = std::getenv("HOME");
+    std::string dir = xdg && *xdg ? std::string(xdg) : (home && *home ? std::string(home) + "/.cache" : std::string());
+    if (dir.empty()) return std::string();
+    return dir + "/strata-q35/probe-" + fnv_hex(key) + ".txt";
+}
+
+// true: use the cache (probe passed, or had passed before); false: leave it off, `why` says why
+bool probe_cache(const Options& o, int argc, char** argv, std::string& why) {
+    const std::string file = probe_file(o);
+    if (!file.empty()) {
+        std::ifstream f(file);
+        std::string verdict;
+        if (f && std::getline(f, verdict)) {
+            if (verdict == "ok") return true;
+            why = "an earlier probe of this card, model and options failed (" + verdict + "); delete " + file + " to try again, or --no-probe to skip the probe";
+            return false;
+        }
+    }
+    std::fprintf(stderr, "strata-q35: trying the expert cache in a second process first (once; it loads the model again) ...\n");
+    std::fflush(stderr);
+    std::vector<std::string> args(argv, argv + argc);
+    args.push_back("--probe-cache");
+    std::vector<char*> av;
+    for (std::string& a : args) av.push_back(&a[0]);
+    av.push_back(nullptr);
+    char self[4096];
+    const ssize_t n = ::readlink("/proc/self/exe", self, sizeof self - 1);
+    const std::string exe = n > 0 ? std::string(self, (size_t) n) : std::string(argv[0]);
+    const pid_t pid = ::fork();
+    if (pid < 0) { why = "could not start the probe process"; return true; }   // no probe possible: rely on the check
+    if (pid == 0) {
+        const int nul = ::open("/dev/null", O_RDWR);
+        if (nul >= 0) { ::dup2(nul, 0); ::dup2(nul, 1); }                       // the protocol's stdout is not the child's
+        ::execv(exe.c_str(), av.data());
+        ::_exit(127);
+    }
+    int status = 0;
+    bool timed_out = false;
+    const auto t0 = Clock::now();
+    for (;;) {
+        const pid_t r = ::waitpid(pid, &status, WNOHANG);
+        if (r == pid) break;
+        if (r < 0 && errno != EINTR) { status = -1; break; }
+        if (ms_since(t0) > 30.0 * 60.0 * 1000.0) { ::kill(pid, SIGKILL); ::waitpid(pid, &status, 0); timed_out = true; break; }
+        ::usleep(200 * 1000);
+    }
+    std::string verdict;
+    if (timed_out) verdict = "no answer after 30 minutes";
+    else if (WIFEXITED(status) && WEXITSTATUS(status) == 0) verdict = "ok";
+    else if (WIFEXITED(status)) verdict = "the probe ended with code " + std::to_string(WEXITSTATUS(status));
+    else if (WIFSIGNALED(status)) verdict = "the probe died from signal " + std::to_string(WTERMSIG(status));
+    else verdict = "the probe did not finish";
+    if (!file.empty()) {
+        const std::string dir = file.substr(0, file.rfind('/'));
+        ::mkdir(dir.substr(0, dir.rfind('/')).c_str(), 0755);
+        ::mkdir(dir.c_str(), 0755);
+        std::ofstream out(file);
+        if (out) out << verdict << "\n";
+    }
+    if (verdict == "ok") return true;
+    why = verdict + " (see the lines above for what the card said)";
+    return false;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1652,6 +1798,14 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "strata-q35: --numa takes distribute, isolate or numactl\n"); return 2; }
         llama_numa_init(s);
     }
+    if (!o.probe_child && probe_wanted(o)) {
+        std::string why;
+        if (!probe_cache(o, argc, argv, why)) {
+            std::fprintf(stderr, "strata-q35: the expert cache is left off: %s\n", why.c_str());
+            o.expert_cache = "off";
+        }
+    }
+    if (o.probe_child) o.cache_profile.clear();     // the probe's own traffic must not become the cache's profile
     auto engp = std::make_unique<Engine>();
     Engine& eng = *engp;
     eng.o = o;
@@ -1662,6 +1816,14 @@ int main(int argc, char** argv) {
         return 1;
     }
     int rc = 0;
+    if (o.probe_child) {
+        // the cache must be on and must have survived the check and the exercise; the exit code tells the engine that started us
+        const bool ok = eng.hx && eng.hx->caching() && eng.probe_exercise();
+        std::fprintf(stderr, "strata-q35: probe %s\n", ok ? "passed" : "failed");
+        engp.reset();
+        llama_backend_free();
+        return ok ? 0 : 10;
+    }
     if (!o.info) std::fprintf(stderr, "strata-q35: %s; context %lld, K/V %s\n", eng.placement.c_str(), (long long) o.max_context,
                               o.kv.c_str());
     if (o.info) eng.print_info();

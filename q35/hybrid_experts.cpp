@@ -274,7 +274,7 @@ bool HybridExperts::Impl::init(llama_model* model, const std::string& gguf_path,
     if (n_used <= 0) { err = "the model does not say how many experts a token uses (" + arch + ".expert_used_count)"; return false; }
 
     // ---- the layers that take part
-    int skipped_scales = 0;
+    int skipped_scales = 0, skipped_backend = 0, skipped_type = 0;
     for (int il = 0; il < n_layer; ++il) {
         Layer L;
         L.il = il;
@@ -289,6 +289,17 @@ bool HybridExperts::Impl::init(llama_model* model, const std::string& gguf_path,
         const bool layer_on_card = !ggml_backend_buft_is_host(lbuft);
         if (want_cache && !cfg.in_ram && !(experts_in_ram && layer_on_card)) continue;   // nothing to cache for it
         if (want_cache && cfg.in_ram && !experts_in_ram) continue;
+        if (want_cache && !cfg.in_ram) {
+            // what the card's kernels were checked for: CUDA's (ROCm's are the same code), and quantized experts: for other
+            // types CUDA picks mul_mat_id kernels that cannot take a token naming an expert twice, as the cache does
+            ggml_backend_buffer_type_t b = ggml_backend_buffer_get_type(L.t.gate_inp->buffer);
+            ggml_backend_dev_t d = ggml_backend_buft_get_device(b);
+            const char* dn = d ? ggml_backend_dev_name(d) : "";
+            if (std::strncmp(dn, "CUDA", 4) != 0 && std::strncmp(dn, "ROCm", 4) != 0) { ++skipped_backend; continue; }
+            bool quantized = true;
+            for (const ggml_tensor* t : {L.t.up, L.t.gate, L.t.gate_up, L.t.down}) if (t && !ggml_is_quantized(t->type)) quantized = false;
+            if (!quantized) { ++skipped_type; continue; }
+        }
         L.slot_bytes = (L.t.gate_up ? L.t.gate_up->nb[2] : L.t.up->nb[2] + L.t.gate->nb[2]) + L.t.down->nb[2];
         L.slot_bytes = std::max<size_t>(L.slot_bytes, 1);
         // the group of its card
@@ -307,7 +318,9 @@ bool HybridExperts::Impl::init(llama_model* model, const std::string& gguf_path,
         layers.push_back(L);
     }
     if (layers.empty()) {
-        err = want_cache ? (skipped_scales ? "the experts have per-expert scales (not supported by the cache)"
+        err = want_cache ? (skipped_backend ? "the card's backend is not CUDA (the cache was written for CUDA's kernels)"
+                           : skipped_type ? "the experts are not quantized (CUDA would pick a mul_mat_id kernel the cache cannot use)"
+                           : skipped_scales ? "the experts have per-expert scales (not supported by the cache)"
                                            : "no layer has its routed experts in RAM and the rest on a card (use --cpu-moe)")
                          : "the model has no routed experts";
         return false;
