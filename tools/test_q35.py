@@ -33,10 +33,10 @@ N_GEN = 24
 class Engine:
     """One `strata-q35 --serve` process, spoken to the way serve/server.py speaks to `strata --serve`."""
 
-    def __init__(self, *args: str, context: int = 4096):
+    def __init__(self, *args: str, context: int = 4096, env: dict | None = None):
         self.proc = subprocess.Popen([ENGINE, "--serve", "--native", GGUF, "--max-context", str(context), "--threads", "2",
                                       *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                     text=True, bufsize=1)
+                                     text=True, bufsize=1, env={**os.environ, **env} if env else None)
         self.lines: queue.Queue = queue.Queue()
         threading.Thread(target=self._pump, daemon=True).start()
         self.info: dict = {}
@@ -626,6 +626,59 @@ class Q35Speculation(unittest.TestCase):
         for args in (["--spec", "fast"], ["--spec-max", "0"], ["--spec-match", "9"]):
             r = subprocess.run([ENGINE, "--native", GGUF, "-p", "hi", *args], capture_output=True, timeout=60)
             self.assertEqual(r.returncode, 2, args)
+
+    # ---- #879: logits that are not finite (the same guard and the same debug switch as Strata's)
+
+    def test_non_finite_logits_before_the_first_token_end_the_request_and_drop_the_state(self):
+        r = REF[1]
+        e = Engine(env={"STRATA_NAN_INJECT": "1"})
+        try:
+            bad = e.gen(r["ids"])
+            self.assertEqual(bad["tokens"], [])                  # none of the poisoned window's tokens is written
+            self.assertEqual(bad["done"][5], "nonfinite")
+            again = e.gen(r["ids"])                              # the server sends it once more: from token 0, as on a fresh engine
+            self.assertEqual(again["resume"], 0)
+            self.assertEqual(again["done"][5], "length")
+            self.assertEqual(again["tokens"], r["gen"])
+        finally:
+            e.close()
+
+    def test_non_finite_logits_in_the_middle_of_a_reply_keep_the_tokens_before_them(self):
+        r = REF[1]
+        e = Engine(env={"STRATA_NAN_INJECT": "5"})
+        try:
+            bad = e.gen(r["ids"])
+            self.assertEqual(bad["done"][5], "nonfinite")
+            self.assertEqual(bad["tokens"], r["gen"][:4])         # windows 1-4 gave tokens 1-4, window 5 was flagged
+            again = e.gen(r["ids"])
+            self.assertEqual(again["resume"], 0)                  # the cached state is gone, the checkpoints too
+            self.assertEqual(again["tokens"], r["gen"])
+        finally:
+            e.close()
+
+    def test_non_finite_logits_in_a_window_of_guesses(self):
+        r = REF[1]
+        hint = ",".join(map(str, r["gen"]))
+        e = Engine(*SPEC, env={"STRATA_NAN_INJECT": "3"})
+        try:
+            bad = e.gen(r["ids"], N_GEN, keys="spec_hint=" + hint)
+            self.assertEqual(bad["done"][5], "nonfinite")
+            self.assertEqual(bad["tokens"], r["gen"][:len(bad["tokens"])])   # what was written is the model's own answer
+            again = e.gen(r["ids"], N_GEN, keys="spec_hint=" + hint)
+            self.assertEqual(again["resume"], 0)
+            self.assertEqual(again["tokens"], r["gen"])
+        finally:
+            e.close()
+
+    def test_the_guard_can_be_turned_off(self):
+        r = REF[1]
+        e = Engine(env={"STRATA_NAN_INJECT": "1,2,3", "STRATA_NAN_GUARD": "0"})
+        try:
+            got = e.gen(r["ids"])
+            self.assertEqual(got["done"][5], "length")
+            self.assertEqual(got["tokens"], r["gen"])
+        finally:
+            e.close()
 
 
 if __name__ == "__main__":

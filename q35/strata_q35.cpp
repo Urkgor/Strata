@@ -555,6 +555,9 @@ public:
     std::string placement = "all on the card";
     std::string offload_tag = "gpu";   // one word for the INFO line
     std::unique_ptr<q35::HybridExperts> hx;   // the hybrid expert cache (null: off)
+    bool nan_guard = true;                    // STRATA_NAN_GUARD=0 turns the logits check off
+    std::set<long long> nan_inject;           // STRATA_NAN_INJECT=n,n: the n-th window checked counts as non-finite (tests)
+    long long nan_windows = 0;                // windows checked so far (a window is one llama_decode whose logits are used)
     ggml_threadpool_t tp = nullptr, tp_batch = nullptr;   // the CPU threads, kept between graphs
     std::vector<std::pair<void*, size_t>> pinned;         // RAM ranges page-locked for the card (--pin-experts)
     bool (*unpin_fn)(void*) = nullptr;
@@ -791,6 +794,16 @@ public:
             if (arch != "qwen4exp" && n_vocab > 248046 && (arch == "qwen35moe" || arch == "qwen35" || arch == "qwen3next")) {
                 eos.insert(248044);
                 eos.insert(248046);
+            }
+        }
+        if (const char* g = std::getenv("STRATA_NAN_GUARD")) nan_guard = std::atoi(g) != 0;
+        if (const char* inj = std::getenv("STRATA_NAN_INJECT")) {
+            for (const char* c = inj; *c;) {
+                char* end = nullptr;
+                const long long w = std::strtoll(c, &end, 10);
+                if (end == c) break;
+                if (w > 0) nan_inject.insert(w);
+                c = *end == ',' ? end + 1 : end;
             }
         }
         spec_on = o.spec == "lookup";
@@ -1091,6 +1104,37 @@ public:
         return s;
     }
 
+    // #879 (the same guard as Strata's): a row of logits that holds a NaN or an infinity means the state it came from is
+    // poisoned (the K/V and the recurrent state carry it into every later token and every later turn that reuses them).
+    // The request ends with `DONE ... nonfinite`, none of that window's tokens is written, and the cached state is dropped
+    // so the next request reads its prompt from token 0.  A pass over 248k floats costs about as much as sampling from them.
+    bool window_ok() {
+        if (!nan_guard) return true;
+        return !(!nan_inject.empty() && nan_inject.count(++nan_windows));
+    }
+    bool row_finite(int idx) const {
+        const float* lg = llama_get_logits_ith(ctx, idx);
+        if (!lg) return true;
+        uint32_t bad = 0;
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            uint32_t b;
+            std::memcpy(&b, lg + i, sizeof(b));
+            bad |= (uint32_t) ((b & 0x7f800000u) == 0x7f800000u);   // the exponent all ones: NaN or infinity
+        }
+        return bad == 0;
+    }
+    // -> false: the logits of row `idx` cannot be used (the caller ends the request with `nonfinite`)
+    bool usable(int idx, bool window_start) {
+        if (!nan_guard) return true;
+        if (window_start && !window_ok()) return false;
+        return row_finite(idx);
+    }
+    void drop_poisoned(int64_t position) {
+        std::fprintf(stderr, "strata-q35: non-finite logits (#879) at position %lld: the request ends here and the cached "
+                             "state is dropped (the next request reads its prompt from token 0)\n", (long long) position);
+        clear_all();
+    }
+
     // One request: reads the prompt (reusing what memory holds), samples, and reports through `out`.
     // `emit_token` is called with each sampled id.  Returns false after printing an ERR.
     struct Result {
@@ -1183,8 +1227,10 @@ public:
             for (size_t i = 0; i < hist.size(); ++i) lk.add(hist, i);
             for (size_t i = 0; i < r.hint.size(); ++i) lkh.add(r.hint, i);
         }
-        llama_token tok = llama_sampler_sample(smpl, ctx, -1);
-        for (;;) {
+        llama_token tok = 0;
+        bool poisoned = !usable(-1, true);
+        if (!poisoned) tok = llama_sampler_sample(smpl, ctx, -1);
+        for (; !poisoned;) {
             if (hk.token) hk.token(tok);
             ++res.produced;
             if (!r.ignore_eos && eos.count(tok)) { res.finish = "stop"; break; }
@@ -1206,6 +1252,7 @@ public:
                 const int rc = decode(&tok, 1, true);
                 if (rc == 2) { res.finish = "cancel"; break; }
                 if (rc != 0) { err = "decode failed (code " + std::to_string(rc) + ")"; ok = false; break; }
+                if (!usable(-1, true)) { poisoned = true; break; }
                 tok = llama_sampler_sample(smpl, ctx, -1);
                 continue;
             }
@@ -1225,6 +1272,7 @@ public:
             bool finished = false;
             llama_token next = 0;
             for (int i = 0; i <= k; ++i) {
+                if (!usable(i, i == 0)) { poisoned = true; break; }   // rows before it were computed from clean positions only
                 next = llama_sampler_sample(smpl, ctx, i);
                 if (i == k || next != draft[(size_t) i]) break;       // the model said something else (or this was the bonus row)
                 ++n_acc;
@@ -1239,12 +1287,17 @@ public:
             res.drafts_accepted += n_acc;
             if (n_acc == 0) { backoff = std::min(std::max(1, backoff * 2), 16); cooldown = backoff; }
             else backoff = 0;
+            if (poisoned) break;
             if (n_acc < k && !drop_tail(p0 + 1 + n_acc, hist)) { err = "could not take back a rejected guess"; ok = false; break; }
             if (finished) break;
             tok = next;
         }
         res.decode_ms = ms_since(t1);
         llama_sampler_free(smpl);
+        if (poisoned) {
+            res.finish = "nonfinite";
+            drop_poisoned((long long) live.size());
+        }
         return ok;
     }
 
