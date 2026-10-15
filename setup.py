@@ -5593,7 +5593,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
 
     step(3, "Python packages")
     pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
-                "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
+                "numpy, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
 
     step(4, "the Strata engine")
     llama, eng, meta, lib_dirs, gpu, _ = engine_step(a, gpu, hip, amd, cuda_tk, "none")

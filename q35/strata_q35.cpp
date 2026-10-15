@@ -127,6 +127,7 @@ struct Options {
     std::string cache_dump;      // --cache-dump FILE: the experts in the cache, in that format
     bool cache_static = false;   // --cache-static: nothing moves after the start
     bool cache_check = true;
+    bool warmup = true;          // a throw-away prompt and some decode steps at load, so the first request runs at full speed
     bool probe_child = false;    // --probe-cache: the process the engine starts to try the cache before it relies on it
     bool no_probe = false;       // --no-probe: do not
     std::vector<int> sim_pct;
@@ -196,6 +197,7 @@ void usage() {
         "  --cache-swaps N        experts moved into the cache after a decode step once it is full (default 2)\n"
         "  --cache-half-life N    tokens after which a use counts half (default 512)\n"
         "  --cache-check on|off   compare the first tokens with and without the cache at start (default on)\n"
+        "  --no-warmup            skip the throw-away prompt and decode steps run at load (--serve and --bench)\n"
         "  --sim-cache A,B,..     with any mode: the hit rate that caches of A%, B%.. of the experts would have had\n"
         "  --no-probe             the first time (and when the card, the model or these options change) a second process loads the\n"
         "                         model and tries the cache; if the card faults, the cache is left off instead of the engine dying\n"
@@ -378,6 +380,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--cache-swaps") { if (!num(a.c_str(), 0, 4096, n)) return false; o.cache_policy.swaps_per_step = (int) n; }
         else if (a == "--cache-fill") { if (!num(a.c_str(), 1, 1 << 20, n)) return false; o.cache_policy.fill_swaps = (int) n; }
         else if (a == "--cache-half-life") { if (!num(a.c_str(), 1, 1 << 30, n)) return false; o.cache_policy.half_life = (double) n; }
+        else if (a == "--no-warmup") o.warmup = false;
         else if (a == "--cache-check") {
             if (!(v = need(i, a.c_str()))) return false;
             const std::string s2 = v;
@@ -882,6 +885,42 @@ public:
         if (ctx) { mem = llama_get_memory(ctx); llama_set_abort_callback(ctx, abort_cb, nullptr); attach_threads(); }
         live.clear();
         ckpts.clear();
+    }
+
+    // A throw-away request at load (--serve, --bench): the first real request then does not pay for the card's lazy kernel
+    // loading, the BLAS handles, the compute buffers and the graphs of each batch size.  The shapes are the ones a request
+    // makes: a prompt chunk, single tokens, and the 2..spec_max+1 token batches of a speculation step.  The expert cache is
+    // frozen meanwhile (what this text routes is not what the user's will), and everything is forgotten afterwards.
+    void warmup() {
+        if (!o.warmup) return;
+        const auto t0 = Clock::now();
+        const std::string text = "Mixture-of-experts models send every token to a few of many small networks. Which ones depends on the "
+                                 "meaning of the word: code, prose, numbers and several languages each prefer their own. Write one sentence.";
+        const std::vector<llama_token> base = text_tokens(text);
+        if (base.size() < 8) return;
+        std::vector<llama_token> chunk;                       // one prompt chunk of the usual size
+        const size_t want = (size_t) std::max<long long>(8, std::min<long long>({(long long) o.n_batch, 512LL, (long long) o.max_context / 4}));
+        while (chunk.size() < want) chunk.insert(chunk.end(), base.begin(), base.end());
+        chunk.resize(want);
+        if (hx) hx->set_frozen(true);
+        clear_all();
+        bool ok = decode(chunk.data(), (int) chunk.size(), true) == 0;
+        llama_token next = base[0];
+        for (int i = 0; ok && i < 4; ++i) {
+            ok = decode(&next, 1, true) == 0;
+            if (ok) {
+                const float* lg = llama_get_logits_ith(ctx, -1);
+                if (lg) next = (llama_token) (std::max_element(lg, lg + n_vocab) - lg);
+            }
+        }
+        if (ok && spec_on) {
+            const int top = std::min<int>(o.spec_max + 1, (int) base.size());
+            for (int n = 2; ok && n <= top; ++n) ok = decode(base.data(), n, true, true) == 0;
+        }
+        clear_all();
+        if (hx) { hx->set_frozen(false); hx->reset_stats(); }
+        if (!ok) std::fprintf(stderr, "strata-q35: the warm-up failed (the first request will say more)\n");
+        else if (g_verbose) std::fprintf(stderr, "strata-q35: warm-up %.1f s\n", ms_since(t0) / 1000.0);
     }
 
     // What the probe process does once the cache is loaded and has passed its check: the paths a real run takes - a
@@ -2155,8 +2194,8 @@ int main(int argc, char** argv) {
     if (!o.info) std::fprintf(stderr, "strata-q35: %s; context %lld, K/V %s\n", eng.placement.c_str(), (long long) o.max_context,
                               o.kv.c_str());
     if (o.info) eng.print_info();
-    else if (o.bench) rc = eng.bench();
-    else if (o.serve) eng.serve();
+    else if (o.bench) { eng.warmup(); rc = eng.bench(); }
+    else if (o.serve) { eng.warmup(); eng.serve(); }
     else rc = eng.generate_text();
     engp.reset();   // the model goes before the backends do
     llama_backend_free();

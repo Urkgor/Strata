@@ -90,6 +90,7 @@ std::string meta(const llama_model* m, const std::string& key) {
 struct HybridExperts::Impl {
     HybridConfig cfg;
     bool ready = false;
+    bool frozen = false;           // after_decode() does nothing: the cache is not taught by this traffic (the warm-up)
     bool cache = false;
     bool enabled = true;
     int n_layer = 0, n_expert = 0, n_used = 0;
@@ -595,7 +596,7 @@ bool HybridExperts::Impl::init(llama_model* model, const std::string& gguf_path,
 // -------------------------------------------------------------------------------------------------- after a decode
 
 void HybridExperts::Impl::after_decode(int n) {
-    if (!ready || n <= 0 || n > cfg.n_ubatch) return;
+    if (!ready || frozen || n <= 0 || n > cfg.n_ubatch) return;
     const auto t0 = std::chrono::steady_clock::now();
     for (Group& g : groups) {
         const size_t bytes = (size_t) n * (size_t) n_layer * (size_t) n_used * sizeof(int32_t);
@@ -650,6 +651,7 @@ void HybridExperts::set_enabled(bool on) {
     p_->enabled = on;
     p_->hy.enabled = p_->cache && on;
 }
+void HybridExperts::set_frozen(bool on) { p_->frozen = on; }
 void HybridExperts::set_fill_swaps(int n) {
     p_->cfg.policy.fill_swaps = n;
     if (p_->hs) p_->hs->set_fill_swaps(n);

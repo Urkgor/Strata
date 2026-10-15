@@ -56,6 +56,7 @@ public:
     bool ready() const;                // init() succeeded
     bool caching() const;              // mode cache: there are slots on the card
     void set_enabled(bool on);         // hybrid graphs (true) or the usual ones (false), for graphs built afterwards
+    void set_frozen(bool on);          // while on, after_decode() ignores the traffic: nothing is counted, nothing is moved
     void set_fill_swaps(int n);        // experts moved per decode step while the cache has free slots
     int fill_swaps() const;
 

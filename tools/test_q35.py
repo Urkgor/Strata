@@ -670,6 +670,17 @@ class Q35Speculation(unittest.TestCase):
         finally:
             e.close()
 
+    def test_the_warm_up_leaves_nothing_behind(self):
+        r = REF[1]
+        for args in ((), ("--no-warmup",), (*SPEC,), (*CACHE, "--cache-slots", "3", "--cache-tokens", "64")):
+            e = Engine(*args)
+            try:
+                got = e.gen(r["ids"])
+                self.assertEqual(got["resume"], 0, args)            # no conversation held over from the warm-up
+                self.assertEqual(got["tokens"], r["gen"], args)
+            finally:
+                e.close()
+
     def test_the_guard_can_be_turned_off(self):
         r = REF[1]
         e = Engine(env={"STRATA_NAN_INJECT": "1,2,3", "STRATA_NAN_GUARD": "0"})
