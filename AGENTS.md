@@ -10,7 +10,9 @@ protocol, so the server runs on it unchanged): [docs/Q35.md](docs/Q35.md), and f
 [docs/RHEL7.md](docs/RHEL7.md). It is llama.cpp's graph plus a patch of ours (`q35/patches/`, applied by the build): the
 expert cache and the code that drives it are `q35/expert_cache.h`, `q35/hybrid_experts.cpp`, `q35/strata_q35.cpp`. Its tests:
 `python -m unittest tools.test_q35_setup` (no engine needed), `build-q35/test-expert-cache` (the cache's policy, no engine) and
-`tools/test_q35.py` (needs the engine and the tiny model from `tools/q35_tiny_model.py`; the cache runs there with `--cache-in-ram`).
+`tools/test_q35.py` (needs the engine and the tiny model from `tools/q35_tiny_model.py --mtp`, which also writes the MTP-block model of the
+`--spec mtp` tests; the cache runs there with `--cache-in-ram`). `strata` itself now also runs Qwen3.6-35B-A3B on its own kernels
+(`src/qwen35/`, `strata-q36`): it is a separate path, see the top of [docs/Q35.md](docs/Q35.md) for when to use which.
 When the patch changes, regenerate it from the patched llama.cpp checkout (`git add -N src/llama-hybrid.h && git diff`).
 
 The Python server (`serve/`) and `tools/strata_tokenizer.py` use **only the standard library**: chat templates are

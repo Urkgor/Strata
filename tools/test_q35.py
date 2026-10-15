@@ -26,6 +26,7 @@ ENGINE = os.environ.get("STRATA_Q35_ENGINE", "")
 MODEL_DIR = os.environ.get("STRATA_Q35_MODEL_DIR", "")
 READY = bool(ENGINE) and Path(ENGINE).exists() and bool(MODEL_DIR) and (Path(MODEL_DIR) / "ref.json").exists()
 GGUF = str(Path(MODEL_DIR) / "tiny-f32.gguf") if MODEL_DIR else ""
+GGUF_MTP = str(Path(MODEL_DIR) / "tiny-mtp-f32.gguf") if MODEL_DIR else ""   # tools/q35_tiny_model.py --mtp
 REF = json.loads((Path(MODEL_DIR) / "ref.json").read_text()) if READY else []
 N_GEN = 24
 
@@ -33,8 +34,8 @@ N_GEN = 24
 class Engine:
     """One `strata-q35 --serve` process, spoken to the way serve/server.py speaks to `strata --serve`."""
 
-    def __init__(self, *args: str, context: int = 4096, env: dict | None = None):
-        self.proc = subprocess.Popen([ENGINE, "--serve", "--native", GGUF, "--max-context", str(context), "--threads", "2",
+    def __init__(self, *args: str, context: int = 4096, env: dict | None = None, model: str = ""):
+        self.proc = subprocess.Popen([ENGINE, "--serve", "--native", model or GGUF, "--max-context", str(context), "--threads", "2",
                                       *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                      text=True, bufsize=1, env={**os.environ, **env} if env else None)
         self.lines: queue.Queue = queue.Queue()
@@ -690,6 +691,135 @@ class Q35Speculation(unittest.TestCase):
             self.assertEqual(got["tokens"], r["gen"])
         finally:
             e.close()
+
+
+# ---- --spec mtp: the GGUF's own MTP block guesses.  tiny-mtp-f32.gguf (tools/q35_tiny_model.py --mtp) is the same model plus a block
+# fitted to guess the token after next, right about a third of the time here; --spec-p-min 0 keeps it guessing even when unsure.
+MTP = ["--spec", "mtp", "--spec-p-min", "0"]
+
+
+@unittest.skipUnless(READY and Path(GGUF_MTP).exists(), "needs tiny-mtp-f32.gguf in the model dir (tools/q35_tiny_model.py --mtp)")
+class Q35Mtp(unittest.TestCase):
+    N = 120
+
+    def plain(self, ids, n=None, *args, keys=""):
+        e = Engine(*args, model=GGUF_MTP)
+        try:
+            return e.gen(ids, n or self.N, keys)
+        finally:
+            e.close()
+
+    def test_the_text_is_the_plain_text_and_some_guesses_are_right(self):
+        for spec_max in ("3", "1", "5"):
+            e = Engine(*MTP, "--spec-max", spec_max, model=GGUF_MTP)
+            try:
+                offered = accepted = 0
+                for r in REF:
+                    got = e.gen(r["ids"], self.N)
+                    self.assertEqual(got["tokens"], self.plain(r["ids"])["tokens"], (spec_max, len(r["ids"])))
+                    accepted += int(got["done"][6])
+                    offered += int(got["done"][7])
+                self.assertGreater(offered, 0, spec_max)
+                self.assertGreater(accepted, 0, spec_max)            # the accepted-guess paths ran
+                self.assertLess(accepted, offered, spec_max)         # and so did the rejected ones
+            finally:
+                e.close()
+
+    def test_a_conversation_continues_with_both_contexts_in_step(self):
+        p, extra = REF[1]["ids"], [11, 12, 13, 14, 15]
+        e = Engine(*MTP, model=GGUF_MTP)
+        try:
+            first = e.gen(p, self.N)
+            turn2 = p + first["tokens"] + extra
+            got = e.gen(turn2, self.N)
+            self.assertGreater(got["resume"], len(p))
+            self.assertEqual(got["tokens"], self.plain(turn2)["tokens"])
+            third = turn2 + got["tokens"] + [21, 22]
+            self.assertEqual(e.gen(third, 40)["tokens"], self.plain(third, 40)["tokens"])
+        finally:
+            e.close()
+
+    def test_an_edit_restores_a_checkpoint_and_the_guesses_go_on(self):
+        p = REF[2]["ids"]
+        args = ("--batch", "16", "--ubatch", "16", "--ckpt-every", "16", "--ckpt-slots", "4")
+        edited = p[:180] + [20 + i for i in range(30)]
+        e = Engine(*MTP, *args, model=GGUF_MTP)
+        try:
+            e.gen(p, 60)
+            got = e.gen(edited, self.N)
+            self.assertEqual(got["resume"], 176)
+            self.assertEqual(got["tokens"], self.plain(edited, self.N, *args)["tokens"])
+            early = p[:100] + [30 + i for i in range(20)]
+            got = e.gen(early, self.N)
+            self.assertEqual(got["resume"], 0)
+            self.assertEqual(got["tokens"], self.plain(early, self.N, *args)["tokens"])
+        finally:
+            e.close()
+
+    def test_stop_in_the_middle_and_on_with_the_same_prompt(self):
+        p = REF[1]["ids"]
+        e = Engine(*MTP, model=GGUF_MTP)
+        try:
+            got = e.gen(p, 3000, stop_after=5)
+            self.assertEqual(got["done"][5], "cancel")
+            again = e.gen(p, self.N)
+            self.assertEqual(again["tokens"], self.plain(p)["tokens"])
+            turn2 = p + again["tokens"] + [41, 42]
+            self.assertEqual(e.gen(turn2, 40)["tokens"], self.plain(turn2, 40)["tokens"])
+        finally:
+            e.close()
+
+    def test_a_restored_conversation_is_guessed_on_after_restore(self):
+        p, extra = REF[1]["ids"], [41, 42, 43]
+        with tempfile.TemporaryDirectory() as d:
+            path = str(Path(d) / "chat.bin")
+            e = Engine(*MTP, model=GGUF_MTP)
+            try:
+                first = e.gen(p, 60)
+                self.assertTrue(e.ask(f"SAVE {path}", "SAVED").startswith("SAVED"))
+                e.gen(REF[0]["ids"], 8)
+                self.assertTrue(e.ask(f"RESTORE {path}", "RESTORED").startswith("RESTORED"))
+                turn2 = p + first["tokens"] + extra
+                got = e.gen(turn2, self.N)
+                self.assertGreater(got["resume"], len(p))
+                self.assertEqual(got["tokens"], self.plain(turn2)["tokens"])
+            finally:
+                e.close()
+
+    def test_with_the_expert_cache(self):
+        args = [*CACHE, "--cache-slots", "3", "--cache-tokens", "64"]
+        e = Engine(*MTP, *args, model=GGUF_MTP)
+        try:
+            for r in REF:
+                got = e.gen(r["ids"], 60)
+                self.assertEqual(got["tokens"], self.plain(r["ids"], 60, "--cpu-moe", "--no-repack")["tokens"])
+        finally:
+            e.close()
+
+    def test_non_finite_logits_in_a_guessing_step(self):
+        r = REF[1]
+        e = Engine(*MTP, model=GGUF_MTP, env={"STRATA_NAN_INJECT": "4"})
+        try:
+            bad = e.gen(r["ids"], self.N)
+            self.assertEqual(bad["done"][5], "nonfinite")
+            again = e.gen(r["ids"], self.N)
+            self.assertEqual(again["resume"], 0)
+            self.assertEqual(again["tokens"], self.plain(r["ids"])["tokens"])
+        finally:
+            e.close()
+
+    def test_a_gguf_without_the_block_guesses_from_the_text_instead(self):
+        e = Engine("--spec", "mtp", "--spec-p-min", "0")          # tiny-f32.gguf has no MTP block
+        try:
+            got = e.gen(REF[1]["ids"])
+            self.assertEqual(got["tokens"], REF[1]["gen"])
+        finally:
+            e.close()
+
+    def test_a_bad_option_is_refused(self):
+        for args in (["--spec", "fast"], ["--spec-p-min", "2"], ["--spec-p-min", "x"]):
+            r = subprocess.run([ENGINE, "--native", GGUF, "-p", "hi", *args], capture_output=True, timeout=60)
+            self.assertEqual(r.returncode, 2, args)
 
 
 if __name__ == "__main__":

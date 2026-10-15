@@ -137,6 +137,13 @@ class Q35Setup(unittest.TestCase):
                          ["--native", "m.gguf", "--max-context", "32768", "--ubatch", "2048", "--batch", "4096", "--no-repack",
                           "--pin-experts", "--spec", "lookup", "--main-gpu", "1", "--split-mode", "none"])
 
+    def test_mtp_speculation_is_passed_on(self):
+        a = q35_setup.parse(["--gguf", "x", "--spec", "mtp", "--spec-p-min", "0.7", "--no-expert-cache"])
+        self.assertEqual(q35_setup.engine_args(a, Path("m.gguf")),
+                         ["--native", "m.gguf", "--max-context", "32768", "--spec", "mtp", "--spec-p-min", "0.7"])
+        b = q35_setup.parse(["--gguf", "x", "--spec", "mtp", "--no-expert-cache"])
+        self.assertNotIn("--spec-p-min", q35_setup.engine_args(b, Path("m.gguf")))
+
     def test_experts_placed_by_hand(self):
         a = q35_setup.parse(["--gguf", "x", "--cache-hot", "/tmp/hot.txt", "--cache-static"])
         args = q35_setup.engine_args(a, Path("m.gguf"))

@@ -157,7 +157,9 @@ built from source on Linux (it is written to build on RHEL / CentOS 7 too). It i
 model of the same architecture, not yet on the real one or on a graphics card, so its speed is not measured yet:
 [what was checked and what was not](docs/Q35.md#what-was-checked-and-what-was-not),
 [how to build and run it](docs/Q35.md), [how to measure what the cache gives you](docs/Q35.md#measuring-what-the-cache-gives-you),
-[RHEL / CentOS 7](docs/RHEL7.md).
+[RHEL / CentOS 7](docs/RHEL7.md). It can also guess ahead with the GGUF's own MTP block
+([`--spec mtp`](docs/Q35.md#the-models-own-guesses---spec-mtp)). Strata's own engine (`strata`, `setup.py --family qwen36`) now runs this model
+as well, on its own kernels; [which one to use](docs/Q35.md#which-engine-for-which-model).
 
 ## Using it
 

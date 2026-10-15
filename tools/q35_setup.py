@@ -92,6 +92,8 @@ def engine_args(a: argparse.Namespace, gguf: Path, out: Path | None = None) -> l
         args.append("--pin-experts")
     if a.spec != "off":
         args += ["--spec", a.spec]
+        if a.spec == "mtp" and a.spec_p_min is not None:
+            args += ["--spec-p-min", str(a.spec_p_min)]
     if a.main_gpu is not None:
         args += ["--main-gpu", str(a.main_gpu)]
     if a.split_mode:
@@ -162,7 +164,11 @@ def parse(argv=None) -> argparse.Namespace:
     ap.add_argument("--no-repack", action="store_true",
                     help="keep the CPU's weights as in the file, so the card can compute them for long prompts (otherwise the CPU does)")
     ap.add_argument("--pin-experts", action="store_true", help="page-lock the experts in RAM: faster PCIe copies for long prompts (experimental)")
-    ap.add_argument("--spec", default="off", choices=["off", "lookup"], help="speculation from repeats in the context (docs/Q35.md)")
+    ap.add_argument("--spec", default="off", choices=["off", "lookup", "mtp"],
+                    help="speculation: lookup guesses from repeats in the context, mtp with the GGUF's own MTP block (Unsloth's "
+                         "-MTP-GGUF files have one); docs/Q35.md")
+    ap.add_argument("--spec-p-min", type=float, default=None, metavar="P",
+                    help="--spec mtp: stop the chain of guesses at a token the block gives less than this probability (engine default 0.5)")
     ap.add_argument("--main-gpu", type=int, default=None, metavar="N", help="the card that holds the model when there are several")
     ap.add_argument("--split-mode", default=None, choices=["none", "layer", "row"], help="several cards: none (one card), layer, row")
     ap.add_argument("--threads", type=int, default=0)

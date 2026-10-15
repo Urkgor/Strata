@@ -17,7 +17,7 @@ Q5_K, Q6_K, IQ4_XS) apply to it: `llama-quantize` it and compare logits to see t
 
 needs `torch`, `transformers` (5.x, with qwen3_5_moe), `tokenizers` and `numpy`; llama.cpp's checkout is only used
 for its converter (the commit in third_party/ggml/VERSION.txt).  OUTDIR gets `hf/` (the model), `tiny-f32.gguf` and
-`ref.json` (three prompts of 5, 40 and 200 token ids with their greedy continuations of 24 tokens and the 8 best
+`ref.json` (with --mtp also `tiny-mtp-f32.gguf`, the same model plus a multi-token-prediction block fitted to guess; three prompts of 5, 40 and 200 token ids with their greedy continuations of 24 tokens and the 8 best
 logits after the prompt).  tools/test_q35.py takes OUTDIR.
 """
 import argparse
@@ -91,18 +91,89 @@ def make_model(out, preset="tiny"):
     return vocab
 
 
-def convert(llama_cpp, hf_dir, gguf):
-    """llama.cpp's converter, with the BPE pre-tokenizer named by hand: the tiny tokenizer has no known hash."""
+def convert(llama_cpp, hf_dir, gguf, mtp=False):
+    """llama.cpp's converter, with the BPE pre-tokenizer named by hand: the tiny tokenizer has no known hash.
+    `mtp`: keep the checkpoint's MTP block (the nextn layer) in the GGUF."""
     sys.path.insert(0, llama_cpp)
     sys.path.insert(0, os.path.join(llama_cpp, "gguf-py"))
     import conversion.base as base
     base.TextModel.get_vocab_base_pre = lambda self, tokenizer: "qwen35"
     argv = sys.argv
-    sys.argv = ["convert_hf_to_gguf.py", hf_dir, "--outfile", gguf, "--outtype", "f32", "--no-mtp"]
+    sys.argv = ["convert_hf_to_gguf.py", hf_dir, "--outfile", gguf, "--outtype", "f32"] + ([] if mtp else ["--no-mtp"])
     try:
         runpy.run_path(os.path.join(llama_cpp, "convert_hf_to_gguf.py"), run_name="__main__")
     finally:
         sys.argv = argv
+
+
+def add_mtp(hf_dir, out_dir, prompts, n_gen=300, steps=1500):
+    """The same model with a multi-token-prediction block, as Qwen3.6's checkpoint carries it: `mtp.fc` (the hidden state and
+    the next token's embedding in, one hidden size out), the two pre-norms, one more decoder layer (a copy of the last,
+    full-attention one) and the final norm.
+
+    The block is made to guess something: its decoder layer is switched off (attention output and every down projection
+    zero, so the layer adds nothing to the residual) and `fc` is fitted - by gradient descent, on the model's own greedy
+    continuations of `prompts` - to give, from (hidden state at p, token p+1), the token the model puts at p+2.  A linear
+    map cannot do that well; it gets a fair share of the guesses right, which is what a test of the accepted-draft paths
+    needs (a random block would almost never be right).  Returns the share of right guesses on the data it was fitted to."""
+    import shutil
+    import torch
+    from safetensors.torch import load_file, save_file
+    from transformers.models.qwen3_5_moe import Qwen3_5MoeForCausalLM
+
+    os.makedirs(out_dir, exist_ok=True)
+    for name in os.listdir(hf_dir):
+        if name != "model.safetensors" and name != "config.json":
+            shutil.copy(os.path.join(hf_dir, name), os.path.join(out_dir, name))
+    cfg = json.load(open(os.path.join(hf_dir, "config.json")))
+    n_layer = cfg["num_hidden_layers"]
+    last = f"model.layers.{n_layer - 1}."
+    w = load_file(os.path.join(hf_dir, "model.safetensors"))
+    hidden = cfg["hidden_size"]
+
+    # the data: (hidden state after the final norm at p, token p+1) -> the token at p+2, over the model's own answers
+    model = Qwen3_5MoeForCausalLM.from_pretrained(hf_dir, dtype=torch.float32).eval()
+    feats_h, feats_x, targets = [], [], []
+    with torch.no_grad():
+        for ids in prompts:
+            seq = model.generate(torch.tensor([ids]), max_new_tokens=n_gen, do_sample=False, use_cache=True,
+                                 eos_token_id=None, pad_token_id=0)
+            h = model.model(seq).last_hidden_state[0]
+            for p in range(len(ids) - 1, seq.shape[1] - 2):
+                feats_h.append(h[p])
+                feats_x.append(seq[0, p + 1])
+                targets.append(seq[0, p + 2])
+        H = torch.stack(feats_h)
+        X = model.get_input_embeddings()(torch.stack(feats_x))
+        Y = torch.stack(targets)
+    norm = model.model.norm                                   # (1 + w) RMSNorm, the model's own
+    pre = type(norm)(hidden, eps=cfg["rms_norm_eps"])         # zero weights: a plain RMS norm
+    g = torch.Generator().manual_seed(99)
+    fc = (torch.randn(hidden, 2 * hidden, generator=g) / (2 * hidden) ** 0.5).requires_grad_(True)
+    opt = torch.optim.Adam([fc], lr=0.02)
+    head = model.lm_head.weight.detach()
+    cat = torch.cat([pre(X), pre(H)], dim=-1).detach()
+    for _ in range(steps):
+        logits = norm(cat @ fc.T) @ head.T
+        loss = torch.nn.functional.cross_entropy(logits, Y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    with torch.no_grad():
+        right = float(((norm(cat @ fc.T) @ head.T).argmax(-1) == Y).float().mean())
+
+    for k in [k for k in w if k.startswith(last)]:
+        w["mtp.layers.0." + k[len(last):]] = w[k].clone()
+    for k in [k for k in w if k.startswith("mtp.layers.0.") and (k.endswith("o_proj.weight") or k.endswith("down_proj.weight"))]:
+        w[k] = torch.zeros_like(w[k])                         # the layer adds nothing to the residual
+    w["mtp.fc.weight"] = fc.detach().clone()
+    w["mtp.pre_fc_norm_embedding.weight"] = torch.zeros(hidden)
+    w["mtp.pre_fc_norm_hidden.weight"] = torch.zeros(hidden)
+    w["mtp.norm.weight"] = w["model.norm.weight"].clone()
+    save_file({k: v.contiguous() for k, v in w.items()}, os.path.join(out_dir, "model.safetensors"), metadata={"format": "pt"})
+    cfg["mtp_num_hidden_layers"] = 1
+    json.dump(cfg, open(os.path.join(out_dir, "config.json"), "w"), indent=1)
+    return right
 
 
 def reference(hf_dir, out_json):
@@ -133,6 +204,7 @@ def main():
     ap.add_argument("outdir")
     ap.add_argument("--llama-cpp", required=True, help="a llama.cpp checkout (only its converter is used)")
     ap.add_argument("--preset", choices=sorted(PRESETS), default="tiny")
+    ap.add_argument("--mtp", action="store_true", help="also write tiny-mtp-f32.gguf: the model with an MTP block that was fitted to guess (for --spec mtp)")
     a = ap.parse_args()
     hf = os.path.join(a.outdir, "hf")
     vocab = make_model(hf, a.preset)
@@ -140,6 +212,10 @@ def main():
     gguf = os.path.join(a.outdir, "tiny-f32.gguf")
     convert(a.llama_cpp, hf, gguf)
     ref = reference(hf, os.path.join(a.outdir, "ref.json"))
+    if a.mtp:
+        right = add_mtp(hf, os.path.join(a.outdir, "hf-mtp"), [r["ids"] for r in ref])
+        convert(a.llama_cpp, os.path.join(a.outdir, "hf-mtp"), os.path.join(a.outdir, "tiny-mtp-f32.gguf"), mtp=True)
+        print(f"with an MTP block: {os.path.join(a.outdir, 'tiny-mtp-f32.gguf')} (its guess is right {100 * right:.0f}% of the time on the data it was fitted to)")
     print("reference:", [(len(r["ids"]), round(r["min_margin"], 3)) for r in ref], "(prompt length, smallest argmax margin)")
     print("done:", gguf)
 

@@ -28,8 +28,13 @@
 #include "hybrid_experts.h"
 #include "llama-hybrid.h"   // third_party/llama.cpp/src, added by the patch
 
+struct common_speculative;   // llama.cpp's MTP draft driver (common/speculative.h), only in a build with its common library
+
 #ifdef STRATA_Q35_FIT
 #include "fit.h"
+#include "common.h"        // llama.cpp's common library: the MTP draft driver below is its
+#include "speculative.h"
+#include "llama-ext.h"     // third_party/llama.cpp/src: the hidden rows the MTP block reads
 #endif
 
 #include <algorithm>
@@ -114,6 +119,7 @@ struct Options {
     int n_rs_seq = 0;            // recurrent snapshots for rollback (llama.cpp experimental)
     // speculation: guesses from the context, checked in one batch (docs/Q35.md)
     std::string spec = "off";   // off | lookup
+    float spec_p_min = 0.5f;     // --spec mtp: a guess below this probability ends the chain of guesses
     int spec_max = 3;            // guessed tokens per step
     int spec_match = 2;          // shortest repeat of the context that makes a guess
     // the hybrid expert cache (docs/Q35.md): the hot experts on the card, the CPU computes only the rest
@@ -211,8 +217,9 @@ void usage() {
         "                         sweep; where the time of a token goes (about a minute after the model loads)\n"
         "\n"
         "speculation (the model's answer is the same; some steps write several tokens)\n"
-        "  --spec off|lookup      off (default) | lookup: guess the next tokens from a repeat in the prompt and the answer so far\n"
-        "  --spec-max N           tokens guessed per step (default 4);  --spec-match N  shortest repeat that makes a guess (2)\n"
+        "  --spec off|lookup|mtp  off (default) | lookup: guess from a repeat in the prompt and the answer so far | mtp: the GGUF's MTP block guesses\n"
+        "  --spec-p-min P         --spec mtp: stop the chain of guesses at a token the block gives less than this probability (0.5)\n"
+        "  --spec-max N           tokens guessed per step (default 3);  --spec-match N  shortest repeat that makes a guess (2)\n"
         "\n"
         "serving\n"
         "  --eos-ids a,b          token ids that end an answer (default: the model's end-of-turn tokens)\n"
@@ -365,7 +372,14 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--spec") {
             if (!(v = need(i, a.c_str()))) return false;
             const std::string s2 = v;
-            if (s2 == "off" || s2 == "lookup") o.spec = s2; else { err = "--spec takes off or lookup"; return false; }
+            if (s2 == "off" || s2 == "lookup" || s2 == "mtp") o.spec = s2; else { err = "--spec takes off, lookup or mtp"; return false; }
+        }
+        else if (a == "--spec-p-min") {
+            if (!(v = need(i, a.c_str()))) return false;
+            char* end = nullptr;
+            const float f = std::strtof(v, &end);
+            if (end == v || *end || !(f >= 0.0f && f <= 1.0f)) { err = "--spec-p-min takes a number from 0 to 1"; return false; }
+            o.spec_p_min = f;
         }
         else if (a == "--spec-max") { if (!num(a.c_str(), 1, 16, n)) return false; o.spec_max = (int) n; }
         else if (a == "--spec-match") { if (!num(a.c_str(), 1, 8, n)) return false; o.spec_match = (int) n; }
@@ -558,6 +572,10 @@ public:
     std::string placement = "all on the card";
     std::string offload_tag = "gpu";   // one word for the INFO line
     std::unique_ptr<q35::HybridExperts> hx;   // the hybrid expert cache (null: off)
+    llama_context* ctx_dft = nullptr;         // --spec mtp: the MTP block's own context (attention K/V of one layer), beside `ctx`
+    llama_memory_t mem_dft = nullptr;
+    common_speculative* mtp = nullptr;        // llama.cpp's MTP draft driver (common/speculative.cpp)
+    bool mtp_on = false;
     bool nan_guard = true;                    // STRATA_NAN_GUARD=0 turns the logits check off
     std::set<long long> nan_inject;           // STRATA_NAN_INJECT=n,n: the n-th window checked counts as non-finite (tests)
     long long nan_windows = 0;                // windows checked so far (a window is one llama_decode whose logits are used)
@@ -567,6 +585,7 @@ public:
     bool cache_placed = false;         // the engine put every routed expert in RAM for the cache (not the user)
 
     ~Engine() {
+        teardown_mtp();
         if (hx && model) hx->detach(model);
         if (batch.token) llama_batch_free(batch);
         if (ctx) { llama_detach_threadpool(ctx); llama_free(ctx); }
@@ -635,17 +654,20 @@ public:
             }
         }
         if (tp) llama_attach_threadpool(ctx, tp, tp_batch);
+        if (tp && ctx_dft) llama_attach_threadpool(ctx_dft, tp, tp_batch);
     }
 
     // A new CPU pool of `n` threads for both the answer and the prompt (the sweep of --bench-threads / --diag).
     void apply_threads(int n) {
         if (!ctx) return;
         llama_detach_threadpool(ctx);
+        if (ctx_dft) llama_detach_threadpool(ctx_dft);
         if (tp_batch) { ggml_threadpool_free(tp_batch); tp_batch = nullptr; }
         if (tp) { ggml_threadpool_free(tp); tp = nullptr; }
         o.threads = n;
         o.threads_batch = n;
         llama_set_n_threads(ctx, n, n);
+        if (ctx_dft) llama_set_n_threads(ctx_dft, n, n);
         attach_threads();
     }
 
@@ -698,6 +720,7 @@ public:
         mp.tensor_split = tensor_split.data();
         mp.tensor_buft_overrides = overrides.data();   // an all-null list is the same as none
         if (o.no_repack) mp.use_extra_bufts = false;
+        mp.load_mtp = o.spec == "mtp";                  // the nextn block of the GGUF (Unsloth's MTP files have one)
         if (o.info) mp.n_gpu_layers = 0;                // --info: the file's facts; nothing goes to the card
 
         llama_context_params cp = llama_context_default_params();
@@ -706,7 +729,7 @@ public:
         cp.n_batch = (uint32_t) o.n_batch;
         cp.n_ubatch = (uint32_t) std::min(o.n_ubatch, o.n_batch);
         cp.n_seq_max = 1;
-        cp.n_rs_seq = (uint32_t) std::max(o.n_rs_seq, o.spec == "lookup" ? o.spec_max : 0);   // a rejected guess is rolled back from these
+        cp.n_rs_seq = (uint32_t) std::max(o.n_rs_seq, o.spec != "off" ? o.spec_max : 0);   // a rejected guess is rolled back from these
         cp.n_threads = o.threads > 0 ? o.threads : physical_cores();
         cp.n_threads_batch = o.threads_batch > 0 ? o.threads_batch : cp.n_threads;
         cp.flash_attn_type = o.flash < 0 ? LLAMA_FLASH_ATTN_TYPE_AUTO
@@ -809,13 +832,14 @@ public:
                 c = *end == ',' ? end + 1 : end;
             }
         }
-        spec_on = o.spec == "lookup";
+        spec_on = o.spec != "off";
         if (spec_on && llama_n_rs_seq(ctx) < (uint32_t) o.spec_max) {
-            std::fprintf(stderr, "strata-q35: --spec lookup needs a model whose recurrent state can be rolled back (%u snapshots, %d wanted): off\n",
-                         (unsigned) llama_n_rs_seq(ctx), o.spec_max);
+            std::fprintf(stderr, "strata-q35: --spec %s needs a model whose recurrent state can be rolled back (%u snapshots, %d wanted): off\n",
+                         o.spec.c_str(), (unsigned) llama_n_rs_seq(ctx), o.spec_max);
             spec_on = false;
         }
         setup_hybrid();
+        setup_mtp();
         return true;
     }
 
@@ -880,6 +904,7 @@ public:
     llama_context_params saved_cp{};
 
     void reset_context() {
+        teardown_mtp();
         if (ctx) { llama_detach_threadpool(ctx); llama_free(ctx); }
         ctx = llama_init_from_model(model, saved_cp);
         if (ctx) { mem = llama_get_memory(ctx); llama_set_abort_callback(ctx, abort_cb, nullptr); attach_threads(); }
@@ -917,6 +942,7 @@ public:
             const int top = std::min<int>(o.spec_max + 1, (int) base.size());
             for (int n = 2; ok && n <= top; ++n) ok = decode(base.data(), n, true, true) == 0;
         }
+        if (ok) ok = exercise_mtp(next, base);
         clear_all();
         if (hx) { hx->set_frozen(false); hx->reset_stats(); }
         if (!ok) std::fprintf(stderr, "strata-q35: the warm-up failed (the first request will say more)\n");
@@ -946,6 +972,7 @@ public:
                 std::vector<llama_token> b(toks.begin(), toks.begin() + n);
                 if (decode(b.data(), n, true, true) != 0) return false;
             }
+            if (!exercise_mtp(next, toks)) return false;                                    // the MTP block's own graphs
         }
         clear_all();
         return true;
@@ -1021,8 +1048,116 @@ public:
 
     void clear_all() {
         llama_memory_clear(mem, true);
+        if (mem_dft) llama_memory_clear(mem_dft, true);
         live.clear();
         ckpts.clear();
+    }
+
+    // ---- --spec mtp: the GGUF's own multi-token-prediction block drafts the guesses (the Unsloth "-MTP-GGUF" files carry
+    // it).  llama.cpp's driver (common/speculative.cpp) does the model's side: its second context holds the K/V of the MTP
+    // layer, built from the hidden rows the main context hands over after every llama_decode (decode_piece below), and a
+    // chain of guesses is read off it.  Everything else is the same as for --spec lookup: the guesses go through the main
+    // model in one batch and only the tokens the model itself would have sampled are kept.
+    void teardown_mtp() {
+#ifdef STRATA_Q35_FIT
+        if (mtp) { common_speculative_free(mtp); mtp = nullptr; }
+        if (ctx && mtp_on) llama_set_embeddings_nextn(ctx, false, false);
+        if (ctx_dft) { llama_detach_threadpool(ctx_dft); llama_free(ctx_dft); ctx_dft = nullptr; }
+#endif
+        mem_dft = nullptr;
+        mtp_on = false;
+    }
+
+    void setup_mtp() {
+        if (o.spec != "mtp" || o.info || !ctx) return;
+        auto fall_back = [&](const std::string& why) {
+            std::fprintf(stderr, "strata-q35: --spec mtp: %s; guessing from the text itself (--spec lookup) instead\n", why.c_str());
+            teardown_mtp();
+            o.spec = "lookup";
+        };
+#ifdef STRATA_Q35_FIT
+        if (llama_model_n_layer_nextn(model) <= 0) { fall_back("this GGUF has no MTP block (Unsloth's \"-MTP-GGUF\" files of Qwen3.6 have one)"); return; }
+        llama_context_params cpd = saved_cp;
+        cpd.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cpd.ctx_other = ctx;
+        cpd.n_rs_seq = 0;
+        ctx_dft = llama_init_from_model(model, cpd);
+        if (!ctx_dft) { fall_back("the MTP context did not fit in the memory that is left (a smaller --max-context, or --fit-margin more)"); return; }
+        mem_dft = llama_get_memory(ctx_dft);
+        llama_set_abort_callback(ctx_dft, abort_cb, nullptr);
+        common_params_speculative sp;
+        sp.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        sp.draft.n_max = o.spec_max;
+        sp.draft.n_min = 1;
+        sp.draft.p_min = o.spec_p_min;
+        sp.draft.backend_sampling = false;
+        sp.draft.ctx_tgt = ctx;
+        sp.draft.ctx_dft = ctx_dft;
+        mtp = common_speculative_init(sp, 1);
+        if (!mtp) { fall_back("llama.cpp's MTP driver could not start"); return; }
+        mtp_on = true;
+        attach_threads();
+        placement += "; MTP drafts (up to " + std::to_string(o.spec_max) + ", from probability " + std::to_string(o.spec_p_min).substr(0, 4) + ")";
+#else
+        fall_back("this build has no llama.cpp common library (-DSTRATA_Q35_FIT=ON)");
+#endif
+    }
+
+    // The main context was just decoded: the MTP context takes the same tokens with the hidden rows it produced.
+    void mtp_process() {
+#ifdef STRATA_Q35_FIT
+        if (!mtp_on) return;
+        if (!common_speculative_process(mtp, batch)) {
+            std::fprintf(stderr, "strata-q35: the MTP context failed; guessing is off until the next restart\n");
+            mtp_on = false;
+        }
+#endif
+    }
+
+    // up to `kmax` guesses for what follows `tok` (the sampled token that is not in memory yet)
+    void mtp_draft(llama_token tok, const std::vector<llama_token>& hist, int kmax, std::vector<llama_token>& out) {
+        out.clear();
+#ifdef STRATA_Q35_FIT
+        if (!mtp_on || kmax < 1) return;
+        const llama_pos pos0 = (llama_pos) live.size();
+        auto& dp = common_speculative_get_draft_params(mtp, 0);
+        dp.drafting = true;
+        dp.n_max = kmax;
+        dp.pos0 = pos0;
+        dp.id_last = tok;
+        dp.prompt = &hist;
+        dp.result = &out;
+        common_speculative_draft(mtp);
+        dp.drafting = false;
+        dp.result = nullptr;
+        // the guesses' own cells are not the right ones: the main model's verification puts the real rows at these positions
+        llama_memory_seq_rm(mem_dft, 0, pos0, -1);
+#else
+        (void) tok; (void) hist; (void) kmax;
+#endif
+    }
+    // after the verification of `n_acc` of the guesses
+    void mtp_accepted(int n_acc) {
+#ifdef STRATA_Q35_FIT
+        if (mtp_on) common_speculative_accept(mtp, 0, (uint16_t) n_acc);
+#else
+        (void) n_acc;
+#endif
+    }
+    // one round of guessing and verifying, for the warm-up and the probe: false only when a decode failed
+    bool exercise_mtp(llama_token next, const std::vector<llama_token>& hist) {
+        if (!mtp_on) return true;
+        std::vector<llama_token> d;
+        mtp_draft(next, hist, o.spec_max, d);
+        if (d.empty()) return true;                       // the head was not sure of anything
+        std::vector<llama_token> st(1, next);
+        st.insert(st.end(), d.begin(), d.end());
+        if (decode(st.data(), (int) st.size(), true, true) != 0) return false;
+        mtp_accepted(0);
+        return true;
+    }
+    void cut_dft(int32_t keep) {
+        if (mem_dft) llama_memory_seq_rm(mem_dft, 0, keep, -1);
     }
 
     void drop_ckpts_above(int32_t n) {
@@ -1055,6 +1190,7 @@ public:
         if (llama_memory_seq_rm(mem, 0, keep, -1)) {   // a hybrid cache that refuses has not changed
             live.resize((size_t) keep);
             drop_ckpts_above(keep);
+            cut_dft(keep);
             return keep;
         }
         for (auto it = ckpts.rbegin(); it != ckpts.rend(); ++it) {
@@ -1065,6 +1201,7 @@ public:
             if (!llama_memory_seq_rm(mem, 0, n, -1)) break;   // cannot cut the attention part to match: start over
             live.resize((size_t) n);
             drop_ckpts_above(n);
+            cut_dft(n);
             return n;
         }
         clear_all();
@@ -1108,10 +1245,14 @@ public:
         const int rc = llama_decode(ctx, batch);
         if (rc == 0) {
             live.insert(live.end(), toks, toks + n);
+            mtp_process();
         } else if (rc == 2) {   // aborted: the ubatches that finished stay in memory
             const int32_t pmax = llama_memory_seq_pos_max(mem, 0);
             const int32_t done = std::max(0, std::min(n, pmax + 1 - p0));
             live.insert(live.end(), toks, toks + done);
+            // the MTP context never saw these tokens (it gets the hidden rows of a whole llama_decode): the main one goes back
+            // to where both agree
+            if (mtp_on && done > 0) rewind_to(p0);
         } else {
             // the memory may hold part of this batch: forget everything rather than trust it
             clear_all();
@@ -1200,6 +1341,7 @@ public:
         while (common < lim && live[(size_t) common] == ids[(size_t) common]) ++common;
         int32_t keep = std::min(common, n - 1);                 // the last prompt token is always read: it gives the logits
         keep = rewind_to(keep);
+        cut_dft(keep);
         // memory may hold fewer than `keep` now (a recurrent model without a checkpoint): read the rest
         res.resume = keep;
         if (hk.resume) hk.resume(keep);
@@ -1282,8 +1424,12 @@ public:
                 if (cooldown > 0) --cooldown;
                 else {
                     const int kmax = (int) std::min<long long>(o.spec_max, r.max_new - res.produced - 1);
-                    if (!r.hint.empty()) lkh.find(r.hint, hist, kmax, draft);
-                    if (draft.empty()) lk.find(hist, hist, kmax, draft);
+                    if (mtp_on) {
+                        mtp_draft(tok, hist, kmax, draft);          // the model's own MTP block (hints and repeats are not used with it)
+                    } else {
+                        if (!r.hint.empty()) lkh.find(r.hint, hist, kmax, draft);
+                        if (draft.empty()) lk.find(hist, hist, kmax, draft);
+                    }
                 }
                 lk.add(hist, hist.size() - 1);
             }
@@ -1324,6 +1470,7 @@ public:
                 if (res.produced >= r.max_new) { res.finish = "length"; finished = true; break; }
             }
             res.drafts_accepted += n_acc;
+            if (mtp_on) mtp_accepted(n_acc);
             if (n_acc == 0) { backoff = std::min(std::max(1, backoff * 2), 16); cooldown = backoff; }
             else backoff = 0;
             if (poisoned) break;
@@ -1346,6 +1493,7 @@ public:
         if (llama_memory_seq_rm(mem, 0, keep, -1)) {
             live.resize((size_t) keep);
             drop_ckpts_above(keep);
+            cut_dft(keep);
             return true;
         }
         const int32_t at = rewind_to(keep);
