@@ -171,7 +171,18 @@ set -- -S . -B "$BUILD_DIR" -G "$GEN" -DCMAKE_BUILD_TYPE=Release \
 note "configuring $BUILD_DIR (sm_$(printf '%s' "$ARCH" | sed 's/;/, sm_/g'))"
 "$CMAKE_BIN" "$@"
 note "building $TARGETS with $JOBS jobs (a few minutes for one architecture, 10-30 for several)"
-"$CMAKE_BIN" --build "$BUILD_DIR" --target $TARGETS -j "$JOBS"
+LOG="$BUILD_DIR/build.log"; RCF="$BUILD_DIR/.build-rc"
+# A parallel make ends in "Error 2" lines that name no cause.  The whole output goes to a log, and after a failure the build is
+# repeated on one job (only what failed is compiled again) so that the first real error is in the log, and shown.
+{ "$CMAKE_BIN" --build "$BUILD_DIR" --target $TARGETS -j "$JOBS" && echo 0 > "$RCF" || echo $? > "$RCF"; } 2>&1 | tee "$LOG"
+RC=$(cat "$RCF")
+if [ "$RC" != 0 ]; then
+  note "the build failed (exit $RC): repeating it on one job to find the first error ..."
+  "$CMAKE_BIN" --build "$BUILD_DIR" --target $TARGETS -j 1 >> "$LOG" 2>&1 || true
+  echo "build_rhel7: the first errors in $LOG:" >&2
+  grep -n -B1 -A4 -m6 -E 'error:|fatal error|undefined reference|cannot find -l|nvcc fatal|No such file or directory|ld returned|internal compiler error|Killed|virtual memory exhausted|out of memory|Permission denied' "$LOG" | cut -c1-260 >&2 || true
+  die "the build failed; the lines above are the cause (all of it: $LOG).  'Killed' or 'out of memory': too many jobs for the RAM, use --jobs 1"
+fi
 
 # ---- 7. will it run on RHEL 7?
 OUT=""

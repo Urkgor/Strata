@@ -132,6 +132,7 @@ RHEL 7 turns transparent huge pages on (`always`); the engine already handles th
 
 | What you see | Meaning and fix |
 | --- | --- |
+| `... Error 2` (`CMakeFiles/Makefile:1633: ... strata.dir/rule`) | only make's wrapper line; the cause is above it. `tools/build_rhel7.sh` keeps the output in `build-rhel7/build.log`, repeats the build on one job after a failure and prints the first `error:` lines. By hand: `cmake --build build-rhel7 -j1 2>&1 \| grep -n -m5 -E 'error:\|Killed\|undefined reference'`. `Killed` means too little RAM for the jobs: `--jobs 1` |
 | `Target ... requires the language dialect "CUDA20"` | this CMakeLists.txt is older than the fix, or the CMake is older than 3.20: use 3.20 or newer (`tools/build_rhel7.sh --cmake DIR/bin/cmake` after unpacking Kitware's tarball) |
 | `CMake 3.20 or higher is required` | `cmake3` of EPEL is 3.17: same fix; pip is not needed |
 | `the C++ compiler (/usr/bin/g++) is GCC 4` | no devtoolset installed: `sudo yum install devtoolset-11-gcc-c++ devtoolset-11-binutils` |
