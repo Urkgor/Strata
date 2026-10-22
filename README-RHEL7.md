@@ -4,7 +4,8 @@ Toutes les commandes, dans l'ordre. Les explications sont dans [docs/RHEL7.md](d
 Carte visée : GTX 10 (Pascal, `sm_61`). Pour une autre carte, changez `--arch` (`nvidia-smi --query-gpu=compute_cap --format=csv`, sans le point : 7.5 devient 75).
 
 > **Vérifié** (conteneur CentOS 7.9, sans carte graphique) : la compilation de `strata` et `libstrata_kq.so`, avec CMake 3.20.2, sans pip ni ninja.
-> **Non vérifié** : tout ce qui touche à une carte ou à un vrai GGUF, c'est-à-dire les étapes 4 et 5.
+> **Vérifié aussi** : le serveur (414 tests) et l'extraction du tokenizer fonctionnent avec `jinja2` et `regex` absents (Python 3.13, sans aucun module).
+> **Non vérifié** : tout ce qui touche à une carte ou à un vrai GGUF, c'est-à-dire les étapes 4 et 5, et Python 3.8 sur cette branche.
 
 ## 1. Prérequis (une fois)
 
@@ -81,16 +82,16 @@ Options utiles de ce chemin (toutes les options du moteur : `build-rhel7/strata 
 
 ## 5. Lancer le serveur (web + API OpenAI / Anthropic)
 
-Il faut Python 3.10 ou plus, avec les modules `jinja2`, `regex` et `psutil`.
+Il faut **Python 3.8 ou plus et aucun module** : le serveur et le tokenizer n'utilisent que la bibliothèque standard (ni `jinja2`, ni `regex`, ni `numpy`, ni pip). RHEL 7 a Python 3.6 : prenez Python 3.8 (`rh-python38` des Software Collections), ou le Python 3.12 autonome de `setup.sh` (`.python/python/bin/python3`).
 
 ```sh
 S=~/Strata
 G=/data/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
 P=$HOME/strata-data/packs/qwen36
 
-# 5a. tokenizer, une seule fois (extrait du GGUF)
+# 5a. tokenizer et modèle de conversation, une seule fois (extraits du GGUF, quelques secondes)
 cd $S
-STRATA_GGUF_PY=$HOME/llama.cpp/gguf-py python3 tools/strata_tokenizer.py --gguf $G --out $P
+python3 tools/strata_tokenizer.py --gguf $G --out $P
 
 # 5b. configuration
 cat > $HOME/strata-qwen36.json <<EOF
@@ -132,5 +133,5 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
 | `Killed` / `out of memory` | `--jobs 1` |
 | `libcudart.so.12: cannot open shared object file` | `export LD_LIBRARY_PATH=/usr/local/cuda-12.4/lib64:$LD_LIBRARY_PATH` |
 | `CUDA driver version is insufficient` | pilote plus ancien que R525 |
-| `ModuleNotFoundError: jinja2 / regex / psutil` | modules Python manquants (étape 5) |
+| `SyntaxError` ou `invalid syntax` au lancement de Python | Python trop ancien (3.6 de RHEL 7) : Python 3.8 ou plus (étape 5) |
 | `no kernel image is available` | mauvais `--arch` pour la carte |

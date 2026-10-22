@@ -33,8 +33,9 @@ def smoke() -> dict:
         raise RuntimeError("this owned-runtime check currently requires POSIX")
     visible = {name: importlib.util.find_spec(name) is not None
                for name in ("rich", "textual", "numpy", "jinja2", "requests")}
+    # jinja2 is not in requirements.txt any more: the server renders chat templates with serve/jinja_lite.py
     if visible != {"rich": False, "textual": False, "numpy": True,
-                   "jinja2": True, "requests": True}:
+                   "jinja2": False, "requests": True}:
         raise RuntimeError(f"runtime-only dependency set was not isolated: {visible}")
     started = time.monotonic()
     result = subprocess.run([sys.executable, "-m", "unittest", TEST_MODULE], cwd=ROOT,

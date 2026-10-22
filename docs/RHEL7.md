@@ -128,6 +128,15 @@ by the engine when the headers lack it), and it reads the memory and CPU limits 
 RHEL 7 turns transparent huge pages on (`always`); the engine already handles that setting
 ([TROUBLESHOOTING.md](TROUBLESHOOTING.md): `STRATA_NO_ARENA_THP=1` turns its request off).
 
+## The server without pip
+
+`serve/server.py` and `tools/strata_tokenizer.py` need **only the Python standard library** (no `jinja2`, `regex`, `numpy`; `psutil` is
+optional): the chat template is rendered by `serve/jinja_lite.py`, and the tokenizer's Unicode classes come from `tools/unicode_classes.py`.
+They need Python 3.8 or newer: RHEL 7's own is 3.6, so use `rh-python38` from the Software Collections, or the standalone Python 3.12 that
+`setup.sh` downloads. Checked here: the 414 tests of the server, the template renderer and the tokenizer classes pass with `jinja2`
+and `regex` blocked (Python 3.13), and the tokenizer is extracted from a GGUF with nothing installed. `setup.py` itself still installs
+`numpy`, `pyyaml`, `requests`, `pillow` and `psutil` with pip. The commands: [README-RHEL7.md](../README-RHEL7.md).
+
 ## When something stops
 
 | What you see | Meaning and fix |
