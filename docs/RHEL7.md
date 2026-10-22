@@ -1,6 +1,6 @@
 # Strata on RHEL / CentOS 7
 
-How to build and run Strata's CUDA engine on RHEL 7 or CentOS 7 (glibc 2.17, kernel 3.10). Back to the [README](../README.md).
+How to build and run Strata's CUDA engine on RHEL 7 or CentOS 7 (glibc 2.17, kernel 3.10). Back to the [README](../README.md). The commands alone, in French, from build to server: [README-RHEL7.md](../README-RHEL7.md).
 
 The ready-made engines and the Linux app are built on glibc 2.35 and cannot start on this system, so on RHEL 7 the
 engine is **always compiled on the machine** (setup does that by itself, [below](#1-with-setup)). Nothing in the engine's
