@@ -62,4 +62,9 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1);
 
+/// A tensor of any ggml type that has a `to_float` (the K-quants, the legacy quants, the i-quants), widened to f32 with
+/// ggml's own dequantizer; `n` values, a multiple of the type's block size.  False when the type has none (or `n` does not
+/// fit its blocks).  For the small tensors the GPU wants as f32 (ssm_alpha / ssm_beta, the router) in a file that quantized them.
+bool dequantize_to_f32(int type, const void* src, float* dst, int64_t n);
+
 }  // namespace strata::kernels::cpu

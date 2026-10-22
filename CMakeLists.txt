@@ -1651,6 +1651,10 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(dequant_q5_1_test tests/core/dequant_q5_1_test.cpp)
     target_link_libraries(dequant_q5_1_test PRIVATE strata_artifact ggml-base)
     add_test(NAME dequant_q5_1_test COMMAND dequant_q5_1_test)
+    # the Qwen3.6 engine's f32 uploads of small tensors a file stores quantized (ssm_alpha / ssm_beta as Q6_K): ggml's to_float
+    add_executable(dequant_f32_test tests/core/dequant_f32_test.cpp)
+    target_link_libraries(dequant_f32_test PRIVATE strata_kernels_cpu ggml-base)
+    add_test(NAME dequant_f32_test COMMAND dequant_f32_test)
   endif()
   # the router lookahead's dot on each rung this CPU has (AVX2, the older CPUs' AVX1) against a double reference
   add_executable(router_dot_parity src/kernels/cpu/router_dot_parity.cpp)

@@ -336,4 +336,12 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     }
 }
 
+bool dequantize_to_f32(int type, const void* src, float* dst, int64_t n) {
+    if (type < 0 || type >= (int) GGML_TYPE_COUNT || n <= 0) return false;
+    const ggml_type_traits* t = ggml_get_type_traits((ggml_type) type);
+    if (t == nullptr || t->to_float == nullptr || t->blck_size <= 0 || n % t->blck_size != 0) return false;
+    t->to_float(src, dst, n);
+    return true;
+}
+
 }  // namespace strata::kernels::cpu

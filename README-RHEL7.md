@@ -128,6 +128,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
 
 | Message | Cause et remède |
 | --- | --- |
+| `strata-q36: blk.N.ssm_alpha.weight is Q6_K, expected F32, BF16, F16 or Q8_0` | GGUF « K-quant ordinaire » (Q4_K_M…) qui stocke ces petits tenseurs quantifiés, moteur d'avant le correctif : `git pull` et recompiler (étape 3). Le moteur les élargit maintenant en f32 au chargement |
 | `strata-q36: missing qwen35moe.nextn_predict_layers` | GGUF sans couche MTP, moteur d'avant le correctif : `git pull` et recompiler (étape 3) |
 | `engine died` / `the engine exited before it was ready` (`server.py`) | le message du serveur ne dit que ça : **la cause est dans les lignes du moteur lui-même**, dans `~/strata-qwen36.log` (`tail -60`). Sans le journal : lancer le moteur seul, `build-rhel7/strata --model $G --tokens "1,2,3" --n 8 --max-context 4096 2>&1 \| tee ~/moteur.log`. Bibliothèque manquante : `ldd build-rhel7/strata \| grep "not found"` |
 | `Error 2` seul | enveloppe de `make` ; lire `build-rhel7/build.log` ou relancer avec `--jobs 1` |

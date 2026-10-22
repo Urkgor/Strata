@@ -946,8 +946,15 @@ float* upload_f32(const strata::TensorInfo& t, const uint8_t* src) {
             const float d = f16_to_f32((uint16_t) (q[0] | (q[1] << 8)));
             for (int j = 0; j < 32; ++j) h[b * 32 + j] = d * (float) (int8_t) q[2 + j];
         }
-    } else {
-        std::fprintf(stderr, "strata-q36: %s is %s, expected F32, BF16, F16 or Q8_0\n", t.name.c_str(), t.type_name());
+    }
+#if defined(STRATA_Q36_CPU_POOL)
+    // any other quantized type (a Q4_K_M / Q6_K file stores ssm_alpha / ssm_beta so): ggml's own dequantizer, on the host, once
+    else if (strata::kernels::cpu::dequantize_to_f32((int) t.type, src, h.data(), (int64_t) h.size())) {
+    }
+#endif
+    else {
+        std::fprintf(stderr, "strata-q36: %s is %s, expected F32, BF16, F16, Q8_0 or a ggml quantized type\n", t.name.c_str(),
+                     t.type_name());
         std::exit(1);
     }
     float* d = nullptr;
