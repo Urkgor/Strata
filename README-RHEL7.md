@@ -121,12 +121,14 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
 ```
 
 - Laissez l'écoute sur `127.0.0.1`. Pour d'autres machines : `--host 0.0.0.0` et une clé d'API (`"api_key"` dans le JSON).
+- **GGUF sans couche MTP** (un GGUF « ordinaire » de Qwen3.6, pas ceux d'Unsloth nommés `-MTP-GGUF`) : le moteur répondait `strata-q36: missing qwen35moe.nextn_predict_layers`. Corrigé (`git pull`, puis relancer `tools/build_rhel7.sh`) : l'absence de cette clé veut dire « pas de bloc MTP ». Dans ce cas mettez `"--mtp", "0"` : les brouillons MTP n'existent pas pour ce fichier (le moteur les désactive de lui-même, mais autant ne pas les demander).
 - Réglages à essayer : `--max-context` plus petit (16384) pour économiser la mémoire ; `"--mtp", "0"` si les brouillons posent problème ; `"--expert-vram", "6"` dans `args` pour limiter la VRAM (valeur d'essai, pas une mesure).
 
 ## Si ça casse
 
 | Message | Cause et remède |
 | --- | --- |
+| `strata-q36: missing qwen35moe.nextn_predict_layers` | GGUF sans couche MTP, moteur d'avant le correctif : `git pull` et recompiler (étape 3) |
 | `engine died` / `the engine exited before it was ready` (`server.py`) | le message du serveur ne dit que ça : **la cause est dans les lignes du moteur lui-même**, dans `~/strata-qwen36.log` (`tail -60`). Sans le journal : lancer le moteur seul, `build-rhel7/strata --model $G --tokens "1,2,3" --n 8 --max-context 4096 2>&1 \| tee ~/moteur.log`. Bibliothèque manquante : `ldd build-rhel7/strata \| grep "not found"` |
 | `Error 2` seul | enveloppe de `make` ; lire `build-rhel7/build.log` ou relancer avec `--jobs 1` |
 | `no instance of function template ... mul_mat_q_case` | mauvais commit de llama.cpp (étape 2) |

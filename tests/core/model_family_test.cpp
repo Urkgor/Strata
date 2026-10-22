@@ -259,6 +259,29 @@ int main(int argc, char** argv) {
               "an inconsistent ssm.inner_size is refused");
     }
     {
+        // a plain GGUF of Qwen3.6 (no MTP layer) has no qwen35moe.nextn_predict_layers key: that means no MTP block, not a refusal
+        Dims plain = kQwen36;
+        plain.block_count = 40;
+        std::vector<Kv> kv = metadata("qwen35moe", plain, 8);
+        for (auto it = kv.begin(); it != kv.end(); ++it)
+            if (it->key == "qwen35moe.nextn_predict_layers") { kv.erase(it); break; }
+        const fs::path pp = d.path / "plain36.gguf";
+        fixture::write(pp, kv, {});
+        check(strata::check_architecture(strata::GgufFile(pp.string())).empty(),
+              "a qwen35moe file without nextn_predict_layers (no MTP layer) passes the architecture guard");
+        strata::core::ModelGeometry pg;
+        int64_t pk = 0;
+        std::string perr;
+        check(geometry_of(pp, pg, pk, perr) && pg.n_layers == 40 && pg.n_mtp_layers == 0,
+              "its geometry has 40 trunk layers and no MTP block" + (perr.empty() ? std::string() : ": " + perr));
+        Dims bad = kQwen36;
+        bad.nextn = 41;
+        const fs::path bp = d.path / "bad36.gguf";
+        fixture::write(bp, metadata("qwen35moe", bad, 8), {});
+        check(strata::check_architecture(strata::GgufFile(bp.string())).find("not smaller") != std::string::npos,
+              "a nextn_predict_layers that is not smaller than block_count is still refused");
+    }
+    {
         // the layout tables
         check(layout_error(d.path, "qwen35moe", kTiny36, 16, nullptr).empty(),
               "a complete qwen35moe file passes its layout (incl. the nextn MTP block)");
