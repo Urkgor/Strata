@@ -1566,6 +1566,21 @@ if(STRATA_NATIVE_EXPERTS)
     set(GGML_NATIVE ON CACHE BOOL "" FORCE)
   endif()
   if(STRATA_GGML_DIR)
+    # The CUDA files that call ggml-cuda's mmq.cuh (mul_mat_q_case, struct mmq_args, ...) are written against the pinned commit; on
+    # another llama.cpp they stop with "no instance of function template ... mul_mat_q_case matches the argument list".
+    file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/VERSION.txt _strata_ggml_pin LIMIT_COUNT 1)
+    string(REGEX MATCH "^[0-9a-f]+" _strata_ggml_pin "${_strata_ggml_pin}")
+    find_package(Git QUIET)
+    if(GIT_FOUND AND _strata_ggml_pin)
+      # no `git -C`: RHEL 7's git 1.8.3 does not have it
+      execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse HEAD WORKING_DIRECTORY ${STRATA_GGML_DIR}
+                      OUTPUT_VARIABLE _strata_ggml_head OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE _strata_ggml_rc ERROR_QUIET)
+      if(_strata_ggml_rc EQUAL 0 AND NOT _strata_ggml_head STREQUAL _strata_ggml_pin)
+        message(WARNING "STRATA_GGML_DIR ${STRATA_GGML_DIR} is at llama.cpp ${_strata_ggml_head}, the engine is written for "
+                        "${_strata_ggml_pin} (third_party/ggml/VERSION.txt): the CUDA build is likely to stop at mmq_*.cu.  "
+                        "cd ${STRATA_GGML_DIR} && git checkout ${_strata_ggml_pin}")
+      endif()
+    endif()
     add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   else()
     include(FetchContent)

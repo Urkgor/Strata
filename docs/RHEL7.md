@@ -105,7 +105,7 @@ tools/build_rhel7.sh --cmake ~/cmake-3.20.2-linux-x86_64/bin/cmake --arch 61
 
 The script runs pip only when it finds no suitable CMake at all, and says how to do without it if pip fails.
 llama.cpp (the `ggml` the engine builds on) is fetched by CMake with `git` at configure time; with no network pass `--ggml DIR`
-(a checkout at the commit in `third_party/ggml/VERSION.txt`).
+(a checkout at exactly the commit in `third_party/ggml/VERSION.txt`, `3cf03257f219afbe7334045ff7c6a06ac68c627d`: any other llama.cpp breaks the `mmq_*.cu` files).
 
 ## 3. In Docker
 
@@ -132,6 +132,7 @@ RHEL 7 turns transparent huge pages on (`always`); the engine already handles th
 
 | What you see | Meaning and fix |
 | --- | --- |
+| `no instance of function template "mul_mat_q_case" (or "strata_w4a4_mul_mat_q_case") matches the argument list`, in `mmq_*.cu` | the llama.cpp given with `--ggml` is not the commit the engine is written for (`third_party/ggml/VERSION.txt`, `3cf03257f219afbe7334045ff7c6a06ac68c627d`); reproduced here with a newer llama.cpp. Use that commit: `cd DIR && git fetch origin 3cf03257f219afbe7334045ff7c6a06ac68c627d && git checkout 3cf03257f219afbe7334045ff7c6a06ac68c627d`, or unpack `https://github.com/ggml-org/llama.cpp/archive/3cf03257f219afbe7334045ff7c6a06ac68c627d.tar.gz` (a tarball has no git: the script cannot check it). Without `--ggml` CMake fetches the right one. `tools/build_rhel7.sh` now refuses a git checkout at another commit |
 | `... Error 2` (`CMakeFiles/Makefile:1633: ... strata.dir/rule`) | only make's wrapper line; the cause is above it. `tools/build_rhel7.sh` keeps the output in `build-rhel7/build.log`, repeats the build on one job after a failure and prints the first `error:` lines. By hand: `cmake --build build-rhel7 -j1 2>&1 \| grep -n -m5 -E 'error:\|Killed\|undefined reference'`. `Killed` means too little RAM for the jobs: `--jobs 1` |
 | `Target ... requires the language dialect "CUDA20"` | this CMakeLists.txt is older than the fix, or the CMake is older than 3.20: use 3.20 or newer (`tools/build_rhel7.sh --cmake DIR/bin/cmake` after unpacking Kitware's tarball) |
 | `CMake 3.20 or higher is required` | `cmake3` of EPEL is 3.17: same fix; pip is not needed |

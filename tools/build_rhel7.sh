@@ -16,6 +16,7 @@
 # The result is $BUILD_DIR/strata (and libstrata_kq.so beside it); the last step checks them with
 # tools/check_glibc_symbols.sh.
 set -eu
+ORIG_PWD=$(pwd)
 cd "$(dirname "$0")/.."
 
 ARCH=""; CMAKE_ARG=""; CUDA_DIR=""; BUILD_DIR="build-rhel7"; JOBS=""; PORTABLE=""; GGML_DIR=""; FLOOR="${STRATA_ISA_FLOOR:-}"; TARGETS="strata"
@@ -50,10 +51,15 @@ while [ $# -gt 0 ]; do
     *) echo "build_rhel7: unknown option $1 (--help lists them)" >&2; exit 2 ;;
   esac
 done
+# paths given on the command line are relative to where the script was started, not to the checkout it moves to
+abs() { case "$1" in ""|/*) printf '%s' "$1" ;; *) printf '%s/%s' "$ORIG_PWD" "$1" ;; esac; }
 die() { echo "build_rhel7: $*" >&2; exit 1; }
 note() { echo "build_rhel7: $*"; }
 # version a >= b ?
 ver_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$2" ]; }
+
+GGML_DIR=$(abs "$GGML_DIR"); CUDA_DIR=$(abs "$CUDA_DIR")
+case "$CMAKE_ARG" in */*) CMAKE_ARG=$(abs "$CMAKE_ARG") ;; esac
 
 # ---- 1. the C++ compiler: C++20 means GCC 10 or newer
 gcc_major() { "$1" -dumpversion 2>/dev/null | cut -d. -f1; }
@@ -158,6 +164,19 @@ case "$FLOOR" in ""|avx|none) ;; *) die "--isa-floor is avx or none, not '$FLOOR
 [ -z "$FLOOR" ] || [ -z "$PORTABLE" ] || die "--portable (AVX2) and --isa-floor exclude each other"
 
 # ---- 6. configure and build
+if [ -n "$GGML_DIR" ]; then
+  # the CUDA files that call ggml-cuda's mmq.cuh are written against one llama.cpp commit; any other stops at "no instance of function
+  # template ... mul_mat_q_case matches the argument list"
+  PIN=$(awk 'NR == 1 { print $1 }' third_party/ggml/VERSION.txt)
+  [ -f "$GGML_DIR/ggml/CMakeLists.txt" ] || die "--ggml $GGML_DIR: no ggml/CMakeLists.txt there; it takes a llama.cpp checkout"
+  # no `git -C`: RHEL 7's git 1.8.3 does not have it
+  if HEAD_SHA=$(cd "$GGML_DIR" && git rev-parse HEAD 2>/dev/null); then
+    [ "$HEAD_SHA" = "$PIN" ] || [ -n "${STRATA_ALLOW_GGML_MISMATCH:-}" ] || \
+      die "--ggml $GGML_DIR is at llama.cpp $HEAD_SHA; the engine is written for $PIN.  cd $GGML_DIR && git fetch origin $PIN && git checkout $PIN   (or a tarball of that commit: https://github.com/ggml-org/llama.cpp/archive/$PIN.tar.gz).  STRATA_ALLOW_GGML_MISMATCH=1 skips this check"
+  else
+    note "warning: $GGML_DIR is not a git checkout, so its llama.cpp version is unknown; the engine needs $PIN"
+  fi
+fi
 [ -n "$JOBS" ] || { n=$(nproc 2>/dev/null || echo 4); JOBS=$((n / 2)); [ "$JOBS" -ge 2 ] || JOBS=2; }
 set -- -S . -B "$BUILD_DIR" -G "$GEN" -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
@@ -181,6 +200,9 @@ if [ "$RC" != 0 ]; then
   "$CMAKE_BIN" --build "$BUILD_DIR" --target $TARGETS -j 1 >> "$LOG" 2>&1 || true
   echo "build_rhel7: the first errors in $LOG:" >&2
   grep -n -B1 -A4 -m6 -E 'error:|fatal error|undefined reference|cannot find -l|nvcc fatal|No such file or directory|ld returned|internal compiler error|Killed|virtual memory exhausted|out of memory|Permission denied' "$LOG" | cut -c1-260 >&2 || true
+  if grep -q 'no instance of function template.*mul_mat_q_case' "$LOG"; then
+    echo "build_rhel7: that error is a llama.cpp of another version than the engine's ($(awk 'NR == 1 { print $1 }' third_party/ggml/VERSION.txt)): drop --ggml (CMake fetches the right one), or check out that commit in the directory --ggml names" >&2
+  fi
   die "the build failed; the lines above are the cause (all of it: $LOG).  'Killed' or 'out of memory': too many jobs for the RAM, use --jobs 1"
 fi
 
