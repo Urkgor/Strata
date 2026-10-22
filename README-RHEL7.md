@@ -103,6 +103,7 @@ cat > $HOME/strata-qwen36.json <<EOF
  "model_name": "qwen3.6-35b-a3b",
  "arch": "qwen35moe",
  "lib_dirs": ["/usr/local/cuda-12.4/lib64"],
+ "log": "$HOME/strata-qwen36.log",
  "port": 8080
 }
 EOF
@@ -126,6 +127,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
 
 | Message | Cause et remède |
 | --- | --- |
+| `engine died` / `the engine exited before it was ready` (`server.py`) | le message du serveur ne dit que ça : **la cause est dans les lignes du moteur lui-même**, dans `~/strata-qwen36.log` (`tail -60`). Sans le journal : lancer le moteur seul, `build-rhel7/strata --model $G --tokens "1,2,3" --n 8 --max-context 4096 2>&1 \| tee ~/moteur.log`. Bibliothèque manquante : `ldd build-rhel7/strata \| grep "not found"` |
 | `Error 2` seul | enveloppe de `make` ; lire `build-rhel7/build.log` ou relancer avec `--jobs 1` |
 | `no instance of function template ... mul_mat_q_case` | mauvais commit de llama.cpp (étape 2) |
 | `Target ... requires the language dialect "CUDA20"` | CMake trop ancien (< 3.20) ou `CMakeLists.txt` pas à jour : `git pull` |
