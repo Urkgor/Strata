@@ -12,7 +12,8 @@ beside the system's own.
 > pip, Python 3.6.8), on a 4-core PC with a Linux 6.18 kernel and no GPU:
 >
 > - `tools/build_rhel7.sh --arch 61 --portable` compiles `strata` and `libstrata_kq.so` for a GTX 10 card (sm_61) in about 5
->   minutes, with no change to the sources. `tools/check_glibc_symbols.sh` finds nothing above GLIBC 2.16, GLIBCXX 3.4.19 and CXXABI
+>   minutes, with no change to the C++ or CUDA sources. It was run twice: with CMake 3.28.4 and Ninja from pip, and with **only
+>   Kitware's CMake 3.20.2** (unpacked from its tarball), `make`, and no pip and no ninja on the `PATH`; both build, and both binaries pass the glibc check below (nvcc was given `-std=c++20` in each). `tools/check_glibc_symbols.sh` finds nothing above GLIBC 2.16, GLIBCXX 3.4.19 and CXXABI
 >   1.3.7 in them, which is what RHEL 7's own libraries provide. `strata --help` starts.
 > - The same source also compiles with nvcc 12.0 and GCC 11 on Ubuntu 24.04 (12.0 is the oldest CUDA 12).
 > - 51 of the 53 CPU-side tests (`ctest`, `STRATA_BUILD_TESTS=ON` without CUDA) pass in the container; the other two read the
@@ -31,7 +32,7 @@ beside the system's own.
 | Needs | RHEL 7 has | Use | Why |
 | --- | --- | --- | --- |
 | a C++20 compiler | GCC 4.8.5 | **devtoolset-11** (GCC 11), from the Software Collections | nvcc 12 takes C++20 with a host GCC 10 or newer |
-| CMake 3.25.2 or newer | 2.8; `cmake3` from EPEL is 3.17 | pip's `cmake` (setup installs it) | older CMake stops at the generate step on every CUDA target ("requires the language dialect CUDA20"); the build now says so at once |
+| CMake 3.20 or newer | 2.8; `cmake3` from EPEL is 3.17 | Kitware's binary tarball (no root, no pip: `cmake-3.20.2-linux-x86_64.tar.gz` from github.com/Kitware/CMake/releases, asks for glibc 2.17), or pip's `cmake` (setup installs it that way) | the project says 3.20; before 3.25.2 CMake does not know nvcc's `-std=c++20`, so `CMakeLists.txt` supplies it (it does nothing on a newer CMake) |
 | CUDA 12.x | none | **12.0 to 12.4** from NVIDIA's RHEL 7 repository | C++20 in `.cu` files; CUDA 13 dropped Pascal and Volta; the repository's newest is 12.4 (read from its metadata) |
 | Python 3.10 or newer, for `setup.sh` | 3.6 | the standalone Python 3.12 that `setup.sh` downloads | the server and setup use `:=` and newer library calls |
 | a driver | whatever is installed | R525 or newer for a CUDA 12 engine | NVIDIA's rule for CUDA 12 (from [OLDER_GPUS.md](OLDER_GPUS.md#nvidia-the-cuda-12-engine); not tested on RHEL 7). R580 is the last branch with Pascal (NVIDIA's announcement) |
@@ -84,12 +85,27 @@ tools/build_rhel7.sh --help
 ```
 
 It does the compiling part of setup in plain shell, with no Python: it switches devtoolset on, finds the newest CUDA 12 toolkit in
-`/usr/local`, installs CMake with `pip --user` when none is 3.25.2 or newer, picks the CPU's instruction-set floor from
+`/usr/local`, takes the first `cmake` that is 3.20 or newer (or the one `--cmake PATH` names; `pip --user` only when there is none), picks the CPU's instruction-set floor from
 `/proc/cpuinfo` (a Xeon without AVX2 gets the [older-CPU build](INSTALL.md#older-cpus-experimental)), builds `strata` and
 `libstrata_kq.so` in `build-rhel7/`, and ends with the glibc check. `--portable` builds for an AVX2 baseline instead of this CPU's
 own instruction set, so the binary can be copied to a similar machine. The result runs with the NVIDIA driver's `libcuda.so.1`
 and the toolkit's `libcudart.so.12`, `libcublas.so.12` and `libcublasLt.so.12` (found through the binary's run path to the
 toolkit it was built with; copy them next to it for another machine).
+
+### No pip, no root
+
+`setup.sh` needs Python and pip (it makes a virtual environment), so on a machine where pip cannot run use this script. It needs
+only the compiler, the CUDA toolkit and a CMake 3.20 or newer; `make` does the building when there is no `ninja`:
+
+```
+tar xzf cmake-3.20.2-linux-x86_64.tar.gz -C ~            # from github.com/Kitware/CMake/releases; no root
+scl enable devtoolset-11 bash                            # or let the script switch it on: it does when /opt/rh/devtoolset-11 exists
+tools/build_rhel7.sh --cmake ~/cmake-3.20.2-linux-x86_64/bin/cmake --arch 61
+```
+
+The script runs pip only when it finds no suitable CMake at all, and says how to do without it if pip fails.
+llama.cpp (the `ggml` the engine builds on) is fetched by CMake with `git` at configure time; with no network pass `--ggml DIR`
+(a checkout at the commit in `third_party/ggml/VERSION.txt`).
 
 ## 3. In Docker
 
@@ -116,7 +132,8 @@ RHEL 7 turns transparent huge pages on (`always`); the engine already handles th
 
 | What you see | Meaning and fix |
 | --- | --- |
-| `CMake 3.x does not know how to ask nvcc ... for C++20` | CMake older than 3.25.2: `python3 -m pip install --user cmake` (RHEL 7's pip needs `pip install --user "pip<22"` first to read the wheels) |
+| `Target ... requires the language dialect "CUDA20"` | this CMakeLists.txt is older than the fix, or the CMake is older than 3.20: use 3.20 or newer (`tools/build_rhel7.sh --cmake DIR/bin/cmake` after unpacking Kitware's tarball) |
+| `CMake 3.20 or higher is required` | `cmake3` of EPEL is 3.17: same fix; pip is not needed |
 | `the C++ compiler (/usr/bin/g++) is GCC 4` | no devtoolset installed: `sudo yum install devtoolset-11-gcc-c++ devtoolset-11-binutils` |
 | `unsupported GNU version`, or errors in `<bits/...>` or `<concepts>` | nvcc 12.0 to 12.3 refuse a host GCC newer than 12; devtoolset-11 is what to use |
 | `no kernel image is available for execution on the device` at start | the engine has no code for the card: build with `--arch` of the card (`nvidia-smi --query-gpu=compute_cap --format=csv`) |

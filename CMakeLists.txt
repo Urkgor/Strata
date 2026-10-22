@@ -7,7 +7,7 @@
 # CUDA targets arrive in Phase 2.  The kernels need sm_80 or newer (tf32 mma, bf16 math) and the guard
 # below refuses anything older: silently building for a pre-Ampere arch would produce a binary that runs
 # and is wrong about its own performance, which is the worst of both outcomes.
-cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.20...3.24)
 project(strata VERSION 0.1.47 LANGUAGES CXX)
 # EXPERIMENTAL: the Intel Arc engine, the SYCL port in sycl/ (PR #423; icpx + oneMKL, docs/INTEL_ARC.md). It is its
 # own project that takes the unported sources from src/; with this on, nothing below is configured.
@@ -175,13 +175,13 @@ elseif(STRATA_ENABLE_CUDA)
     set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
   endif()
   enable_language(CUDA)
-  # nvcc 12 compiles C++20 (this project's standard, CUDA sources included), but CMake knows to ask for it only from 3.25.2:
-  # 3.24 to 3.25.0 get through the configure step and then stop at generate, "Target ... requires the language dialect
-  # CUDA20 ... CMake does not know the compile flags", on every CUDA target.  Say so here (RHEL 7's cmake3 is 3.17:
-  # `python3 -m pip install --user cmake`, docs/RHEL7.md).
-  if(CMAKE_VERSION VERSION_LESS 3.25.2 AND NOT CMAKE_CUDA20_STANDARD_COMPILE_OPTION)
-    message(FATAL_ERROR "CMake ${CMAKE_VERSION} does not know how to ask nvcc ${CMAKE_CUDA_COMPILER_VERSION} for C++20: the CUDA "
-                        "build needs CMake 3.25.2 or newer (python3 -m pip install --user cmake)")
+  # CMake before 3.25.2 knows nvcc's C++17 flag but not its C++20 one, and the project is C++20: every CUDA target stops at the
+  # generate step ("requires the language dialect CUDA20 ... CMake does not know the compile flags").  nvcc 12 takes
+  # -std=c++20, so say so; a CMake that knows it (3.25.2 and newer) has set the variable and nothing changes.  RHEL 7: cmake
+  # 3.20 is enough (docs/RHEL7.md).
+  if(NOT CMAKE_CUDA20_STANDARD_COMPILE_OPTION)
+    set(CMAKE_CUDA20_STANDARD_COMPILE_OPTION "-std=c++20")
+    set(CMAKE_CUDA20_EXTENSION_COMPILE_OPTION "-std=c++20")
   endif()
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.

@@ -8,7 +8,8 @@
 #
 # What RHEL 7 lacks, and what this does about it:
 #   * GCC 4.8.5 (the engine is C++20): Red Hat's devtoolset-11 (or 12 / 10), switched on here when g++ is older than 10.
-#   * CMake 2.8 / 3.17: the CUDA build needs 3.25.2; pip's cmake is installed with `pip --user` when none is found.
+#   * CMake 2.8 / 3.17: the build needs 3.20 or newer.  Use one you have (--cmake), or Kitware's binary tarball (no root, no
+#     pip); pip's cmake is tried only when none is found.
 #   * CUDA: NVIDIA's RHEL 7 repository stops at 12.4.  Cards older than RTX 20 (GTX 10, Tesla P100/P40) need CUDA 12.x
 #     anyway (CUDA 13 dropped them), so this is the "CUDA 12 engine" of docs/OLDER_GPUS.md.
 #   * the prebuilt engines: they ask for glibc 2.35, RHEL 7 has 2.17.  An engine built here asks for nothing above it.
@@ -17,13 +18,14 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-ARCH=""; CUDA_DIR=""; BUILD_DIR="build-rhel7"; JOBS=""; PORTABLE=""; GGML_DIR=""; FLOOR="${STRATA_ISA_FLOOR:-}"; TARGETS="strata"
+ARCH=""; CMAKE_ARG=""; CUDA_DIR=""; BUILD_DIR="build-rhel7"; JOBS=""; PORTABLE=""; GGML_DIR=""; FLOOR="${STRATA_ISA_FLOOR:-}"; TARGETS="strata"
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; cat <<'EOF'
 
 options:
   --arch LIST        CUDA architectures without the dot, ';' or ',' between: 61 (GTX 10), 60 (P100), 70 (V100), 75, 86 ...
                      Default: the cards nvidia-smi lists.  Below 75 the experimental Pascal/Volta build is switched on.
   --cuda-home DIR    the CUDA toolkit (default: $CUDA_HOME, the newest /usr/local/cuda-12.*, /usr/local/cuda, nvcc on PATH)
+  --cmake PATH       the cmake to use (default: the first cmake on PATH that is 3.20 or newer; pip is the last resort)
   --build-dir DIR    where to build (default build-rhel7)
   --jobs N           parallel compiles (default: half the CPUs; every compile of the engine can take 2-3 GB of RAM)
   --portable         an AVX2 baseline instead of this CPU's own instruction set: one binary for several machines
@@ -37,6 +39,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --arch) ARCH="$2"; shift 2 ;;
     --cuda-home) CUDA_DIR="$2"; shift 2 ;;
+    --cmake) CMAKE_ARG="$2"; shift 2 ;;
     --build-dir) BUILD_DIR="$2"; shift 2 ;;
     --jobs) JOBS="$2"; shift 2 ;;
     --portable) PORTABLE=ON; shift ;;
@@ -108,27 +111,34 @@ if [ "$LOWEST" -lt 75 ]; then
   note "sm_$LOWEST is below the supported RTX 20 floor: the experimental Pascal/Volta build (docs/OLDER_GPUS.md)"
 fi
 
-# ---- 4. CMake 3.25.2 or newer, ninja when there is one
-cmake_ok() { v=$("$1" --version 2>/dev/null | sed -n '1s/.*version //p'); [ -n "$v" ] && ver_ge "$v" 3.25.2; }
+# ---- 4. CMake 3.20 or newer (the project says 3.20; it adds nvcc's C++20 flag itself when CMake does not know it), ninja when there is one
+CMAKE_MIN=3.20
+cmake_ok() { v=$("$1" --version 2>/dev/null | sed -n '1s/.*version //p'); [ -n "$v" ] && ver_ge "$v" "$CMAKE_MIN"; }
 CMAKE_BIN=""
-for c in cmake cmake3 "$HOME/.local/bin/cmake"; do
-  if command -v "$c" >/dev/null 2>&1 && cmake_ok "$c"; then CMAKE_BIN=$(command -v "$c"); break; fi
-done
+if [ -n "$CMAKE_ARG" ]; then
+  cmake_ok "$CMAKE_ARG" || die "--cmake $CMAKE_ARG: not a CMake $CMAKE_MIN or newer"
+  CMAKE_BIN=$CMAKE_ARG
+else
+  for c in cmake cmake3 "$HOME/.local/bin/cmake"; do
+    if command -v "$c" >/dev/null 2>&1 && cmake_ok "$c"; then CMAKE_BIN=$(command -v "$c"); break; fi
+  done
+fi
 if [ -z "$CMAKE_BIN" ]; then
   PIP_PY=""
   for p in python3 python3.12 python3.11 python3.10 python3.9 python3.8 python3.6; do
     if command -v "$p" >/dev/null 2>&1; then PIP_PY=$p; break; fi
   done
-  [ -n "$PIP_PY" ] || die "CMake 3.25.2 or newer is needed (the CUDA build) and there is no Python to install it with.  RHEL 7: sudo yum install python3 python3-pip, or Kitware's binary from cmake.org"
-  note "no CMake 3.25.2 or newer: installing one with pip (--user)"
+  nocmake="CMake $CMAKE_MIN or newer is needed.  Without pip or root: unpack Kitware's binary (cmake-3.20.2-linux-x86_64.tar.gz from github.com/Kitware/CMake/releases; it asks for glibc 2.17) anywhere and pass --cmake DIR/bin/cmake.  RHEL 7's cmake3 package is 3.17, too old"
+  [ -n "$PIP_PY" ] || die "no CMake $CMAKE_MIN or newer found.  $nocmake"
+  note "no CMake $CMAKE_MIN or newer: trying pip (--user)"
   # RHEL 7's pip 9 does not know the manylinux2014 wheels CMake is shipped in; pip 21.3 is the last that runs on its Python 3.6
   "$PIP_PY" -m pip install --user --quiet --upgrade pip >/dev/null 2>&1 || true
-  "$PIP_PY" -m pip install --user --quiet 'cmake>=3.25.2' ninja || die "pip could not install CMake.  Install CMake 3.25.2 or newer by hand (cmake.org has binaries for glibc 2.17)"
+  "$PIP_PY" -m pip install --user --quiet "cmake>=$CMAKE_MIN" ninja || die "pip could not install CMake.  $nocmake"
   # where pip puts a program: the user base (--user), or the interpreter's own scripts folder when it was installed already
   for d in "$("$PIP_PY" -m site --user-base 2>/dev/null)/bin" "$("$PIP_PY" -c 'import sysconfig; print(sysconfig.get_path("scripts"))' 2>/dev/null)"; do
     if [ -x "$d/cmake" ] && cmake_ok "$d/cmake"; then PATH="$d:$PATH"; export PATH; CMAKE_BIN="$d/cmake"; break; fi
   done
-  [ -n "$CMAKE_BIN" ] || die "pip left no CMake 3.25.2 or newer where it could be found (pip's newest for this Python may be older, or the folder is not readable); use a newer Python (RHEL 7: rh-python38 from the Software Collections) or Kitware's binary from cmake.org"
+  [ -n "$CMAKE_BIN" ] || die "pip left no CMake $CMAKE_MIN or newer where it could be found.  $nocmake"
 fi
 GEN="Unix Makefiles"; command -v ninja >/dev/null 2>&1 && GEN=Ninja
 note "CMake: $CMAKE_BIN ($("$CMAKE_BIN" --version | sed -n '1s/.*version //p')), generator $GEN"
