@@ -51,6 +51,7 @@ memory. More memory gives a bigger model or a faster one.
 | **Apple Silicon Mac** (M1 or newer, macOS 15 or newer) | [Mac](docs/MAC.md) |
 | **AMD Ryzen AI Max (Strix Halo)** and other unified-memory systems | [Strix Halo](docs/STRIX_HALO.md) |
 | Older cards and processors | [Older GPUs](docs/OLDER_GPUS.md), [Older CPUs](docs/INSTALL.md#older-cpus-experimental) |
+| **RHEL / CentOS 7** (NVIDIA, compiled on the machine) | [RHEL 7](docs/RHEL7.md) |
 
 Also needed:
 

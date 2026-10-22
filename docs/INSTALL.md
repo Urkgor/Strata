@@ -146,7 +146,8 @@ start is 24x slower: [Running it at startup](DETAILS.md#running-it-at-startup-ta
 The same questions, the same automatic install (it uses `sudo apt` for Python and, only if it has to compile, for
 the build tools), and the same start: `http://127.0.0.1:8080`. Later runs of `./setup.sh` (or `./run-<model>.sh`)
 start the model directly; `./setup.sh --setup` installs another model or changes the settings. Other distributions,
-WSL and compiling: [details](DETAILS.md#linux).
+WSL and compiling: [details](DETAILS.md#linux). **RHEL / CentOS 7** (glibc 2.17, no ready-made engine runs there):
+[RHEL7.md](RHEL7.md).
 
 On Nix/NixOS, you can use the flake:
 

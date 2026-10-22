@@ -84,7 +84,9 @@ def run_elf(path):
         if shutil.which(tool) is None:
             print("check_isa_guard: %s not found" % tool)
             return 77
-    nm = subprocess.run(["nm", "-C", "--defined-only", path], capture_output=True, text=True, check=True).stdout
+    # stdout/stderr/universal_newlines, not capture_output/text: Python 3.6 (RHEL 7) has neither
+    pipes = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True)
+    nm = subprocess.run(["nm", "-C", "--defined-only", path], **pipes).stdout
     weak, obj = set(), None
     for line in nm.splitlines():
         m = re.match(r"^(\S+\.o):$", line)
@@ -94,8 +96,7 @@ def run_elf(path):
         m = re.match(r"^[0-9a-f]+ ([A-Za-z]) (.*)$", line)
         if m and m.group(2) and m.group(1) in "WVwu":
             weak.add((obj, m.group(2)))
-    dis = subprocess.run(["objdump", "-d", "-C", "-w", "--no-addresses", path], capture_output=True, text=True,
-                         check=True).stdout
+    dis = subprocess.run(["objdump", "-d", "-C", "-w", "--no-addresses", path], **pipes).stdout
     obj, cur, wide, funcs, inits = None, None, {}, 0, {}
     for line in dis.splitlines():
         m = re.match(r"^(\S+\.o):\s+file format", line)

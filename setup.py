@@ -3141,7 +3141,17 @@ def pip_install(packages, what, extra=()):
         return
     acquisition.require(what)
     say(f"  Installing {what} ...")
-    run([sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *extra, *need])
+    pip = [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *extra]
+    glibc = glibc_version()
+    if glibc and glibc < PREBUILT_MIN_GLIBC:
+        # RHEL / CentOS 7 (glibc 2.17): the newest numpy and pillow ship wheels for glibc 2.27 and newer only.  The
+        # pinned install is tried first; when it fails, the same packages without their pins, the newest wheel each
+        # one has for this system (numpy 2.2.6 and pillow 12.2.0 on glibc 2.17, measured with pip on CentOS 7.9).
+        if run([*pip, *need], check=False, quiet=True).returncode != 0:
+            say("  (a pinned version has no wheel for this old C library: installing the newest that has one)")
+            run([*pip, "--prefer-binary", *[re.sub(r"==[^\s;]+", "", p) for p in need]])
+    else:
+        run([*pip, *need])
     stamp.write_text(json.dumps(sorted(set(have) | set(need)), indent=0))
     ok(f"{what} installed")
 
@@ -5218,8 +5228,10 @@ def install_build_tools(gpu, yes):
         fail("the experimental CUDA 12 engine (Pascal / Volta, or --cuda 12) is compiled here with the NVIDIA CUDA "
              f"Toolkit {need12[0]}.{need12[1]} or a newer 12.x (CUDA 13 cannot compile for these cards)" +
              (f"; found CUDA {cuda_v[0]}.{cuda_v[1]}" if nvcc else ""),
-             "install CUDA 12.9 (it can sit next to a newer one) from https://developer.nvidia.com/cuda-toolkit-archive "
-             "and run it again (STRATA_NVCC=<its nvcc> picks one toolkit)")
+             ("RHEL / CentOS 7: NVIDIA's RHEL 7 repository has CUDA 12.0 to 12.4 (docs/RHEL7.md); install one and run it again"
+              if (glibc_version() or (9, 9)) < PREBUILT_MIN_GLIBC else
+              "install CUDA 12.9 (it can sit next to a newer one) from https://developer.nvidia.com/cuda-toolkit-archive "
+              "and run it again (STRATA_NVCC=<its nvcc> picks one toolkit)"))
     # RTX 50 (sm_120): CUDA 13.0 - an engine built with 12.8 crashed in the prompt path on Linux (#220)
     need_cuda = need12 if old else (13, 0) if max(archs) >= 120 else (12, 0)
     vcvars = find_vcvars(cuda_v) if WIN else None
@@ -5367,6 +5379,65 @@ def host_compiler_defs(cuda: bool) -> list:
            ([f"-DCMAKE_CUDA_HOST_COMPILER={hostcxx}"] if cuda and hostcxx else [])
 
 
+GCC_MIN = 10   # the engine is C++20, and nvcc 12 takes C++20 with a host GCC 10 or newer
+#: Where Red Hat keeps a GCC newer than the system's: Software Collections on RHEL / CentOS 7 (devtoolset-N), gcc-toolset-N on 8 and 9.
+NEWER_GCC_DIRS = ("/opt/rh/devtoolset-{v}/root/usr/bin", "/opt/rh/gcc-toolset-{v}/root/usr/bin")
+#: The ready-made Linux engines are built on glibc 2.35 (packaging/README.md); a C library older than this one cannot load them.
+#: RHEL / CentOS 7 has 2.17.  The limit is the oldest one that is certain to fail, not the one that is certain to work.
+PREBUILT_MIN_GLIBC = (2, 28)
+
+
+def gcc_major(cxx: str) -> int:
+    """The major version of a g++ (0 when it cannot be asked)."""
+    try:
+        return int(out([cxx, "-dumpversion"]).strip().split(".")[0])
+    except (ValueError, IndexError):
+        return 0
+
+
+def glibc_version():
+    """The C library's (major, minor) on Linux with glibc, e.g. (2, 17) on RHEL / CentOS 7; None on anything else."""
+    if WIN or sys.platform == "darwin":
+        return None
+    name, ver = platform.libc_ver()
+    m = re.match(r"(\d+)\.(\d+)", ver or "")
+    return (int(m.group(1)), int(m.group(2))) if name == "glibc" and m else None
+
+
+def newer_gcc_dir():
+    """The bin folder of Red Hat's newer GCC when the engine needs it: the g++ on PATH is older than GCC_MIN (RHEL / CentOS 7:
+    4.8.5), CC and CXX do not name a compiler, and /opt/rh has a devtoolset / gcc-toolset to use - 11 first, the one every
+    CUDA 12 release takes.  None when there is nothing to change."""
+    if WIN or sys.platform == "darwin" or os.environ.get("CC") or os.environ.get("CXX"):
+        return None
+    gxx = shutil.which("g++")
+    if gxx and gcc_major(gxx) >= GCC_MIN:
+        return None
+    for v in (11, 12, 10, 13):
+        for pattern in NEWER_GCC_DIRS:
+            d = pattern.format(v=v)
+            if os.access(d + "/g++", os.X_OK):
+                return d
+    return None
+
+
+def use_newer_gcc():
+    """Put the newer GCC (newer_gcc_dir) first on PATH for this run: its g++ and its binutils (the CPU kernels use
+    instructions the system's assembler does not know), so CMake and nvcc find them as they would after `scl enable`.
+    A g++ that is still older than GCC_MIN stops here, in words, instead of in a CMake error about C++20."""
+    d = newer_gcc_dir()
+    if d:
+        os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+        say(f"  The system's GCC is older than the engine's C++20 needs: compiling with {d}/g++")
+    if WIN or sys.platform == "darwin" or os.environ.get("CC") or os.environ.get("CXX"):
+        return
+    gxx = shutil.which("g++")
+    if gxx and gcc_major(gxx) < GCC_MIN:
+        fail(f"the C++ compiler ({gxx}) is GCC {gcc_major(gxx)}: the engine is C++20 and needs GCC {GCC_MIN} or newer",
+             "RHEL / CentOS 7: sudo yum install devtoolset-11-gcc-c++ devtoolset-11-binutils (docs/RHEL7.md); otherwise "
+             "install a newer g++ and run CXX=g++-12 ./setup.sh")
+
+
 def toolkit_root_defs(nvcc) -> list:
     """CUDAToolkit_ROOT for the toolkit whose nvcc builds the engine.  Without it CMake can take cudart and cuBLAS from
     another toolkit: with STRATA_NVCC=/opt/cuda-13.0/bin/nvcc on Ubuntu 24.04 that also has the distribution's CUDA
@@ -5426,6 +5497,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
         return eng
     if local:
         archs = sorted(built | set(archs))
+    use_newer_gcc()                                       # RHEL / CentOS 7: Red Hat's devtoolset, not the system's GCC 4.8
     nvcc, vcvars = install_build_tools({**gpu, "archs": archs, "toolkit": toolkit}, yes)
     cuda_archs = ";".join(str(x) for x in archs)
     bdir, vdir = (ROOT / "build-cuda12", ROOT / "build-vision-cuda12") if t12 else (ROOT / "build", ROOT / "build-vision")
@@ -8234,6 +8306,13 @@ def main() -> int:
         if hip and WIN:
             fail("the older-CPU engine is compiled from source, and setup compiles the AMD engine on Linux only",
                  "use Linux for an AMD card on this CPU, or an NVIDIA card")
+        a.build = True
+    glibc = glibc_version()
+    if glibc and glibc < PREBUILT_MIN_GLIBC and not hip and not a.build:
+        # RHEL / CentOS 7 (glibc 2.17): the ready-made engine would not even load.  docs/RHEL7.md.
+        say(f"  This system's C library is glibc {glibc[0]}.{glibc[1]}, older than the ready-made engines can use "
+            f"({PREBUILT_MIN_GLIBC[0]}.{PREBUILT_MIN_GLIBC[1]} at least): setup compiles the engine on this PC "
+            "(10-20 minutes, once; docs/RHEL7.md)")
         a.build = True
     if a.check:
         say()

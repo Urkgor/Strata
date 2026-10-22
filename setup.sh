@@ -60,6 +60,23 @@ if [ ! -x .venv/bin/python ]; then
     fi
     PY=python3
     if ! ok_py $PY; then
+      # Linux x86-64 with no Python 3.10 to install - RHEL / CentOS 7 has 3.6 and no package for a newer one: the
+      # standalone Python 3.12 the Mac gets (pinned), built for glibc 2.17 and newer; no sudo, no package (docs/RHEL7.md)
+      if [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] && command -v curl >/dev/null 2>&1 \
+         && command -v sha256sum >/dev/null 2>&1; then
+        if [ ! -x .python/python/bin/python3 ]; then
+          PBS="https://github.com/astral-sh/python-build-standalone/releases/download/20261009/cpython-3.12.15%2B20261009-x86_64-unknown-linux-gnu-install_only.tar.gz"
+          echo "No Python 3.10+ here; downloading a standalone Python 3.12 into .python (67 MB) ..."
+          mkdir -p .python && curl -fL --retry 3 -o .python/python.tar.gz "$PBS" || { rm -rf .python; echo "could not download Python"; exit 1; }
+          if [ "$(sha256sum .python/python.tar.gz | cut -d" " -f1)" != "5864001bf969db329fadc2b654c4878c6027d170c6bd77e28f88666260bcaf63" ]; then
+            rm -rf .python; echo "the Python download does not match its pinned SHA-256"; exit 1
+          fi
+          tar xzf .python/python.tar.gz -C .python && rm -f .python/python.tar.gz
+        fi
+        PY=.python/python/bin/python3
+      fi
+    fi
+    if ! ok_py $PY; then
       echo "Please install Python 3.10 or newer with venv (Ubuntu/Debian: sudo apt install python3-venv), then run"
       echo "./setup.sh again. On NixOS, add uv to environment.systemPackages."
       exit 1

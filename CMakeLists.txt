@@ -175,6 +175,14 @@ elseif(STRATA_ENABLE_CUDA)
     set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
   endif()
   enable_language(CUDA)
+  # nvcc 12 compiles C++20 (this project's standard, CUDA sources included), but CMake knows to ask for it only from 3.25.2:
+  # 3.24 to 3.25.0 get through the configure step and then stop at generate, "Target ... requires the language dialect
+  # CUDA20 ... CMake does not know the compile flags", on every CUDA target.  Say so here (RHEL 7's cmake3 is 3.17:
+  # `python3 -m pip install --user cmake`, docs/RHEL7.md).
+  if(CMAKE_VERSION VERSION_LESS 3.25.2 AND NOT CMAKE_CUDA20_STANDARD_COMPILE_OPTION)
+    message(FATAL_ERROR "CMake ${CMAKE_VERSION} does not know how to ask nvcc ${CMAKE_CUDA_COMPILER_VERSION} for C++20: the CUDA "
+                        "build needs CMake 3.25.2 or newer (python3 -m pip install --user cmake)")
+  endif()
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
   find_package(CUDAToolkit REQUIRED)

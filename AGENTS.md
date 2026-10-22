@@ -57,6 +57,11 @@ Terminal cannot run. Strata's MCP server ([docs/MCP_SERVER.md](docs/MCP_SERVER.m
   the packages and the update feed: [packaging/README.md](packaging/README.md) and [packaging/UPDATES.md](packaging/UPDATES.md).
 - AMD (HIP) build and validation: [docs/AMD_HIP.md](docs/AMD_HIP.md); multi-GPU: [docs/MULTI_GPU.md](docs/MULTI_GPU.md);
   Mac (Metal): [docs/MAC.md](docs/MAC.md).
+- RHEL / CentOS 7 (glibc 2.17; no ready-made engine runs there, setup compiles): [docs/RHEL7.md](docs/RHEL7.md). Its checks
+  run in `docker/rhel7` (a CentOS 7.9 image with devtoolset-11 and CUDA 12.4): `tools/build_rhel7.sh` builds the engine in
+  it, `tools/check_glibc_symbols.sh BINARY` says whether a binary asks for more than glibc 2.17, and
+  `python -m unittest tools.test_setup_rhel7` needs nothing. Engine C++ stays inside C++20 and GCC 11's library, and calls
+  nothing newer than glibc 2.17.
 - Tests: the Terminal and Control tests are in `tests/terminal` (`python -m pytest tests/terminal`). The app's UI
   tests run with `npm test` in `apps/host`. Setup's own tests run without a GPU or downloads:
   `python tools/test_setup_<name>.py` (for example `tools/test_setup_amd.py`, `tools/test_setup_choices.py`).
