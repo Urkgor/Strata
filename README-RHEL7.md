@@ -124,6 +124,16 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
 - **GGUF sans couche MTP** (un GGUF « ordinaire » de Qwen3.6, pas ceux d'Unsloth nommés `-MTP-GGUF`) : le moteur répondait `strata-q36: missing qwen35moe.nextn_predict_layers`. Corrigé (`git pull`, puis relancer `tools/build_rhel7.sh`) : l'absence de cette clé veut dire « pas de bloc MTP ». Dans ce cas mettez `"--mtp", "0"` : les brouillons MTP n'existent pas pour ce fichier (le moteur les désactive de lui-même, mais autant ne pas les demander).
 - Réglages à essayer : `--max-context` plus petit (16384) pour économiser la mémoire ; `"--mtp", "0"` si les brouillons posent problème ; `"--expert-vram", "6"` dans `args` pour limiter la VRAM (valeur d'essai, pas une mesure).
 
+## Quels types contient mon GGUF ?
+
+Le moteur s'arrête avec un message « blk.N… est du type X, non géré » quand un tenseur a un type qu'il ne connaît pas. Pour voir tous les types du fichier (en-tête seulement, rien n'est chargé ; Python 3.8+, bibliothèque standard) :
+
+```sh
+python3 tools/gguf_types.py /data/le-modele.gguf
+```
+
+Envoyez cette sortie avec l'erreur : elle suffit à savoir quels types manquent.
+
 ## Si ça casse
 
 | Message | Cause et remède |
