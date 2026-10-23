@@ -120,9 +120,33 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
   -d '{"model":"qwen3.6-35b-a3b","messages":[{"role":"user","content":"Bonjour"}],"max_tokens":64}'
 ```
 
-- Laissez l'écoute sur `127.0.0.1`. Pour d'autres machines : `--host 0.0.0.0` et une clé d'API (`"api_key"` dans le JSON).
+- Par défaut le serveur n'écoute que sur `127.0.0.1` : **aucun autre poste ne peut s'y connecter**. Voir « Se connecter depuis un autre poste » ci-dessous.
 - **GGUF sans couche MTP** (un GGUF « ordinaire » de Qwen3.6, pas ceux d'Unsloth nommés `-MTP-GGUF`) : le moteur répondait `strata-q36: missing qwen35moe.nextn_predict_layers`. Corrigé (`git pull`, puis relancer `tools/build_rhel7.sh`) : l'absence de cette clé veut dire « pas de bloc MTP ». Dans ce cas mettez `"--mtp", "0"` : les brouillons MTP n'existent pas pour ce fichier (le moteur les désactive de lui-même, mais autant ne pas les demander).
 - Réglages à essayer : `--max-context` plus petit (16384) pour économiser la mémoire ; `"--mtp", "0"` si les brouillons posent problème ; `"--expert-vram", "6"` dans `args` pour limiter la VRAM (valeur d'essai, pas une mesure).
+
+## Se connecter depuis un autre poste (autre outil, autre machine)
+
+```sh
+# sur le serveur : écouter sur le réseau, avec une clé d'API
+python3 serve/server.py --engine strata --config $HOME/strata-qwen36.json --port 8080 --host 0.0.0.0 --api-key UNE-CLE-LONGUE-ET-SECRETE
+
+# sur le serveur : le pare-feu de RHEL 7 (firewalld) bloque le port par défaut
+sudo firewall-cmd --permanent --add-port=8080/tcp && sudo firewall-cmd --reload
+ss -ltn | grep 8080                        # doit montrer 0.0.0.0:8080 (et non 127.0.0.1:8080)
+```
+
+Le serveur affiche au démarrage `from other devices: http://<ip>:8080/   (API: http://<ip>:8080/v1)`. Réglages de l'outil qui se connecte :
+
+| Réglage | Valeur |
+| --- | --- |
+| URL de base (OpenAI) | `http://<ip-du-serveur>:8080/v1` (avec `/v1`) |
+| Clé d'API | la clé donnée à `--api-key` (en-tête `Authorization: Bearer …` ou `x-api-key`) |
+| Modèle | `qwen3.6-35b-a3b` (le `model_name` du JSON) |
+| API Anthropic (Claude Code…) | `http://<ip>:8080/v1/messages`, même clé |
+
+Test depuis l'autre poste : `curl -H "Authorization: Bearer UNE-CLE…" http://<ip>:8080/v1/models` doit répondre un JSON ; `401` = clé fausse ou absente, « connection refused » ou délai dépassé = pare-feu, ou le serveur écoute encore sur `127.0.0.1`.
+Alternative sans ouvrir le réseau : un tunnel SSH depuis l'autre poste, `ssh -L 8080:127.0.0.1:8080 utilisateur@serveur`, puis `http://127.0.0.1:8080/v1` (la clé reste conseillée).
+Sans clé, tout poste qui atteint le port utilise le modèle : ne l'exposez pas sans `--api-key` (`--no-api-key` le permet, avec un avertissement).
 
 ## Quels types contient mon GGUF ?
 
