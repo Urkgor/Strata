@@ -125,6 +125,22 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
 - **`"--kv", "f16"`** : le cache de contexte en demi-précision (2 octets au lieu de 4 par valeur) : moitié de VRAM (45 Ko → 22 Ko par token, soit 128 000 tokens ≈ 2,9 Go au lieu de 5,9 Go) et moitié de lecture mémoire en décodage long. Les valeurs sont arrondies en fp16 (comme le fait llama.cpp par défaut) : le texte peut différer très légèrement de celui du cache en f32, qui reste le comportement sans cette option (`"--kv", "f32"`). Avec une carte de 11 Go, essayez `--max-context 131072 --kv f16` ; la ligne du journal `context N cells (K / V cache in f16) … GiB of VRAM free` dit ce qui reste, puis `hybrid experts: N of 256 per layer in VRAM` combien d'experts tiennent. Pas mesuré sur une carte.
 - Réglages à essayer : `--max-context` plus petit (16384) pour économiser la mémoire ; `"--mtp", "0"` si les brouillons posent problème ; `"--expert-vram", "6"` dans `args` pour limiter la VRAM (valeur d'essai, pas une mesure).
 
+## Deux cartes : le contexte sur la 2e carte (`--kv-gpu`)
+
+Idée : la carte de 11 Go garde les poids et le plus d'experts possible ; la carte de 8 Go porte le **cache de contexte et le calcul de l'attention**. Les experts ne bougent pas ; le calcul de l'attention est le même (mêmes noyaux, même ordre des opérations) : le texte doit être celui d'une seule carte, à une différence près possible si la 2e carte est d'une autre génération (cuBLAS choisit ses algorithmes par carte, pour le prompt). Option **désactivée par défaut** : sans `--kv-gpu` le moteur est inchangé.
+
+```json
+ "args": ["--gpu", "0,1", "--native", "$G", "--max-context", "131072", "--kv", "f16", "--kv-gpu", "1",
+          "--prefill", "auto", "--mtp", "0"],
+```
+
+- **`"--gpu", "0,1"` dans `args`** (numéros de `nvidia-smi`) : la **première** carte listée garde les poids et les experts (mettez la 1080 Ti en premier), `--kv-gpu 1` désigne la **deuxième** du lot (pas le numéro de nvidia-smi). N'utilisez pas la clé `"gpu"` du fichier de configuration : le serveur ajouterait `--layer-split`, qui n'est pas ce qu'on veut ici.
+- **Architecture des deux cartes** : le binaire doit contenir des noyaux pour la 2e carte. `tools/build_rhel7.sh` lit les cartes de `nvidia-smi` (toutes) ; si votre binaire a été compilé avant d'avoir branché/vu la 2e carte, relancez-le (`--arch "61;75"` à la main si besoin ; `nvidia-smi --query-gpu=name,compute_cap --format=csv`). Sinon le moteur s'arrête tout de suite avec `this build has no kernels for that card`.
+- `--kv-gpu 0` (la carte principale) fait passer le même chemin de code sur une seule carte : utile pour vérifier que le texte (température 0) est identique à celui sans l'option.
+- Mémoire sur la 2e carte : cache f16 à 128 000 tokens ≈ 2,9 Go (f32 : 5,9 Go) + tampons de l'attention ≈ 1 Go. Le journal dit `K / V cache and attention on device 1: … GiB of its VRAM free` ; si ça ne tient pas, le moteur le dit (`not enough VRAM on device 1 …`) et propose `--kv f16` ou un contexte plus court.
+- Les deux cartes échangent, par couche d'attention (10 sur 40) et par token, 36 Ko aller + 16 Ko retour, via la mémoire de l'hôte (pas besoin de P2P entre les cartes). Pas de graphes CUDA avec cette option (un graphe ne peut pas couvrir deux cartes ; en mode hybride ils étaient déjà coupés). Le prompt envoie environ 52 Ko par token et par couche d'attention.
+- **Pas testé sur une carte** (je n'ai pas de GPU ici) : le code compile sous CentOS 7 / CUDA 12.4 mais n'a jamais tourné. Dites-moi ce que donnent les lignes du journal, le débit en prompt et en décodage, avec et sans `--kv-gpu`.
+
 ## Décodage lent avec un long contexte (6 tk/s à 25 000 tokens contre 60 à petit contexte)
 
 Cause trouvée dans le code : l'attention du décode lisait la mémoire des clés (K) de façon non coalescée (chaque fil lisait sa propre ligne de 1 Ko) et relisait K et V pour chacune des 8 têtes d'un même groupe. Corrigé (`git pull`, puis recompiler, étape 3) : un bloc sert les 8 têtes et lit K par tranches en mémoire partagée. Les résultats sont **identiques bit à bit** à l'ancien noyau (test CPU `q36_attn_gqa_test`), seul l'ordre des lectures change.
@@ -181,3 +197,6 @@ Envoyez cette sortie avec l'erreur : elle suffit à savoir quels types manquent.
 | `CUDA driver version is insufficient` | pilote plus ancien que R525 |
 | `SyntaxError` ou `invalid syntax` au lancement de Python | Python trop ancien (3.6 de RHEL 7) : Python 3.8 ou plus (étape 5) |
 | `no kernel image is available` | mauvais `--arch` pour la carte |
+| `--kv-gpu 1: only 1 CUDA device visible` | une seule carte visible : mettre `"--gpu", "0,1"` dans `args` du fichier de configuration (pas la clé `"gpu"`, qui ajoute `--layer-split`) |
+| `--kv-gpu N … this build has no kernels for that card` | le binaire n'a pas l'architecture de la 2e carte : `tools/build_rhel7.sh --arch "61;XX"` (`nvidia-smi --query-gpu=name,compute_cap --format=csv`) |
+| `not enough VRAM on device N for the K / V cache` | le contexte ne tient pas sur la 2e carte : `--kv f16`, un `--max-context` plus petit ou moins de `--slots` |

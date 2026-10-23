@@ -465,6 +465,29 @@ __global__ void k_gate_mul(float* att, const float* gate, int64_t n) {
     if (i < n) att[i] *= sigm(gate[i]);
 }
 
+/// --kv-gpu: the attention layer's inputs in one buffer for the other card.  Layout: kAttnHdr int32 (the position *pos0, the
+/// rotary offset *delta, the batch rows' cell / slot / rotary offset), then the projected qg [nq], kx [nk], vx [nk] floats.
+constexpr int kAttnHdr = 32;
+__global__ void k_pack_attn(float* out, const float* qg, const float* kx, const float* vx, int64_t nq, int64_t nk,
+                            const int32_t* pos0, const int32_t* delta, const int32_t* rcell, const int32_t* rslot,
+                            const int32_t* rdelta, int nrows) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t* hdr = reinterpret_cast<int32_t*>(out);
+    if (i == 0) {
+        hdr[0] = pos0 ? *pos0 : 0;
+        hdr[1] = delta ? *delta : 0;
+    }
+    if (i < nrows) {
+        hdr[2 + i] = rcell[i];
+        hdr[10 + i] = rslot[i];
+        hdr[18 + i] = rdelta[i];
+    }
+    float* o = out + kAttnHdr;
+    if (i < nq) o[i] = qg[i];
+    else if (i < nq + nk) o[i] = kx[i - nq];
+    else if (i < nq + 2 * nk) o[i] = vx[i - nq - nk];
+}
+
 /// Picture rows over the embeddings of a chunk: x[r] = img[map[r]] for the rows with map[r] >= 0 (the rows of a picture's
 /// <|image_pad|> cells).  grid (T), block 256.
 __global__ void k_put_rows(float* x, const float* img, const int32_t* map, int n) {
@@ -1137,6 +1160,24 @@ void expert_blob(const Layer& L, int64_t e, uint8_t* dst) {
 }
 
 // ------------------------------------------------------------------------------------------------ the engine
+/// The current CUDA device for a scope (--kv-gpu: the allocations and calls for the cache's card); dev < 0: unchanged.
+struct DevScope {
+    int prev = -1;
+    explicit DevScope(int dev) {
+        if (dev < 0) return;
+        int cur = 0;
+        CK(cudaGetDevice(&cur));
+        if (cur == dev) return;
+        prev = cur;
+        CK(cudaSetDevice(dev));
+    }
+    ~DevScope() {
+        if (prev >= 0) cudaSetDevice(prev);
+    }
+    DevScope(const DevScope&) = delete;
+    DevScope& operator=(const DevScope&) = delete;
+};
+
 float* dalloc(size_t n) {
     float* p = nullptr;
     CK(cudaMalloc(&p, n * 4));
@@ -1178,7 +1219,16 @@ struct Engine {
     /// held in float* handles, and the prompt attention reads the cache itself as its FP16 operands (no k16 / v16 copies)
     bool kv16 = false;
     size_t kv_elem() const { return kv16 ? 2 : 4; }
+    /// --kv-gpu N: the K / V cache and the attention (the norm / rotary / cache write, the scores, the softmax, the sum over V) run
+    /// on device N; the weights, the experts and all the rest stay on the main device.  The two cards trade the projected rows
+    /// (36 KB per token and attention layer) and the attention's output (16 KB) through pinned host memory, ordered by events:
+    /// no peer access needed, the host never waits.  N = the main device runs the same path on one card (to check that its
+    /// output is bit-identical).  The attention does the same arithmetic on either card.  No CUDA graphs then (one cannot span
+    /// two devices).
+    bool kvr = false;
+    int kv_dev = 0, main_dev = 0;
     float* alloc_kv() const {
+        DevScope ds(kvr ? kv_dev : -1);
         const size_t n = (size_t) m->g.n_head_kv * ctx * m->g.head_dim;
         return kv16 ? reinterpret_cast<float*>(dalloc_t<__half>(n)) : dalloc(n);
     }
@@ -1361,6 +1411,7 @@ struct Engine {
 
     void init(const Model& model, int ctx_, int tmax_, int n_sessions = 1, bool vision_ = false) {
         m = &model;
+        CK(cudaGetDevice(&main_dev));
         ctx = ctx_;
         n_sess = std::max(1, std::min(n_sessions, kVerify));
         vision = vision_;
@@ -1373,8 +1424,11 @@ struct Engine {
         qkv = dalloc(T * C); hc = dalloc(T * C); z = dalloc(T * g.ssm_value_dim);
         alpha = dalloc(T * g.ssm_v_heads); beta = dalloc(T * g.ssm_v_heads); gdn_y = dalloc(T * g.ssm_value_dim);
         qg = dalloc(T * 2 * g.n_head * g.head_dim); kx = dalloc(T * g.n_head_kv * g.head_dim);
-        vx = dalloc(T * g.n_head_kv * g.head_dim); q = dalloc(T * g.n_head * g.head_dim);
-        gate = dalloc(T * g.n_head * g.head_dim); att = dalloc(T * g.n_head * g.head_dim);
+        vx = dalloc(T * g.n_head_kv * g.head_dim); att = dalloc(T * g.n_head * g.head_dim);
+        if (!kvr) {   // (--kv-gpu: the attention's q and gate are the cache card's)
+            q = dalloc(T * g.n_head * g.head_dim);
+            gate = dalloc(T * g.n_head * g.head_dim);
+        }
         logits_r = dalloc(T * (g.n_expert + 1));
         eparts = dalloc(T * Kp * N); moe_out = dalloc(T * N);
         sg = dalloc(T * g.n_ff_shexp); su = dalloc(T * g.n_ff_shexp); shh = dalloc(T * g.n_ff_shexp); sy = dalloc(T * N);
@@ -1387,14 +1441,16 @@ struct Engine {
             std::fprintf(stderr, "strata-q36: cuBLAS handle failed\n");
             std::exit(1);
         }
-        att_s = dalloc(kAttScoreFloats);
         sk_part = dalloc((size_t) kSplitK * T * (g.n_expert + 1));
-        att_p16 = dalloc_t<__half>(kAttScoreFloats);
-        if (!kv16) {   // (--kv f16: the cache is the FP16 operand)
-            k16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
-            v16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
+        if (!kvr) {   // (--kv-gpu: the attention's scratch is the cache card's, see init_kv_card)
+            att_s = dalloc(kAttScoreFloats);
+            att_p16 = dalloc_t<__half>(kAttScoreFloats);
+            if (!kv16) {   // (--kv f16: the cache is the FP16 operand)
+                k16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
+                v16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
+            }
+            q16 = dalloc_t<__half>(T * g.n_head * g.head_dim);
         }
-        q16 = dalloc_t<__half>(T * g.n_head * g.head_dim);
         use_mmq = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr;
         auto mmq_ok = [&](const Layer& L) {
             return MMQ::supported(L.L.gu_type) && MMQ::supported(L.L.d_type) && MMQ::fits(L.L.gu_type, 2 * g.n_ff) &&
@@ -1451,9 +1507,13 @@ struct Engine {
         CK(cudaHostAlloc((void**) &hpin, 64 * sizeof(int32_t), cudaHostAllocDefault));
         n_chunk = (ctx + kChunkCells - 1) / kChunkCells;
         att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, 64));   // 64 query tokens per attention batch
-        pacc = dalloc((size_t) att_rows * n_chunk * g.head_dim);
-        pm = dalloc((size_t) att_rows * n_chunk);
-        pl = dalloc((size_t) att_rows * n_chunk);
+        if (!kvr) {
+            pacc = dalloc((size_t) att_rows * n_chunk * g.head_dim);
+            pm = dalloc((size_t) att_rows * n_chunk);
+            pl = dalloc((size_t) att_rows * n_chunk);
+        } else {
+            init_kv_card(T);
+        }
         for (const Layer& L : m->layers) {   // the verify windows' GDN inputs (one set, whichever session runs)
             if (L.attn) {
                 for (auto* v : {&v_qkv, &v_hc, &v_alpha, &v_beta}) v->push_back(nullptr);
@@ -1478,8 +1538,27 @@ struct Engine {
             // the MTP block, and its recurrent state)
             size_t n_attn = m->has_mtp ? 1 : 0, n_gdn = 0;
             for (const Layer& L : m->layers) (L.attn ? n_attn : n_gdn) += 1;
-            const size_t per = (size_t) (g.n_head_kv * g.head_dim * 2 * 4) * (size_t) ctx * n_attn +
-                               (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn;
+            const size_t per_kv = (size_t) (g.n_head_kv * g.head_dim * 2) * kv_elem() * (size_t) ctx * n_attn;
+            const size_t per_gdn = (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn;
+            if (kvr) {   // the K / V caches on the cache's card, the recurrent states here: each card is asked for its share
+                size_t frk = 0, totk = 0;
+                {
+                    DevScope ds(kv_dev);
+                    CK(cudaMemGetInfo(&frk, &totk));
+                }
+                std::fprintf(stderr, "strata-q36: --kv-gpu %d: K / V cache%s of %.2f GiB per session at a context of %d, %.2f "
+                             "GiB free on that card (%d session%s)\n", kv_dev, kv16 ? " (f16)" : "", (double) per_kv / (1 << 30), ctx,
+                             (double) frk / (1 << 30), n_sess, n_sess > 1 ? "s" : "");
+                if (per_kv * (size_t) n_sess + ((size_t) 256 << 20) > frk) {
+                    std::fprintf(stderr, "strata-q36: not enough VRAM on device %d for the K / V cache of %d session%s at a context "
+                                 "of %d (%.2f GiB each, %.2f GiB free): %s\n", kv_dev, n_sess, n_sess > 1 ? "s" : "", ctx,
+                                 (double) per_kv / (1 << 30), (double) frk / (1 << 30),
+                                 kv16 ? "use a shorter --max-context or fewer slots"
+                                      : "use --kv f16 (half the size), a shorter --max-context or fewer slots");
+                    std::exit(1);
+                }
+            }
+            const size_t per = kvr ? per_gdn : per_kv + per_gdn;
             size_t fr0 = 0, tot0 = 0;
             CK(cudaMemGetInfo(&fr0, &tot0));
             if (n_sess > 1)
@@ -1507,6 +1586,7 @@ struct Engine {
             const std::pair<float***, std::vector<float*>*> tabs[4] = {{&d_conv_tab, &hc}, {&d_S_tab, &hs},
                                                                           {&d_kc_tab, &hk}, {&d_vc_tab, &hv}};
             for (const auto& tb : tabs) {
+                DevScope ds(kvr && (tb.first == &d_kc_tab || tb.first == &d_vc_tab) ? kv_dev : -1);   // read by the attention
                 CK(cudaMalloc((void**) tb.first, tb.second->size() * sizeof(float*)));
                 CK(cudaMemcpy((void*) *tb.first, tb.second->data(), tb.second->size() * sizeof(float*),
                               cudaMemcpyHostToDevice));
@@ -1521,18 +1601,37 @@ struct Engine {
         }
         if (vision) {
             d_mtab = dalloc_t<int32_t>((size_t) ctx * 3);
+            if (kvr) {
+                DevScope ds(kv_dev);
+                d_mtab_kv = dalloc_t<int32_t>((size_t) ctx * 3);
+            }
             d_map = dalloc_t<int32_t>(T);
             CK(cudaHostAlloc((void**) &h_map, T * sizeof(int32_t), cudaHostAllocDefault));
         }
         d_delta = dalloc_t<int32_t>(1);
+        if (kvr) {   // the attention's tables on the cache's card (the rest of its inputs travel in the packed header)
+            ar_kv.kc_tab = d_kc_tab;
+            ar_kv.vc_tab = d_vc_tab;
+        }
         cur = 0;
         load_cur();
         CK(cudaDeviceSynchronize());   // every legacy-stream cudaMemset of the buffers above is done
+        if (kvr) {
+            DevScope ds(kv_dev);
+            CK(cudaDeviceSynchronize());
+        }
         size_t fr = 0, tot = 0;
         CK(cudaMemGetInfo(&fr, &tot));
         std::fprintf(stderr, "strata-q36: context %d cells%s, prompt chunk %d%s, %.2f GiB of VRAM free\n", ctx,
                      kv16 ? " (K / V cache in f16)" : "", tmax, m->has_mtp ? ", MTP block loaded" : "",
                      (double) fr / (1 << 30));
+        if (kvr) {
+            size_t frk = 0, totk = 0;
+            DevScope ds(kv_dev);
+            CK(cudaMemGetInfo(&frk, &totk));
+            std::fprintf(stderr, "strata-q36: K / V cache and attention on device %d%s: %.2f GiB of its VRAM free\n", kv_dev,
+                         kv_dev == main_dev ? " (the main device: a check of the path)" : "", (double) frk / (1 << 30));
+        }
     }
 
     /// The recurrent state and the cache to a fresh sequence.
@@ -1900,6 +1999,231 @@ struct Engine {
         }
     }
 
+    /// What an attention layer needs besides the cache: a stream, a cuBLAS handle and scratch on the device that runs it, and the
+    /// rows' tables there.  The main device's are the engine's own members (ar_main()); with --kv-gpu the other card has its own (ar_kv).
+    struct AttnRes {
+        cudaStream_t st = nullptr;
+        cublasHandle_t blas = nullptr;
+        float *q = nullptr, *gate = nullptr, *pacc = nullptr, *pm = nullptr, *pl = nullptr, *att_s = nullptr;
+        __half *att_p16 = nullptr, *k16 = nullptr, *v16 = nullptr, *q16 = nullptr;
+        size_t score_floats = 0;
+        const int32_t *delta = nullptr, *rcell = nullptr, *rslot = nullptr, *rdelta = nullptr;
+        float* const *kc_tab = nullptr, *const *vc_tab = nullptr;
+    };
+    AttnRes ar_main() const {
+        AttnRes R;
+        R.st = st; R.blas = blas;
+        R.q = q; R.gate = gate; R.pacc = pacc; R.pm = pm; R.pl = pl; R.att_s = att_s;
+        R.att_p16 = att_p16; R.k16 = k16; R.v16 = v16; R.q16 = q16;
+        R.score_floats = kAttScoreFloats;
+        R.delta = d_delta; R.rcell = d_rcell; R.rslot = d_rslot; R.rdelta = d_rdelta;
+        R.kc_tab = d_kc_tab; R.vc_tab = d_vc_tab;
+        return R;
+    }
+
+    // --kv-gpu: the cache's card
+    AttnRes ar_kv;                                    // its stream, cuBLAS handle and scratch (q, gate, partials, scores ...)
+    float* pk_main = nullptr;                         // main device: the packed inputs of an attention layer (k_pack_attn)
+    float* pk_kv = nullptr;                           // cache device: the same, copied
+    float* att_kv = nullptr;                          // cache device: the attention's output [tmax][H HD]
+    float *stage_in = nullptr, *stage_out = nullptr;  // pinned (portable) host memory the two copies go through
+    cudaEvent_t ev_in = nullptr, ev_out = nullptr;    // the inputs are in host memory / the output is
+    std::vector<float*> qn_kv, kn_kv;                 // per attention layer (the MTP block's last): q / k norm weights on that card
+    int32_t* d_mtab_kv = nullptr;                     // the M-RoPE table there (vision)
+
+    /// Allocates the cache's card side of --kv-gpu (before the sessions' caches): stream, cuBLAS handle, the attention's scratch,
+    /// the hand-off buffers and the layers' norm weights.
+    void init_kv_card(size_t T) {
+        const auto& g = m->g;
+        const size_t H = (size_t) g.n_head, HKV = (size_t) g.n_head_kv, HD = (size_t) g.head_dim;
+        {   // host side first (pinned, usable by every device), and the event the cache's card waits on
+            const size_t in_floats = (size_t) kAttnHdr + T * (2 * H * HD + 2 * HKV * HD);
+            CK(cudaHostAlloc((void**) &stage_in, in_floats * 4, cudaHostAllocPortable));
+            CK(cudaHostAlloc((void**) &stage_out, T * H * HD * 4, cudaHostAllocPortable));
+            pk_main = dalloc(in_floats);
+            CK(cudaEventCreateWithFlags(&ev_in, cudaEventDisableTiming));
+        }
+        DevScope ds(kv_dev);
+        AttnRes& R = ar_kv;
+        CK(cudaStreamCreateWithFlags(&R.st, cudaStreamNonBlocking));
+        CK(cudaEventCreateWithFlags(&ev_out, cudaEventDisableTiming));
+        if (cublasCreate(&R.blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(R.blas, R.st) != CUBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr, "strata-q36: cuBLAS handle failed on device %d\n", kv_dev);
+            std::exit(1);
+        }
+        R.q = dalloc(T * H * HD);
+        R.gate = dalloc(T * H * HD);
+        R.score_floats = kAttScoreFloats;
+        R.att_s = dalloc(R.score_floats);
+        R.att_p16 = dalloc_t<__half>(R.score_floats);
+        if (!kv16) {   // (--kv f16: the cache is the FP16 operand)
+            R.k16 = dalloc_t<__half>(HKV * ctx * HD);
+            R.v16 = dalloc_t<__half>(HKV * ctx * HD);
+        }
+        R.q16 = dalloc_t<__half>(T * H * HD);
+        R.pacc = dalloc((size_t) att_rows * n_chunk * HD);
+        R.pm = dalloc((size_t) att_rows * n_chunk);
+        R.pl = dalloc((size_t) att_rows * n_chunk);
+        pk_kv = dalloc((size_t) kAttnHdr + T * (2 * H * HD + 2 * HKV * HD));
+        att_kv = dalloc(T * H * HD);
+        const int32_t* hdr = reinterpret_cast<const int32_t*>(pk_kv);   // the header's scalars and rows, as the kernels read them
+        R.delta = hdr + 1;
+        R.rcell = hdr + 2;
+        R.rslot = hdr + 10;
+        R.rdelta = hdr + 18;
+        auto copy_vec = [&](const float* src_main) {   // HD floats from the main device to this one
+            std::vector<float> host(HD);
+            float* d = dalloc(HD);
+            if (src_main) {
+                CK(cudaMemcpy(host.data(), src_main, HD * 4, cudaMemcpyDefault));   // (unified addressing: either device's pointer)
+                CK(cudaMemcpy(d, host.data(), HD * 4, cudaMemcpyHostToDevice));
+            }
+            return d;
+        };
+        const size_t nl = m->layers.size() + (m->has_mtp ? 1 : 0);
+        for (size_t li = 0; li < nl; ++li) {
+            const Layer& L = li < m->layers.size() ? m->layers[li] : m->mtp;
+            qn_kv.push_back(L.attn ? copy_vec(L.q_norm) : nullptr);
+            kn_kv.push_back(L.attn ? copy_vec(L.k_norm) : nullptr);
+        }
+    }
+
+    /// --kv-gpu: attention layer li for T rows on the cache's card.  The rows projected here (qg / kx / vx) are packed with the
+    /// position into one buffer and go through pinned host memory to the card; attn_core runs there on its own stream; the output
+    /// comes back the same way.  Every hand-off is an event (the host does not wait), and the main stream is held until the
+    /// output is in: so a single staging buffer each way is enough, and the stream order everywhere else is unchanged.
+    void attn_remote(size_t li, int T, int64_t p0, const int32_t* dpos) {
+        const auto& g = m->g;
+        const int H = (int) g.n_head, HKV = (int) g.n_head_kv, HD = (int) g.head_dim;
+        const int64_t nq = (int64_t) T * 2 * H * HD, nk = (int64_t) T * HKV * HD;
+        const size_t in_bytes = (size_t) (kAttnHdr + nq + 2 * nk) * 4, out_bytes = (size_t) T * H * HD * 4;
+        k_pack_attn<<<grid1(nq + 2 * nk), kThreads, 0, st>>>(pk_main, qg, kx, vx, nq, nk, dpos, d_delta,
+                                                             rows_mode ? d_rcell : nullptr, rows_mode ? d_rslot : nullptr,
+                                                             rows_mode ? d_rdelta : nullptr, rows_mode ? T : 0);
+        CK(cudaMemcpyAsync(stage_in, pk_main, in_bytes, cudaMemcpyDeviceToHost, st));
+        CK(cudaEventRecord(ev_in, st));
+        {
+            DevScope ds(kv_dev);
+            const AttnRes& R = ar_kv;
+            CK(cudaStreamWaitEvent(R.st, ev_in, 0));
+            CK(cudaMemcpyAsync(pk_kv, stage_in, in_bytes, cudaMemcpyHostToDevice, R.st));
+            const float* in = pk_kv + kAttnHdr;
+            attn_core(R, li, T, p0, reinterpret_cast<const int32_t*>(pk_kv), false, in, in + nq, in + nq + nk, qn_kv[li],
+                      kn_kv[li], mtab_now ? d_mtab_kv : nullptr, att_kv);
+            CK(cudaMemcpyAsync(stage_out, att_kv, out_bytes, cudaMemcpyDeviceToHost, R.st));
+            CK(cudaEventRecord(ev_out, R.st));
+        }
+        CK(cudaStreamWaitEvent(st, ev_out, 0));
+        CK(cudaMemcpyAsync(att, stage_out, out_bytes, cudaMemcpyHostToDevice, st));
+    }
+
+    /// The core of an attention layer on the device `R` belongs to: the q / k norm, the rotary position and the cache write
+    /// of the T projected rows (qg_ [T][2 H HD] as [q | gate] pairs, kx_ / vx_ [T][HKV HD]), then the attention over the cache
+    /// (graph_mode: the chunk grid covers the whole context); the gated result in att_ [T][H HD].  All on R.st, with R's scratch.
+    void attn_core(const AttnRes& R, size_t li, int T, int64_t p0, const int32_t* dpos, bool graph_mode, const float* qg_,
+                   const float* kx_, const float* vx_, const float* qnorm, const float* knorm, const int32_t* mtab,
+                   float* att_) {
+        const auto& g = m->g;
+        const int H = (int) g.n_head, HKV = (int) g.n_head_kv, HD = (int) g.head_dim;
+        RowSel rs;
+        if (rows_mode) {
+            rs.cell = R.rcell;
+            rs.slot = R.rslot;
+            rs.delta = R.rdelta;
+            rs.kc = R.kc_tab + li * n_sess;
+            rs.vc = R.vc_tab + li * n_sess;
+        }
+        auto prep = [&](auto kt) {   // kt: std::type_identity<float or __half>, the cache's element type
+            using KT = typename decltype(kt)::type;
+            k_attn_prep<KT><<<dim3(H + HKV, T), kThreads, 0, R.st>>>(qg_, kx_, vx_, qnorm, knorm, R.q, R.gate,
+                                                                  rows_mode ? nullptr : kc[li], rows_mode ? nullptr : vc[li],
+                                                                  H, HKV, HD, m->n_rot, dpos, ctx, m->rope_base, m->eps,
+                                                                  R.delta, mtab, rs);
+        };
+        if (kv16) prep(std::type_identity<__half>{});
+        else prep(std::type_identity<float>{});
+        if (T > kGemmT) {
+            // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
+            // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
+            // FP16 probabilities; the queries in slices whose scores fit
+            const int P = (int) p0 + T;
+            const int ldp = (P + 7) / 8 * 8;
+            const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (R.score_floats / ((size_t) H * ldp))));
+            const int G = H / HKV;
+            const float one = 1.0f, zero = 0.0f;
+            if (!kv16)
+                k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, R.st>>>(kc[li], vc[li], R.k16, R.v16, ctx, P, HD, HKV);
+            k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, R.st>>>(R.q, R.q16, (int64_t) T * H * HD);
+            for (int t0 = 0; t0 < T; t0 += tq) {
+                const int nt = std::min(tq, T - t0);
+                for (int kvh = 0; kvh < HKV; ++kvh) {
+                    // --kv f16: the cache rows are the FP16 operand already (cells HD apart, a KV head ctx * HD)
+                    const __half* Kh = kv16 ? reinterpret_cast<const __half*>(kc[li]) + (size_t) kvh * ctx * HD
+                                            : R.k16 + (size_t) kvh * P * HD;
+                    const __half* Qh = R.q16 + ((size_t) t0 * H + kvh * G) * HD;
+                    float* Sh = R.att_s + (size_t) kvh * G * nt * ldp;
+                    if (cublasGemmStridedBatchedEx(R.blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh, CUDA_R_16F, HD,
+                                                   0, Qh, CUDA_R_16F, H * HD, HD, &zero, Sh, CUDA_R_32F, ldp,
+                                                   (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                        CUBLAS_STATUS_SUCCESS) {
+                        std::fprintf(stderr, "strata-q36: attention scores GEMM failed\n");
+                        std::exit(1);
+                    }
+                }
+                k_attn_softmax16<<<dim3(nt, H), kThreads, 0, R.st>>>(R.att_s, R.att_p16, ldp, nt, P, (int) p0 + t0,
+                                                                   1.0f / sqrtf((float) HD));
+                for (int kvh = 0; kvh < HKV; ++kvh) {
+                    const __half* Vh = kv16 ? reinterpret_cast<const __half*>(vc[li]) + (size_t) kvh * ctx * HD
+                                            : R.v16 + (size_t) kvh * P * HD;
+                    const __half* Sh = R.att_p16 + (size_t) kvh * G * nt * ldp;
+                    float* Oh = att_ + ((size_t) t0 * H + kvh * G) * HD;
+                    if (cublasGemmStridedBatchedEx(R.blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, Vh, CUDA_R_16F, HD,
+                                                   0, Sh, CUDA_R_16F, ldp, (long long) nt * ldp, &zero, Oh, CUDA_R_32F,
+                                                   H * HD, HD, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
+                        CUBLAS_STATUS_SUCCESS) {
+                        std::fprintf(stderr, "strata-q36: attention values GEMM failed\n");
+                        std::exit(1);
+                    }
+                }
+            }
+            k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, R.st>>>(att_, R.gate, (int64_t) T * H * HD);
+        } else {
+            // split-K over 256-cell chunks; the chunk grid covers every cell a row can see (graph mode: the whole
+            // context, past-the-end chunks return at once)
+            const int rows_per = att_rows / H;
+#if defined(__HIPCC__)
+            const bool gqa_attn_ok = false;
+#else
+            const bool gqa_attn_ok = HD == q36k::kAttnHD && kChunkCells == q36k::kAttnChunk && kThreads == q36k::kAttnThreads &&
+                                     HKV > 0 && H == HKV * q36k::kAttnGroup;
+#endif
+            for (int t0 = 0; t0 < T; t0 += rows_per) {
+                const int nt = std::min(rows_per, T - t0);
+                const int nc = graph_mode ? n_chunk
+                                          : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
+                // grouped queries (16 heads over 2 KV heads): one block serves the 8 heads of a KV head and reads K through
+                // shared memory, coalesced; the same bits as k_attn_part (q36_attn.cuh, which says why: a GTX 1080 Ti
+                // decoded 6 tokens/s at 25K of context against 60 at a short one).  STRATA_Q36_OLD_ATTN=1: the old kernel
+                // (A/B).  HIP keeps the old one.
+                static const bool gqa_attn = std::getenv("STRATA_Q36_OLD_ATTN") == nullptr;
+                auto part = [&](auto kt) {   // kt: std::type_identity<float or __half>, the cache's element type
+                    using KT = typename decltype(kt)::type;
+                    if (gqa_attn_ok && gqa_attn)
+                        q36k::k_attn_part_gqa<KT><<<dim3(nc, nt * HKV), kChunkCells, 0, R.st>>>(
+                            R.q, rows_mode ? nullptr : kc[li], rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
+                            1.0f / sqrtf((float) HD), n_chunk, R.pacc, R.pm, R.pl, rs.cell, rs.slot, rs.kc, rs.vc);
+                    else
+                        k_attn_part<KT><<<dim3(nc, nt * H), kChunkCells, 0, R.st>>>(
+                            R.q, rows_mode ? nullptr : kc[li], rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
+                            1.0f / sqrtf((float) HD), n_chunk, R.pacc, R.pm, R.pl, rs);
+                };
+                if (kv16) part(std::type_identity<__half>{});
+                else part(std::type_identity<float>{});
+                k_attn_merge<<<nt * H, HD, 0, R.st>>>(R.pacc, R.pm, R.pl, R.gate, dpos, t0, H, n_chunk, att_, rs);
+            }
+        }
+    }
+
     /// One layer for T rows: x (the residual) += mixer(h); then MoE; x += moe; `hout` = rms(x) * wn (the next norm).
     /// `li` indexes the layer's state; positions *dpos .. + T - 1 (device), p0 the same on the host (eager grids);
     /// `verify`: a verify window - the GDN state is read, not written (commit() writes it for the kept rows).
@@ -1909,7 +2233,6 @@ struct Engine {
         const int N = (int) g.n_embd, Kp = (int) m->top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
         const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, D = (int) g.ssm_state_size;
         const int C = (int) g.ssm_conv_channels;
-        const int H = (int) g.n_head, HKV = (int) g.n_head_kv, HD = (int) g.head_dim;
         if (!L.attn) {
             float* qkv_b = verify ? v_qkv[li] : qkv;
             float* hc_b = verify ? v_hc[li] : hc;
@@ -1956,103 +2279,8 @@ struct Engine {
             apply(L.wq, xq, qg, T);
             apply(L.wk, xq, kx, T);
             apply(L.wv, xq, vx, T);
-            RowSel rs;
-            if (rows_mode) {
-                rs.cell = d_rcell;
-                rs.slot = d_rslot;
-                rs.delta = d_rdelta;
-                rs.kc = d_kc_tab + li * n_sess;
-                rs.vc = d_vc_tab + li * n_sess;
-            }
-            auto prep = [&](auto kt) {   // kt: std::type_identity<float or __half>, the cache's element type
-                using KT = typename decltype(kt)::type;
-                k_attn_prep<KT><<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate,
-                                                                      rows_mode ? nullptr : kc[li], rows_mode ? nullptr : vc[li],
-                                                                      H, HKV, HD, m->n_rot, dpos, ctx, m->rope_base, m->eps,
-                                                                      d_delta, mtab_now, rs);
-            };
-            if (kv16) prep(std::type_identity<__half>{});
-            else prep(std::type_identity<float>{});
-            if (T > kGemmT) {
-                // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
-                // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
-                // FP16 probabilities; the queries in slices whose scores fit
-                const int P = (int) p0 + T;
-                const int ldp = (P + 7) / 8 * 8;
-                const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldp))));
-                const int G = H / HKV;
-                const float one = 1.0f, zero = 0.0f;
-                if (!kv16)
-                    k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, ctx, P, HD, HKV);
-                k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
-                for (int t0 = 0; t0 < T; t0 += tq) {
-                    const int nt = std::min(tq, T - t0);
-                    for (int kvh = 0; kvh < HKV; ++kvh) {
-                        // --kv f16: the cache rows are the FP16 operand already (cells HD apart, a KV head ctx * HD)
-                        const __half* Kh = kv16 ? reinterpret_cast<const __half*>(kc[li]) + (size_t) kvh * ctx * HD
-                                                : k16 + (size_t) kvh * P * HD;
-                        const __half* Qh = q16 + ((size_t) t0 * H + kvh * G) * HD;
-                        float* Sh = att_s + (size_t) kvh * G * nt * ldp;
-                        if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh, CUDA_R_16F, HD,
-                                                       0, Qh, CUDA_R_16F, H * HD, HD, &zero, Sh, CUDA_R_32F, ldp,
-                                                       (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
-                            CUBLAS_STATUS_SUCCESS) {
-                            std::fprintf(stderr, "strata-q36: attention scores GEMM failed\n");
-                            std::exit(1);
-                        }
-                    }
-                    k_attn_softmax16<<<dim3(nt, H), kThreads, 0, st>>>(att_s, att_p16, ldp, nt, P, (int) p0 + t0,
-                                                                       1.0f / sqrtf((float) HD));
-                    for (int kvh = 0; kvh < HKV; ++kvh) {
-                        const __half* Vh = kv16 ? reinterpret_cast<const __half*>(vc[li]) + (size_t) kvh * ctx * HD
-                                                : v16 + (size_t) kvh * P * HD;
-                        const __half* Sh = att_p16 + (size_t) kvh * G * nt * ldp;
-                        float* Oh = att + ((size_t) t0 * H + kvh * G) * HD;
-                        if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, Vh, CUDA_R_16F, HD,
-                                                       0, Sh, CUDA_R_16F, ldp, (long long) nt * ldp, &zero, Oh, CUDA_R_32F,
-                                                       H * HD, HD, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
-                            CUBLAS_STATUS_SUCCESS) {
-                            std::fprintf(stderr, "strata-q36: attention values GEMM failed\n");
-                            std::exit(1);
-                        }
-                    }
-                }
-                k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, gate, (int64_t) T * H * HD);
-            } else {
-                // split-K over 256-cell chunks; the chunk grid covers every cell a row can see (graph mode: the whole
-                // context, past-the-end chunks return at once)
-                const int rows_per = att_rows / H;
-#if defined(__HIPCC__)
-                const bool gqa_attn_ok = false;
-#else
-                const bool gqa_attn_ok = HD == q36k::kAttnHD && kChunkCells == q36k::kAttnChunk && kThreads == q36k::kAttnThreads &&
-                                         HKV > 0 && H == HKV * q36k::kAttnGroup;
-#endif
-                for (int t0 = 0; t0 < T; t0 += rows_per) {
-                    const int nt = std::min(rows_per, T - t0);
-                    const int nc = graph_mode ? n_chunk
-                                              : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
-                    // grouped queries (16 heads over 2 KV heads): one block serves the 8 heads of a KV head and reads K through
-                    // shared memory, coalesced; the same bits as k_attn_part (q36_attn.cuh, which says why: a GTX 1080 Ti
-                    // decoded 6 tokens/s at 25K of context against 60 at a short one).  STRATA_Q36_OLD_ATTN=1: the old kernel
-                    // (A/B).  HIP keeps the old one.
-                    static const bool gqa_attn = std::getenv("STRATA_Q36_OLD_ATTN") == nullptr;
-                    auto part = [&](auto kt) {   // kt: std::type_identity<float or __half>, the cache's element type
-                        using KT = typename decltype(kt)::type;
-                        if (gqa_attn_ok && gqa_attn)
-                            q36k::k_attn_part_gqa<KT><<<dim3(nc, nt * HKV), kChunkCells, 0, st>>>(
-                                q, rows_mode ? nullptr : kc[li], rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
-                                1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs.cell, rs.slot, rs.kc, rs.vc);
-                        else
-                            k_attn_part<KT><<<dim3(nc, nt * H), kChunkCells, 0, st>>>(
-                                q, rows_mode ? nullptr : kc[li], rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
-                                1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
-                    };
-                    if (kv16) part(std::type_identity<__half>{});
-                    else part(std::type_identity<float>{});
-                    k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att, rs);
-                }
-            }
+            if (kvr) attn_remote(li, T, p0, dpos);
+            else attn_core(ar_main(), li, T, p0, dpos, graph_mode, qg, kx, vx, L.q_norm, L.k_norm, mtab_now, att);
             mm(L.wo, att, y, T);
         }
         add_rms_post(L, T);
@@ -2402,6 +2630,7 @@ struct Engine {
     }
 
     void shrink_att(size_t floats) {
+        if (kvr) return;   // (the scores buffer is the cache card's: it gives the main device's VRAM nothing back)
         CK(cudaDeviceSynchronize());
         CK(cudaFree(att_s));
         CK(cudaFree(att_p16));
@@ -2451,6 +2680,10 @@ struct Engine {
         }
         CK(cudaMemcpy(d_img, rows.data(), need * 4, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(d_mtab, mrope.data(), mrope.size() * 4, cudaMemcpyHostToDevice));
+        if (kvr) {
+            DevScope ds(kv_dev);
+            CK(cudaMemcpy(d_mtab_kv, mrope.data(), mrope.size() * 4, cudaMemcpyHostToDevice));
+        }
         img_map = cell_row;
         img_prompt_cells = n_prompt;
         img_active = true;
@@ -2720,11 +2953,17 @@ struct Engine {
                                    cudaMemcpyDeviceToDevice, st));
             }
             if (a.kc[l] && a.pos > 0) {
+                DevScope ds(kvr ? kv_dev : -1);
+                cudaStream_t cs = kvr ? ar_kv.st : st;
                 CK(cudaMemcpy2DAsync(b.kc[l], row, a.kc[l], row, (size_t) a.pos * g.head_dim * kv_elem(), (size_t) g.n_head_kv,
-                                     cudaMemcpyDeviceToDevice, st));
+                                     cudaMemcpyDeviceToDevice, cs));
                 CK(cudaMemcpy2DAsync(b.vc[l], row, a.vc[l], row, (size_t) a.pos * g.head_dim * kv_elem(), (size_t) g.n_head_kv,
-                                     cudaMemcpyDeviceToDevice, st));
+                                     cudaMemcpyDeviceToDevice, cs));
             }
+        }
+        if (kvr) {   // (the cache's copies are on the cache card's stream)
+            DevScope ds(kv_dev);
+            CK(cudaStreamSynchronize(ar_kv.st));
         }
         CK(cudaMemcpyAsync(b.hlast, a.hlast, (size_t) g.n_embd * 4, cudaMemcpyDeviceToDevice, st));
         CK(cudaStreamSynchronize(st));
@@ -2876,7 +3115,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     for (const auto& pk : m.packed) packed_bytes += std::get<2>(pk);
     size_t main_need = 0;   // the main layers' experts (the MTP block's can go to the CPU, see below)
     for (Layer& L : m.layers) main_need += L.stride * (size_t) ne + kMmqTail;
-    const size_t slack = ((size_t) 512 << 20) + (E.kAttScoreFloats - ((size_t) 16 << 20)) * 6;   // reserve + scores
+    const size_t att_bytes = E.kvr ? 0 : (E.kAttScoreFloats - ((size_t) 16 << 20)) * 6;   // att_s (4 B) + att_p16 (2 B), here
+    const size_t slack = ((size_t) 512 << 20) + att_bytes;   // reserve + scores
     const bool mtp_cpu_ok = m.has_mtp && std::getenv("STRATA_Q36_NO_MTP_CPU") == nullptr;
     if (slots <= 0 && vram_gib < 0 && total > budget && packed_bytes > 0 &&
         (total <= budget + packed_bytes || (mtp_cpu_ok && main_need <= budget + packed_bytes + slack)) &&
@@ -2903,7 +3143,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     for (Layer& L : m.layers) total_main += L.stride * (size_t) ne + kMmqTail;
     bool mtp_only = false;
     if (slots <= 0 && vram_gib < 0 && m.has_mtp && total > budget2 && std::getenv("STRATA_Q36_NO_MTP_CPU") == nullptr) {
-        const size_t att_save = (E.kAttScoreFloats - ((size_t) 16 << 20)) * 6;   // att_s (4 B) + att_p16 (2 B)
+        const size_t att_save = att_bytes;
         const size_t small_reserve = (size_t) 256 << 20;
         const size_t room = fr + att_save > small_reserve ? fr + att_save - small_reserve : 0;
         if (total_main + ((size_t) 64 << 20) <= budget2) {
@@ -2913,10 +3153,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             CK(cudaMemGetInfo(&fr, &tot));
             budget2 = fr > small_reserve ? fr - small_reserve : 0;
             mtp_only = total_main + ((size_t) 64 << 20) <= budget2;
-            std::fprintf(stderr, "strata-q36: the experts nearly fit: the attention scores buffer at 64 MB and the VRAM "
-                         "reserve at 256 MiB (instead of 768) so that every main layer's experts fit; a driver or "
-                         "another program needing more VRAM later can make it fail - --expert-vram GiB sets the experts' "
-                         "budget instead\n");
+            std::fprintf(stderr, "strata-q36: the experts nearly fit: %sthe VRAM reserve at 256 MiB (instead of 768) so that "
+                         "every main layer's experts fit; a driver or another program needing more VRAM later can make it "
+                         "fail - --expert-vram GiB sets the experts' budget instead\n",
+                         E.kvr ? "" : "the attention scores buffer at 64 MB and ");
         }
     }
     if (slots <= 0 && total <= budget2 && total + ((size_t) 256 << 20) <= fr) {
@@ -3796,6 +4036,7 @@ int strata::qwen35::run(int argc, char** argv) {
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false, kv16 = false;
+    int kv_gpu = -1;   // --kv-gpu N: the K / V cache and the attention on device N (-1: all on the main device)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -3838,6 +4079,18 @@ int strata::qwen35::run(int argc, char** argv) {
             if (v == "f16" || v == "fp16" || v == "half") kv16 = true;
             else if (v == "f32" || v == "fp32" || v == "float") kv16 = false;
             else std::fprintf(stderr, "strata-q36: ignoring --kv %s (this family's cache is f16 or f32)\n", v.c_str());
+        }
+        else if (a == "--kv-gpu") {
+            // the cache and the attention on another card (the weights and the experts stay on the first of --gpu's cards): a
+            // device number among the visible ones, 0 = the first of --gpu (the main one: the same path on one card, a check)
+            const std::string v = next();
+            char* endp = nullptr;
+            const long d = std::strtol(v.c_str(), &endp, 10);
+            if (v.empty() || *endp != 0 || d < 0 || d > 64) {
+                std::fprintf(stderr, "strata-q36: --kv-gpu takes a device number (0, 1, ...), not \"%s\"\n", v.c_str());
+                return 2;
+            }
+            kv_gpu = (int) d;
         }
         else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
@@ -3883,6 +4136,42 @@ int strata::qwen35::run(int argc, char** argv) {
     Engine E;
     E.use_graph = graph;
     E.kv16 = kv16;
+    if (kv_gpu >= 0) {
+        int n_dev = 0;
+        CK(cudaGetDeviceCount(&n_dev));
+        if (kv_gpu >= n_dev) {
+            std::fprintf(stderr, "strata-q36: --kv-gpu %d: only %d CUDA device%s visible%s (--gpu 0,1 makes two visible: the first "
+                         "keeps the weights and the experts, --kv-gpu 1 puts the cache and the attention on the second)\n",
+                         kv_gpu, n_dev, n_dev == 1 ? "" : "s", n_dev == 1 ? " - the server's \"gpu\" setting would add --layer-split, "
+                         "put \"--gpu\", \"0,1\" in the engine's args instead" : "");
+            return 2;
+        }
+        {   // does this build carry kernels for that card?  (an --arch list at build time; tools/build_rhel7.sh reads every card's)
+            DevScope ds(kv_gpu);
+            cudaFuncAttributes fa{};
+            cudaError_t e = cudaFree(nullptr);
+            if (e == cudaSuccess) e = cudaFuncGetAttributes(&fa, k_attn_prep<float>);
+            if (e != cudaSuccess) {
+                cudaDeviceProp pr0{};
+                cudaGetDeviceProperties(&pr0, kv_gpu);
+                std::fprintf(stderr, "strata-q36: --kv-gpu %d (%s, compute capability %d.%d): %s - this build has no kernels for "
+                             "that card.  Build with its architecture too: tools/build_rhel7.sh --arch \"61;%d%d\" (the card "
+                             "numbers: nvidia-smi --query-gpu=name,compute_cap --format=csv)\n", kv_gpu, pr0.name, pr0.major,
+                             pr0.minor, cudaGetErrorString(e), pr0.major, pr0.minor);
+                return 2;
+            }
+        }
+        int cur_dev = 0;
+        CK(cudaGetDevice(&cur_dev));
+        E.kvr = true;
+        E.kv_dev = kv_gpu;
+        E.use_graph = false;   // a CUDA graph cannot span two devices
+        E.mtp_graph = false;
+        cudaDeviceProp pr{};
+        CK(cudaGetDeviceProperties(&pr, kv_gpu));
+        std::fprintf(stderr, "strata-q36: --kv-gpu %d: the K / V cache and the attention on %s (%.1f GiB), the weights and the experts on "
+                     "device %d; no CUDA graphs\n", kv_gpu, pr.name, (double) pr.totalGlobalMem / (1 << 30), cur_dev);
+    }
     if (chunk == 0) {
         // auto: the largest chunk (4096 .. 1024) that fits beside every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
         // experts over PCIe once, so a bigger chunk pays that once for more tokens)
@@ -3908,7 +4197,8 @@ int strata::qwen35::run(int argc, char** argv) {
             // (measured on a 32 GB R9700 at 8192 cells, 512 chunk: 1.77 GiB of buffers + K / V; the free room after init must still hold
             // every expert and the 0.77 GiB reserve, or place_experts gives the packed decode copies back - slower decode - or goes hybrid)
             const int ns = std::max(1, batch);
-            const double kv_one = kv16 ? 22528.0 : 45056.0, kv_shared = kv16 ? 3072.0 : 5120.0;   // per cell: a session's K / V, and the fp16 copies the prompt attention keeps (--kv f16: none)
+            double kv_one = kv16 ? 22528.0 : 45056.0, kv_shared = kv16 ? 3072.0 : 5120.0;   // per cell: a session's K / V, and the fp16 copies the prompt attention keeps (--kv f16: none)
+            if (E.kvr) kv_one = kv_shared = 0.0;   // --kv-gpu: they are the other card's
             const double sess_extra = std::max(0.0, (double) ctx * (kv_one * ns + kv_shared) - 8192.0 * (kv_one + kv_shared));
             const int cap = ns > 1 ? 1024 : 4096;
             for (int c : {4096, 2048, 1024})
