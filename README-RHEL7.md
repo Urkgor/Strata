@@ -199,4 +199,5 @@ Envoyez cette sortie avec l'erreur : elle suffit à savoir quels types manquent.
 | `no kernel image is available` | mauvais `--arch` pour la carte |
 | `--kv-gpu 1: only 1 CUDA device visible` | une seule carte visible : mettre `"--gpu", "0,1"` dans `args` du fichier de configuration (pas la clé `"gpu"`, qui ajoute `--layer-split`) |
 | `--kv-gpu N … this build has no kernels for that card` | le binaire n'a pas l'architecture de la 2e carte : `tools/build_rhel7.sh --arch "61;XX"` (`nvidia-smi --query-gpu=name,compute_cap --format=csv`) |
+| `attention scores GEMM failed` (ou `values`) | échec de cuBLAS dans l'attention. Le moteur à jour ajoute le statut, la carte, la VRAM libre et l'erreur CUDA éventuelle d'un noyau précédent : envoyez cette ligne et les lignes `--kv-gpu` du journal. `ALLOC_FAILED` = plus de mémoire sur la carte (contexte plus court, `--kv f16`) ; avec `--kv-gpu`, un test cuBLAS est fait dès le chargement sur la 2e carte |
 | `not enough VRAM on device N for the K / V cache` | le contexte ne tient pas sur la 2e carte : `--kv f16`, un `--max-context` plus petit ou moins de `--slots` |

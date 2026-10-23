@@ -1549,7 +1549,7 @@ struct Engine {
                 std::fprintf(stderr, "strata-q36: --kv-gpu %d: K / V cache%s of %.2f GiB per session at a context of %d, %.2f "
                              "GiB free on that card (%d session%s)\n", kv_dev, kv16 ? " (f16)" : "", (double) per_kv / (1 << 30), ctx,
                              (double) frk / (1 << 30), n_sess, n_sess > 1 ? "s" : "");
-                if (per_kv * (size_t) n_sess + ((size_t) 256 << 20) > frk) {
+                if (per_kv * (size_t) n_sess + ((size_t) 512 << 20) > frk) {
                     std::fprintf(stderr, "strata-q36: not enough VRAM on device %d for the K / V cache of %d session%s at a context "
                                  "of %d (%.2f GiB each, %.2f GiB free): %s\n", kv_dev, n_sess, n_sess > 1 ? "s" : "", ctx,
                                  (double) per_kv / (1 << 30), (double) frk / (1 << 30),
@@ -1999,6 +1999,35 @@ struct Engine {
         }
     }
 
+    /// A cuBLAS call of the attention failed: say which, with the status, the device and what is left there, and whether an earlier
+    /// kernel left an error behind (it would show up as the GEMM's failure).
+    [[noreturn]] static void gemm_failed(const char* what, cublasStatus_t s, int P, int nt, int ldp) {
+        int dev = -1;
+        cudaGetDevice(&dev);
+        size_t fr = 0, tot = 0;
+        cudaMemGetInfo(&fr, &tot);
+        const cudaError_t last = cudaGetLastError();
+        const cudaError_t sync = cudaDeviceSynchronize();
+        const char* name = "?";
+#if !defined(__HIPCC__)
+        switch (s) {
+            case CUBLAS_STATUS_NOT_INITIALIZED: name = "NOT_INITIALIZED"; break;
+            case CUBLAS_STATUS_ALLOC_FAILED: name = "ALLOC_FAILED (no memory left for cuBLAS)"; break;
+            case CUBLAS_STATUS_INVALID_VALUE: name = "INVALID_VALUE"; break;
+            case CUBLAS_STATUS_ARCH_MISMATCH: name = "ARCH_MISMATCH"; break;
+            case CUBLAS_STATUS_MAPPING_ERROR: name = "MAPPING_ERROR"; break;
+            case CUBLAS_STATUS_EXECUTION_FAILED: name = "EXECUTION_FAILED"; break;
+            case CUBLAS_STATUS_INTERNAL_ERROR: name = "INTERNAL_ERROR"; break;
+            case CUBLAS_STATUS_NOT_SUPPORTED: name = "NOT_SUPPORTED"; break;
+            default: break;
+        }
+#endif
+        std::fprintf(stderr, "strata-q36: attention %s GEMM failed: cuBLAS status %d %s, on device %d (%.2f GiB free there), P %d, "
+                     "%d queries, ld %d; CUDA last error: %s; after a sync: %s\n", what, (int) s, name, dev, (double) fr / (1 << 30),
+                     P, nt, ldp, cudaGetErrorString(last), cudaGetErrorString(sync));
+        std::exit(1);
+    }
+
     /// What an attention layer needs besides the cache: a stream, a cuBLAS handle and scratch on the device that runs it, and the
     /// rows' tables there.  The main device's are the engine's own members (ar_main()); with --kv-gpu the other card has its own (ar_kv).
     struct AttnRes {
@@ -2066,6 +2095,24 @@ struct Engine {
         R.pl = dalloc((size_t) att_rows * n_chunk);
         pk_kv = dalloc((size_t) kAttnHdr + T * (2 * H * HD + 2 * HKV * HD));
         att_kv = dalloc(T * H * HD);
+        {   // one small scores-shaped GEMM now: cuBLAS takes its own memory on this card at the first call, which must happen before
+            // the caches are sized against what is free, and a card cuBLAS cannot use is said here and not in the first prompt
+            const int P = 256, nt = 8, G = (int) (H / HKV), ldp = 256;
+            __half* a = dalloc_t<__half>((size_t) P * HD);
+            const float one = 1.0f, zero = 0.0f;
+            const cublasStatus_t cs = cublasGemmStridedBatchedEx(
+                R.blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, (int) HD, &one, a, CUDA_R_16F, (int) HD, 0, R.q16, CUDA_R_16F,
+                (int) (H * HD), (long long) HD, &zero, R.att_s, CUDA_R_32F, ldp, (long long) nt * ldp, G, CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT);
+            if (cs != CUBLAS_STATUS_SUCCESS) {
+                cudaDeviceProp pr{};
+                cudaGetDeviceProperties(&pr, kv_dev);
+                std::fprintf(stderr, "strata-q36: --kv-gpu %d (%s, compute capability %d.%d): ", kv_dev, pr.name, pr.major, pr.minor);
+                gemm_failed("test", cs, P, nt, ldp);
+            }
+            CK(cudaStreamSynchronize(R.st));
+            CK(cudaFree(a));
+        }
         const int32_t* hdr = reinterpret_cast<const int32_t*>(pk_kv);   // the header's scalars and rows, as the kernels read them
         R.delta = hdr + 1;
         R.rcell = hdr + 2;
@@ -2162,13 +2209,10 @@ struct Engine {
                                             : R.k16 + (size_t) kvh * P * HD;
                     const __half* Qh = R.q16 + ((size_t) t0 * H + kvh * G) * HD;
                     float* Sh = R.att_s + (size_t) kvh * G * nt * ldp;
-                    if (cublasGemmStridedBatchedEx(R.blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh, CUDA_R_16F, HD,
-                                                   0, Qh, CUDA_R_16F, H * HD, HD, &zero, Sh, CUDA_R_32F, ldp,
-                                                   (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
-                        CUBLAS_STATUS_SUCCESS) {
-                        std::fprintf(stderr, "strata-q36: attention scores GEMM failed\n");
-                        std::exit(1);
-                    }
+                    const cublasStatus_t cs = cublasGemmStridedBatchedEx(
+                        R.blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh, CUDA_R_16F, HD, 0, Qh, CUDA_R_16F, H * HD, HD,
+                        &zero, Sh, CUDA_R_32F, ldp, (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+                    if (cs != CUBLAS_STATUS_SUCCESS) gemm_failed("scores", cs, P, nt, ldp);
                 }
                 k_attn_softmax16<<<dim3(nt, H), kThreads, 0, R.st>>>(R.att_s, R.att_p16, ldp, nt, P, (int) p0 + t0,
                                                                    1.0f / sqrtf((float) HD));
@@ -2177,13 +2221,10 @@ struct Engine {
                                             : R.v16 + (size_t) kvh * P * HD;
                     const __half* Sh = R.att_p16 + (size_t) kvh * G * nt * ldp;
                     float* Oh = att_ + ((size_t) t0 * H + kvh * G) * HD;
-                    if (cublasGemmStridedBatchedEx(R.blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, Vh, CUDA_R_16F, HD,
-                                                   0, Sh, CUDA_R_16F, ldp, (long long) nt * ldp, &zero, Oh, CUDA_R_32F,
-                                                   H * HD, HD, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) !=
-                        CUBLAS_STATUS_SUCCESS) {
-                        std::fprintf(stderr, "strata-q36: attention values GEMM failed\n");
-                        std::exit(1);
-                    }
+                    const cublasStatus_t cs = cublasGemmStridedBatchedEx(
+                        R.blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, Vh, CUDA_R_16F, HD, 0, Sh, CUDA_R_16F, ldp,
+                        (long long) nt * ldp, &zero, Oh, CUDA_R_32F, H * HD, HD, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+                    if (cs != CUBLAS_STATUS_SUCCESS) gemm_failed("values", cs, P, nt, ldp);
                 }
             }
             k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, R.st>>>(att_, R.gate, (int64_t) T * H * HD);
