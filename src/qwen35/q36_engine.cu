@@ -28,6 +28,7 @@
 #include "strata/qwen35/engine.hpp"
 #include "q36_kernels.cuh"
 #include "q36_attn.cuh"
+#include "q36_blas_check.hpp"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -2041,6 +2042,7 @@ struct Engine {
         __half *att_p16 = nullptr, *k16 = nullptr, *v16 = nullptr, *q16 = nullptr;
         size_t score_floats = 0;
         bool use_blas = true;   // false: the prompt chunks' attention does not use cuBLAS (the split-K kernels do it)
+        int blas_min_nt = 0;    // query slices smaller than this go to the split-K kernels (blas_selftest: cuBLAS is wrong or fails there)
         const int32_t *delta = nullptr, *rcell = nullptr, *rslot = nullptr, *rdelta = nullptr;
         float* const *kc_tab = nullptr, *const *vc_tab = nullptr;
     };
@@ -2064,6 +2066,89 @@ struct Engine {
     cudaEvent_t ev_in = nullptr, ev_out = nullptr;    // the inputs are in host memory / the output is
     std::vector<float*> qn_kv, kn_kv;                 // per attention layer (the MTP block's last): q / k norm weights on that card
     int32_t* d_mtab_kv = nullptr;                     // the M-RoPE table there (vision)
+
+    /// --kv-gpu: the two prompt-attention GEMMs on the cache's card against a host reference (q36_blas_check.hpp), on the shapes of a
+    /// prompt's tail and of bigger slices.  A T1000 (TU117) answered INTERNAL_ERROR for a 9-query slice; a card can also answer
+    /// SUCCESS and be wrong.  Sets R.blas_min_nt (the prompt attention uses cuBLAS from that many queries per slice) or R.use_blas
+    /// = false when even the largest tested shape is bad.  STRATA_Q36_NO_BLAS_TEST=1 skips it.
+    void blas_selftest(AttnRes& R) {
+        if (std::getenv("STRATA_Q36_NO_BLAS_TEST")) return;
+        const auto& g = m->g;
+        const int H = (int) g.n_head, HKV = (int) g.n_head_kv, HD = (int) g.head_dim, G = H / HKV;
+        const auto& shapes = q36chk::shapes();
+        int Pm = 0, ntm = 0;
+        for (const auto& s : shapes) {
+            Pm = std::max(Pm, s.P);
+            ntm = std::max(ntm, s.nt);
+        }
+        const int ldm = (Pm + 7) / 8 * 8;
+        __half *dK = dalloc_t<__half>((size_t) Pm * HD), *dV = dalloc_t<__half>((size_t) Pm * HD),
+               *dQ = dalloc_t<__half>((size_t) ntm * H * HD), *dS = dalloc_t<__half>((size_t) G * ntm * ldm);
+        float *dC = dalloc((size_t) G * ntm * ldm), *dO = dalloc((size_t) ntm * H * HD);
+        const float one = 1.0f, zero = 0.0f;
+        int bad_nt = 0, n_bad = 0;
+        auto to_half = [](const std::vector<float>& f) {
+            std::vector<__half> h(f.size());
+            for (size_t i = 0; i < f.size(); ++i) h[i] = __float2half(f[i]);
+            return h;
+        };
+        for (const auto& sh : shapes) {
+            const int nt = sh.nt, P = sh.P, ldp = (P + 7) / 8 * 8;
+            std::vector<float> K((size_t) P * HD), V((size_t) P * HD), Q((size_t) nt * H * HD), S((size_t) G * nt * ldp);
+            q36chk::fill(K, 1);
+            q36chk::fill(V, 2);
+            q36chk::fill(Q, 3);
+            q36chk::fill(S, 4);
+            const auto hK = to_half(K), hV = to_half(V), hQ = to_half(Q), hS = to_half(S);
+            CK(cudaMemcpy(dK, hK.data(), hK.size() * sizeof(__half), cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dV, hV.data(), hV.size() * sizeof(__half), cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dQ, hQ.data(), hQ.size() * sizeof(__half), cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dS, hS.data(), hS.size() * sizeof(__half), cudaMemcpyHostToDevice));
+            CK(cudaMemset(dC, 0xff, (size_t) G * nt * ldp * 4));   // NaN: an output that is not written is wrong
+            CK(cudaMemset(dO, 0xff, (size_t) nt * H * HD * 4));
+            CK(cudaDeviceSynchronize());   // the uploads and fills (legacy stream) before the GEMMs on R.st
+            // the engine's two calls (same arguments as attn_core's)
+            const cublasStatus_t cs1 = cublasGemmStridedBatchedEx(
+                R.blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, dK, CUDA_R_16F, HD, 0, dQ, CUDA_R_16F, H * HD, HD, &zero, dC,
+                CUDA_R_32F, ldp, (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            const cublasStatus_t cs2 = cublasGemmStridedBatchedEx(
+                R.blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, dV, CUDA_R_16F, HD, 0, dS, CUDA_R_16F, ldp,
+                (long long) nt * ldp, &zero, dO, CUDA_R_32F, H * HD, HD, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            const cudaError_t sync = cudaStreamSynchronize(R.st);
+            std::vector<float> C((size_t) G * nt * ldp), O((size_t) nt * H * HD);
+            CK(cudaMemcpy(C.data(), dC, C.size() * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(O.data(), dO, O.size() * 4, cudaMemcpyDeviceToHost));
+            double w1 = 0, w2 = 0;
+            const bool ok1 = cs1 == CUBLAS_STATUS_SUCCESS && sync == cudaSuccess && q36chk::check_scores(C.data(), K.data(), Q.data(), H, HD, G, nt, P, ldp, &w1);
+            const bool ok2 = cs2 == CUBLAS_STATUS_SUCCESS && sync == cudaSuccess && q36chk::check_values(O.data(), S.data(), V.data(), H, HD, G, nt, P, ldp, &w2);
+            if (!ok1 || !ok2) {
+                bad_nt = std::max(bad_nt, nt);
+                if (n_bad++ < 6)
+                    std::fprintf(stderr, "strata-q36: cuBLAS check on device %d, %d queries x %d cells: scores %s (status %d, error x%.3g of the "
+                                 "tolerance), values %s (status %d, error x%.3g)%s\n", kv_dev, nt, P, ok1 ? "right" : "WRONG", (int) cs1, w1,
+                                 ok2 ? "right" : "WRONG", (int) cs2, w2, sync == cudaSuccess ? "" : " - a CUDA error followed");
+            }
+            if (sync != cudaSuccess) {   // a sticky error would break everything after it: no point in going on
+                std::fprintf(stderr, "strata-q36: cuBLAS check on device %d: CUDA error %s\n", kv_dev, cudaGetErrorString(sync));
+                std::exit(1);
+            }
+        }
+        CK(cudaFree(dK)); CK(cudaFree(dV)); CK(cudaFree(dQ)); CK(cudaFree(dS)); CK(cudaFree(dC)); CK(cudaFree(dO));
+        (void) cudaGetLastError();
+        if (bad_nt == 0) {
+            std::fprintf(stderr, "strata-q36: cuBLAS check on device %d: the prompt attention GEMMs are right on all %zu shapes (%d .. %d "
+                         "queries)\n", kv_dev, shapes.size(), shapes.front().nt, shapes.back().nt);
+        } else if (bad_nt >= shapes.back().nt) {
+            R.use_blas = false;
+            std::fprintf(stderr, "strata-q36: cuBLAS check on device %d: the prompt attention GEMMs are wrong or fail up to %d queries, the "
+                         "largest tested: this card's prompt attention runs on the split-K kernels (slower on a long prompt)\n", kv_dev, bad_nt);
+        } else {
+            R.blas_min_nt = bad_nt + 1;
+            std::fprintf(stderr, "strata-q36: cuBLAS check on device %d: the prompt attention GEMMs are wrong or fail for slices of up to %d "
+                         "queries: slices below %d queries run on the split-K kernels, the bigger ones on cuBLAS\n", kv_dev, bad_nt,
+                         R.blas_min_nt);
+        }
+    }
 
     /// Allocates the cache's card side of --kv-gpu (before the sessions' caches): stream, cuBLAS handle, the attention's scratch,
     /// the hand-off buffers and the layers' norm weights.
@@ -2100,25 +2185,7 @@ struct Engine {
         R.pl = dalloc((size_t) att_rows * n_chunk);
         pk_kv = dalloc((size_t) kAttnHdr + T * (2 * H * HD + 2 * HKV * HD));
         att_kv = dalloc(T * H * HD);
-        {   // one small scores-shaped GEMM now: cuBLAS takes its own memory on this card at the first call, which must happen before
-            // the caches are sized against what is free, and a card cuBLAS cannot use is said here and not in the first prompt
-            const int P = 256, nt = 8, G = (int) (H / HKV), ldp = 256;
-            __half* a = dalloc_t<__half>((size_t) P * HD);
-            const float one = 1.0f, zero = 0.0f;
-            const cublasStatus_t cs = cublasGemmStridedBatchedEx(
-                R.blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, (int) HD, &one, a, CUDA_R_16F, (int) HD, 0, R.q16, CUDA_R_16F,
-                (int) (H * HD), (long long) HD, &zero, R.att_s, CUDA_R_32F, ldp, (long long) nt * ldp, G, CUBLAS_COMPUTE_32F,
-                CUBLAS_GEMM_DEFAULT);
-            if (cs != CUBLAS_STATUS_SUCCESS) {
-                cudaDeviceProp pr{};
-                cudaGetDeviceProperties(&pr, kv_dev);
-                std::fprintf(stderr, "strata-q36: --kv-gpu %d (%s, compute capability %d.%d): ", kv_dev, pr.name, pr.major, pr.minor);
-                gemm_failed("test", cs, P, nt, ldp);
-                R.use_blas = false;
-            }
-            CK(cudaStreamSynchronize(R.st));
-            CK(cudaFree(a));
-        }
+        blas_selftest(R);   // (also cuBLAS's first call on this card: it takes its own memory then, before the caches are sized)
         const int32_t* hdr = reinterpret_cast<const int32_t*>(pk_kv);   // the header's scalars and rows, as the kernels read them
         R.delta = hdr + 1;
         R.rcell = hdr + 2;
@@ -2195,7 +2262,7 @@ struct Engine {
         };
         if (kv16) prep(std::type_identity<__half>{});
         else prep(std::type_identity<float>{});
-        auto split_k = [&]() {
+        auto split_k = [&](int tb, int te) {   // the queries tb .. te - 1 of the chunk
             // split-K over 256-cell chunks; the chunk grid covers every cell a row can see (graph mode: the whole
             // context, past-the-end chunks return at once)
             const int rows_per = att_rows / H;
@@ -2205,8 +2272,8 @@ struct Engine {
             const bool gqa_attn_ok = HD == q36k::kAttnHD && kChunkCells == q36k::kAttnChunk && kThreads == q36k::kAttnThreads &&
                                      HKV > 0 && H == HKV * q36k::kAttnGroup;
 #endif
-            for (int t0 = 0; t0 < T; t0 += rows_per) {
-                const int nt = std::min(rows_per, T - t0);
+            for (int t0 = tb; t0 < te; t0 += rows_per) {
+                const int nt = std::min(rows_per, te - t0);
                 const int nc = graph_mode ? n_chunk
                                           : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
                 // grouped queries (16 heads over 2 KV heads): one block serves the 8 heads of a KV head and reads K through
@@ -2230,56 +2297,60 @@ struct Engine {
                 k_attn_merge<<<nt * H, HD, 0, R.st>>>(R.pacc, R.pm, R.pl, R.gate, dpos, t0, H, n_chunk, att_, rs);
             }
         };
-        // a prompt chunk: the GEMMs, unless cuBLAS fails (this card, this shape): then the split-K kernels, whose result
-        // the q, gate and cache that k_attn_prep wrote are all they need
-        auto gemm_attn = [&]() -> bool {
-            // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
-            // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
-            // FP16 probabilities; the queries in slices whose scores fit
+        // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV head (its query heads one
+        // strided batch over the shared K / V), the causal softmax in between writing FP16 probabilities; the queries in slices whose
+        // scores fit.  A slice goes to the split-K kernels instead (q, gate and the cache that k_attn_prep wrote are all they need) when
+        // it is smaller than the card's check allows (blas_min_nt) or cuBLAS fails on it.
+        auto gemm_slice = [&](int t0, int nt, int P, int ldp, int G) -> bool {
+            const float one = 1.0f, zero = 0.0f;
+            for (int kvh = 0; kvh < HKV; ++kvh) {
+                // --kv f16: the cache rows are the FP16 operand already (cells HD apart, a KV head ctx * HD)
+                const __half* Kh = kv16 ? reinterpret_cast<const __half*>(kc[li]) + (size_t) kvh * ctx * HD
+                                        : R.k16 + (size_t) kvh * P * HD;
+                const __half* Qh = R.q16 + ((size_t) t0 * H + kvh * G) * HD;
+                float* Sh = R.att_s + (size_t) kvh * G * nt * ldp;
+                const cublasStatus_t cs = cublasGemmStridedBatchedEx(
+                    R.blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh, CUDA_R_16F, HD, 0, Qh, CUDA_R_16F, H * HD, HD,
+                    &zero, Sh, CUDA_R_32F, ldp, (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+                if (cs != CUBLAS_STATUS_SUCCESS) {
+                    gemm_failed("scores", cs, P, nt, ldp);
+                    return false;
+                }
+            }
+            k_attn_softmax16<<<dim3(nt, H), kThreads, 0, R.st>>>(R.att_s, R.att_p16, ldp, nt, P, (int) p0 + t0,
+                                                               1.0f / sqrtf((float) HD));
+            for (int kvh = 0; kvh < HKV; ++kvh) {
+                const __half* Vh = kv16 ? reinterpret_cast<const __half*>(vc[li]) + (size_t) kvh * ctx * HD
+                                        : R.v16 + (size_t) kvh * P * HD;
+                const __half* Sh = R.att_p16 + (size_t) kvh * G * nt * ldp;
+                float* Oh = att_ + ((size_t) t0 * H + kvh * G) * HD;
+                const cublasStatus_t cs = cublasGemmStridedBatchedEx(
+                    R.blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, Vh, CUDA_R_16F, HD, 0, Sh, CUDA_R_16F, ldp,
+                    (long long) nt * ldp, &zero, Oh, CUDA_R_32F, H * HD, HD, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+                if (cs != CUBLAS_STATUS_SUCCESS) {
+                    gemm_failed("values", cs, P, nt, ldp);
+                    return false;
+                }
+            }
+            k_gate_mul<<<grid1((int64_t) nt * H * HD), kThreads, 0, R.st>>>(att_ + (size_t) t0 * H * HD, R.gate + (size_t) t0 * H * HD,
+                                                                          (int64_t) nt * H * HD);
+            return true;
+        };
+        auto gemm_attn = [&]() {
             const int P = (int) p0 + T;
             const int ldp = (P + 7) / 8 * 8;
             const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (R.score_floats / ((size_t) H * ldp))));
             const int G = H / HKV;
-            const float one = 1.0f, zero = 0.0f;
             if (!kv16)
                 k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, R.st>>>(kc[li], vc[li], R.k16, R.v16, ctx, P, HD, HKV);
             k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, R.st>>>(R.q, R.q16, (int64_t) T * H * HD);
             for (int t0 = 0; t0 < T; t0 += tq) {
                 const int nt = std::min(tq, T - t0);
-                for (int kvh = 0; kvh < HKV; ++kvh) {
-                    // --kv f16: the cache rows are the FP16 operand already (cells HD apart, a KV head ctx * HD)
-                    const __half* Kh = kv16 ? reinterpret_cast<const __half*>(kc[li]) + (size_t) kvh * ctx * HD
-                                            : R.k16 + (size_t) kvh * P * HD;
-                    const __half* Qh = R.q16 + ((size_t) t0 * H + kvh * G) * HD;
-                    float* Sh = R.att_s + (size_t) kvh * G * nt * ldp;
-                    const cublasStatus_t cs = cublasGemmStridedBatchedEx(
-                        R.blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh, CUDA_R_16F, HD, 0, Qh, CUDA_R_16F, H * HD, HD,
-                        &zero, Sh, CUDA_R_32F, ldp, (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-                    if (cs != CUBLAS_STATUS_SUCCESS) {
-                        gemm_failed("scores", cs, P, nt, ldp);
-                        return false;
-                    }
-                }
-                k_attn_softmax16<<<dim3(nt, H), kThreads, 0, R.st>>>(R.att_s, R.att_p16, ldp, nt, P, (int) p0 + t0,
-                                                                   1.0f / sqrtf((float) HD));
-                for (int kvh = 0; kvh < HKV; ++kvh) {
-                    const __half* Vh = kv16 ? reinterpret_cast<const __half*>(vc[li]) + (size_t) kvh * ctx * HD
-                                            : R.v16 + (size_t) kvh * P * HD;
-                    const __half* Sh = R.att_p16 + (size_t) kvh * G * nt * ldp;
-                    float* Oh = att_ + ((size_t) t0 * H + kvh * G) * HD;
-                    const cublasStatus_t cs = cublasGemmStridedBatchedEx(
-                        R.blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, Vh, CUDA_R_16F, HD, 0, Sh, CUDA_R_16F, ldp,
-                        (long long) nt * ldp, &zero, Oh, CUDA_R_32F, H * HD, HD, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-                    if (cs != CUBLAS_STATUS_SUCCESS) {
-                        gemm_failed("values", cs, P, nt, ldp);
-                        return false;
-                    }
-                }
+                if (nt < R.blas_min_nt || !gemm_slice(t0, nt, P, ldp, G)) split_k(t0, t0 + nt);
             }
-            k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, R.st>>>(att_, R.gate, (int64_t) T * H * HD);
-            return true;
         };
-        if (T <= kGemmT || !R.use_blas || !gemm_attn()) split_k();
+        if (T <= kGemmT || !R.use_blas) split_k(0, T);
+        else gemm_attn();
     }
 
     /// One layer for T rows: x (the residual) += mixer(h); then MoE; x += moe; `hout` = rms(x) * wn (the next norm).
