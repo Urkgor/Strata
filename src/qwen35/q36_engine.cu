@@ -2001,9 +2001,11 @@ struct Engine {
         }
     }
 
-    /// A cuBLAS call of the attention failed: say which, with the status, the device and what is left there, and whether an earlier
-    /// kernel left an error behind (it would show up as the GEMM's failure).
-    [[noreturn]] static void gemm_failed(const char* what, cublasStatus_t s, int P, int nt, int ldp) {
+    /// A cuBLAS call of the attention failed (the first few times: said, with the status, the device, what is left there, the shapes,
+    /// and whether an earlier kernel left an error behind).  The caller then runs that call's attention on the split-K kernels.
+    static void gemm_failed(const char* what, cublasStatus_t s, int P, int nt, int ldp) {
+        static int said = 0;
+        if (said++ >= 3) return;
         int dev = -1;
         cudaGetDevice(&dev);
         size_t fr = 0, tot = 0;
@@ -2025,9 +2027,9 @@ struct Engine {
         }
 #endif
         std::fprintf(stderr, "strata-q36: attention %s GEMM failed: cuBLAS status %d %s, on device %d (%.2f GiB free there), P %d, "
-                     "%d queries, ld %d; CUDA last error: %s; after a sync: %s\n", what, (int) s, name, dev, (double) fr / (1 << 30),
-                     P, nt, ldp, cudaGetErrorString(last), cudaGetErrorString(sync));
-        std::exit(1);
+                     "%d queries, ld %d; CUDA last error: %s; after a sync: %s.  This attention runs on the split-K kernels "
+                     "instead (slower on a long prompt chunk)%s\n", what, (int) s, name, dev, (double) fr / (1 << 30), P, nt,
+                     ldp, cudaGetErrorString(last), cudaGetErrorString(sync), said == 3 ? " (no more of these messages)" : "");
     }
 
     /// What an attention layer needs besides the cache: a stream, a cuBLAS handle and scratch on the device that runs it, and the
@@ -2038,6 +2040,7 @@ struct Engine {
         float *q = nullptr, *gate = nullptr, *pacc = nullptr, *pm = nullptr, *pl = nullptr, *att_s = nullptr;
         __half *att_p16 = nullptr, *k16 = nullptr, *v16 = nullptr, *q16 = nullptr;
         size_t score_floats = 0;
+        bool use_blas = true;   // false: the prompt chunks' attention does not use cuBLAS (the split-K kernels do it)
         const int32_t *delta = nullptr, *rcell = nullptr, *rslot = nullptr, *rdelta = nullptr;
         float* const *kc_tab = nullptr, *const *vc_tab = nullptr;
     };
@@ -2111,6 +2114,7 @@ struct Engine {
                 cudaGetDeviceProperties(&pr, kv_dev);
                 std::fprintf(stderr, "strata-q36: --kv-gpu %d (%s, compute capability %d.%d): ", kv_dev, pr.name, pr.major, pr.minor);
                 gemm_failed("test", cs, P, nt, ldp);
+                R.use_blas = false;
             }
             CK(cudaStreamSynchronize(R.st));
             CK(cudaFree(a));
@@ -2191,46 +2195,7 @@ struct Engine {
         };
         if (kv16) prep(std::type_identity<__half>{});
         else prep(std::type_identity<float>{});
-        if (T > kGemmT) {
-            // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
-            // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
-            // FP16 probabilities; the queries in slices whose scores fit
-            const int P = (int) p0 + T;
-            const int ldp = (P + 7) / 8 * 8;
-            const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (R.score_floats / ((size_t) H * ldp))));
-            const int G = H / HKV;
-            const float one = 1.0f, zero = 0.0f;
-            if (!kv16)
-                k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, R.st>>>(kc[li], vc[li], R.k16, R.v16, ctx, P, HD, HKV);
-            k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, R.st>>>(R.q, R.q16, (int64_t) T * H * HD);
-            for (int t0 = 0; t0 < T; t0 += tq) {
-                const int nt = std::min(tq, T - t0);
-                for (int kvh = 0; kvh < HKV; ++kvh) {
-                    // --kv f16: the cache rows are the FP16 operand already (cells HD apart, a KV head ctx * HD)
-                    const __half* Kh = kv16 ? reinterpret_cast<const __half*>(kc[li]) + (size_t) kvh * ctx * HD
-                                            : R.k16 + (size_t) kvh * P * HD;
-                    const __half* Qh = R.q16 + ((size_t) t0 * H + kvh * G) * HD;
-                    float* Sh = R.att_s + (size_t) kvh * G * nt * ldp;
-                    const cublasStatus_t cs = cublasGemmStridedBatchedEx(
-                        R.blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh, CUDA_R_16F, HD, 0, Qh, CUDA_R_16F, H * HD, HD,
-                        &zero, Sh, CUDA_R_32F, ldp, (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-                    if (cs != CUBLAS_STATUS_SUCCESS) gemm_failed("scores", cs, P, nt, ldp);
-                }
-                k_attn_softmax16<<<dim3(nt, H), kThreads, 0, R.st>>>(R.att_s, R.att_p16, ldp, nt, P, (int) p0 + t0,
-                                                                   1.0f / sqrtf((float) HD));
-                for (int kvh = 0; kvh < HKV; ++kvh) {
-                    const __half* Vh = kv16 ? reinterpret_cast<const __half*>(vc[li]) + (size_t) kvh * ctx * HD
-                                            : R.v16 + (size_t) kvh * P * HD;
-                    const __half* Sh = R.att_p16 + (size_t) kvh * G * nt * ldp;
-                    float* Oh = att_ + ((size_t) t0 * H + kvh * G) * HD;
-                    const cublasStatus_t cs = cublasGemmStridedBatchedEx(
-                        R.blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, Vh, CUDA_R_16F, HD, 0, Sh, CUDA_R_16F, ldp,
-                        (long long) nt * ldp, &zero, Oh, CUDA_R_32F, H * HD, HD, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-                    if (cs != CUBLAS_STATUS_SUCCESS) gemm_failed("values", cs, P, nt, ldp);
-                }
-            }
-            k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, R.st>>>(att_, R.gate, (int64_t) T * H * HD);
-        } else {
+        auto split_k = [&]() {
             // split-K over 256-cell chunks; the chunk grid covers every cell a row can see (graph mode: the whole
             // context, past-the-end chunks return at once)
             const int rows_per = att_rows / H;
@@ -2264,7 +2229,57 @@ struct Engine {
                 else part(std::type_identity<float>{});
                 k_attn_merge<<<nt * H, HD, 0, R.st>>>(R.pacc, R.pm, R.pl, R.gate, dpos, t0, H, n_chunk, att_, rs);
             }
-        }
+        };
+        // a prompt chunk: the GEMMs, unless cuBLAS fails (this card, this shape): then the split-K kernels, whose result
+        // the q, gate and cache that k_attn_prep wrote are all they need
+        auto gemm_attn = [&]() -> bool {
+            // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
+            // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
+            // FP16 probabilities; the queries in slices whose scores fit
+            const int P = (int) p0 + T;
+            const int ldp = (P + 7) / 8 * 8;
+            const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (R.score_floats / ((size_t) H * ldp))));
+            const int G = H / HKV;
+            const float one = 1.0f, zero = 0.0f;
+            if (!kv16)
+                k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, R.st>>>(kc[li], vc[li], R.k16, R.v16, ctx, P, HD, HKV);
+            k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, R.st>>>(R.q, R.q16, (int64_t) T * H * HD);
+            for (int t0 = 0; t0 < T; t0 += tq) {
+                const int nt = std::min(tq, T - t0);
+                for (int kvh = 0; kvh < HKV; ++kvh) {
+                    // --kv f16: the cache rows are the FP16 operand already (cells HD apart, a KV head ctx * HD)
+                    const __half* Kh = kv16 ? reinterpret_cast<const __half*>(kc[li]) + (size_t) kvh * ctx * HD
+                                            : R.k16 + (size_t) kvh * P * HD;
+                    const __half* Qh = R.q16 + ((size_t) t0 * H + kvh * G) * HD;
+                    float* Sh = R.att_s + (size_t) kvh * G * nt * ldp;
+                    const cublasStatus_t cs = cublasGemmStridedBatchedEx(
+                        R.blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh, CUDA_R_16F, HD, 0, Qh, CUDA_R_16F, H * HD, HD,
+                        &zero, Sh, CUDA_R_32F, ldp, (long long) nt * ldp, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+                    if (cs != CUBLAS_STATUS_SUCCESS) {
+                        gemm_failed("scores", cs, P, nt, ldp);
+                        return false;
+                    }
+                }
+                k_attn_softmax16<<<dim3(nt, H), kThreads, 0, R.st>>>(R.att_s, R.att_p16, ldp, nt, P, (int) p0 + t0,
+                                                                   1.0f / sqrtf((float) HD));
+                for (int kvh = 0; kvh < HKV; ++kvh) {
+                    const __half* Vh = kv16 ? reinterpret_cast<const __half*>(vc[li]) + (size_t) kvh * ctx * HD
+                                            : R.v16 + (size_t) kvh * P * HD;
+                    const __half* Sh = R.att_p16 + (size_t) kvh * G * nt * ldp;
+                    float* Oh = att_ + ((size_t) t0 * H + kvh * G) * HD;
+                    const cublasStatus_t cs = cublasGemmStridedBatchedEx(
+                        R.blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, Vh, CUDA_R_16F, HD, 0, Sh, CUDA_R_16F, ldp,
+                        (long long) nt * ldp, &zero, Oh, CUDA_R_32F, H * HD, HD, G, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+                    if (cs != CUBLAS_STATUS_SUCCESS) {
+                        gemm_failed("values", cs, P, nt, ldp);
+                        return false;
+                    }
+                }
+            }
+            k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, R.st>>>(att_, R.gate, (int64_t) T * H * HD);
+            return true;
+        };
+        if (T <= kGemmT || !R.use_blas || !gemm_attn()) split_k();
     }
 
     /// One layer for T rows: x (the residual) += mixer(h); then MoE; x += moe; `hout` = rms(x) * wn (the next norm).
