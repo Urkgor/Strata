@@ -97,7 +97,7 @@ python3 tools/strata_tokenizer.py --gguf $G --out $P
 cat > $HOME/strata-qwen36.json <<EOF
 {
  "exe": "$S/build-rhel7/strata",
- "args": ["--native", "$G", "--max-context", "32768", "--prefill", "auto", "--mtp", "2"],
+ "args": ["--native", "$G", "--max-context", "32768", "--kv", "f16", "--prefill", "auto", "--mtp", "2"],
  "cwd": "$S",
  "tokenizer": "$P/tokenizer",
  "model_name": "qwen3.6-35b-a3b",
@@ -122,6 +122,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
 
 - Par défaut le serveur n'écoute que sur `127.0.0.1` : **aucun autre poste ne peut s'y connecter**. Voir « Se connecter depuis un autre poste » ci-dessous.
 - **GGUF sans couche MTP** (un GGUF « ordinaire » de Qwen3.6, pas ceux d'Unsloth nommés `-MTP-GGUF`) : le moteur répondait `strata-q36: missing qwen35moe.nextn_predict_layers`. Corrigé (`git pull`, puis relancer `tools/build_rhel7.sh`) : l'absence de cette clé veut dire « pas de bloc MTP ». Dans ce cas mettez `"--mtp", "0"` : les brouillons MTP n'existent pas pour ce fichier (le moteur les désactive de lui-même, mais autant ne pas les demander).
+- **`"--kv", "f16"`** : le cache de contexte en demi-précision (2 octets au lieu de 4 par valeur) : moitié de VRAM (45 Ko → 22 Ko par token, soit 128 000 tokens ≈ 2,9 Go au lieu de 5,9 Go) et moitié de lecture mémoire en décodage long. Les valeurs sont arrondies en fp16 (comme le fait llama.cpp par défaut) : le texte peut différer très légèrement de celui du cache en f32, qui reste le comportement sans cette option (`"--kv", "f32"`). Avec une carte de 11 Go, essayez `--max-context 131072 --kv f16` ; la ligne du journal `context N cells (K / V cache in f16) … GiB of VRAM free` dit ce qui reste, puis `hybrid experts: N of 256 per layer in VRAM` combien d'experts tiennent. Pas mesuré sur une carte.
 - Réglages à essayer : `--max-context` plus petit (16384) pour économiser la mémoire ; `"--mtp", "0"` si les brouillons posent problème ; `"--expert-vram", "6"` dans `args` pour limiter la VRAM (valeur d'essai, pas une mesure).
 
 ## Décodage lent avec un long contexte (6 tk/s à 25 000 tokens contre 60 à petit contexte)
