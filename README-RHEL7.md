@@ -141,6 +141,15 @@ Idée : la carte de 11 Go garde les poids et le plus d'experts possible ; la car
 - Les deux cartes échangent, par couche d'attention (10 sur 40) et par token, 36 Ko aller + 16 Ko retour, via la mémoire de l'hôte (pas besoin de P2P entre les cartes). Pas de graphes CUDA avec cette option (un graphe ne peut pas couvrir deux cartes ; en mode hybride ils étaient déjà coupés). Le prompt envoie environ 52 Ko par token et par couche d'attention.
 - **Pas testé sur une carte** (je n'ai pas de GPU ici) : le code compile sous CentOS 7 / CUDA 12.4 mais n'a jamais tourné. Dites-moi ce que donnent les lignes du journal, le débit en prompt et en décodage, avec et sans `--kv-gpu`.
 
+## Remplir davantage la carte principale avec des experts
+
+Avec `--kv-gpu`, la carte de 11 Go n'a plus le cache : tout ce qui reste (moins une réserve) va aux experts, le même nombre par couche. Le journal finit par une ligne `… GiB of VRAM free after the experts (a slot per layer is … MiB; the reserve … MiB …)` : c'est ce qu'il reste. Deux réglages **optionnels** (rien ne change sans eux) pour en gagner, chacun rendant « un emplacement par couche » = un expert de plus dans chacune des 40 couches (≈ 80 Mo) :
+
+- **`"--vram-reserve-mib", "384"`** : la réserve laissée libre passe de 768 Mo (défaut) à 384 Mo, soit ≈ 5 emplacements de plus par couche. Le minimum accepté est 128. Trop bas : cuBLAS, le pilote ou un affichage qui a besoin de VRAM plus tard peut faire échouer le moteur (`out of memory`) ; remontez la valeur dans ce cas.
+- **`"--drop-packed"`** : rend à la VRAM les copies « packées » des matrices Q8_0 (décodage rapide) que le mode hybride garde. Le moteur lit alors le format du GGUF pour ces matrices : mêmes résultats bit à bit, un peu plus lent sur ces seules matrices. La ligne du journal donne leur taille (`--drop-packed gives back … GiB = N slots`).
+
+**Aucun gain n'est mesuré** (pas de carte ici) : comparez le débit en décodage avec et sans, sur le même prompt, et regardez `hybrid experts: N of 256 per layer in VRAM`. Autre levier déjà là : `--prefill 1024` au lieu de `auto` libère de la VRAM (≈ 0,5 Mo par token de bloc) mais ralentit nettement le prompt (le bloc diffuse tous les experts par PCIe à chaque fois).
+
 ## Décodage lent avec un long contexte (6 tk/s à 25 000 tokens contre 60 à petit contexte)
 
 Cause trouvée dans le code : l'attention du décode lisait la mémoire des clés (K) de façon non coalescée (chaque fil lisait sa propre ligne de 1 Ko) et relisait K et V pour chacune des 8 têtes d'un même groupe. Corrigé (`git pull`, puis recompiler, étape 3) : un bloc sert les 8 têtes et lit K par tranches en mémoire partagée. Les résultats sont **identiques bit à bit** à l'ancien noyau (test CPU `q36_attn_gqa_test`), seul l'ordre des lectures change.

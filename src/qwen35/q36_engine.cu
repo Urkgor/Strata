@@ -1316,6 +1316,8 @@ struct Engine {
     };
     std::vector<Hy> hy;
     int hybrid_t = 32;
+    int vram_reserve_mib = -1;   // --vram-reserve-mib: the VRAM place_experts leaves free (-1: its 768 MiB)
+    bool drop_packed = false;    // --drop-packed: give the packed Q8_0 decode copies back to the experts, hybrid mode too
     bool main_hybrid = false;   // some main layer is hybrid (else only the MTP block is: the decode graph stays)
     bool mtp_graph = true;      // the MTP draft step may be a graph (not when its layer is hybrid)
     /// state index li's layer runs hybrid (its experts not all in VRAM)
@@ -3145,7 +3147,24 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     }
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
-    const size_t reserve = (size_t) 768 << 20;
+    auto give_back_packed = [&]() {   // the packed Q8_0 decode copies out of VRAM: the decode reads the GGUF layout, the same bits
+        CK(cudaDeviceSynchronize());
+        for (const auto& pk : m.packed) {
+            K::native_q8_0_packed_unregister(std::get<0>(pk));
+            CK(cudaFree(std::get<1>(pk)));
+        }
+        m.packed.clear();
+        E.reset_graphs();
+        CK(cudaMemGetInfo(&fr, &tot));
+    };
+    if (E.drop_packed && !m.packed.empty()) {   // (the hybrid mode keeps them otherwise: they are VRAM the experts could have)
+        size_t pb = 0;
+        for (const auto& pk : m.packed) pb += std::get<2>(pk);
+        give_back_packed();
+        std::fprintf(stderr, "strata-q36: the packed Q8_0 decode copies (%.2f GiB) given back to the experts (--drop-packed); "
+                     "%.2f GiB of VRAM free now\n", (double) pb / (1 << 30), (double) fr / (1 << 30));
+    }
+    const size_t reserve = E.vram_reserve_mib >= 0 ? (size_t) E.vram_reserve_mib << 20 : (size_t) 768 << 20;
     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30))
                                         : (fr > reserve ? fr - reserve : 0);
     // every expert fits once the packed Q8_0 decode copies are given back (a file a few GiB larger than the card's
@@ -3162,14 +3181,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (slots <= 0 && vram_gib < 0 && total > budget && packed_bytes > 0 &&
         (total <= budget + packed_bytes || (mtp_cpu_ok && main_need <= budget + packed_bytes + slack)) &&
         std::getenv("STRATA_Q36_KEEP_PACKED") == nullptr) {
-        CK(cudaDeviceSynchronize());
-        for (const auto& pk : m.packed) {
-            K::native_q8_0_packed_unregister(std::get<0>(pk));
-            CK(cudaFree(std::get<1>(pk)));
-        }
-        m.packed.clear();
-        E.reset_graphs();
-        CK(cudaMemGetInfo(&fr, &tot));
+        give_back_packed();
         std::fprintf(stderr, "strata-q36: the packed Q8_0 decode copies (%.2f GiB) given back so that every routed "
                      "expert fits in VRAM (STRATA_Q36_KEEP_PACKED=1 keeps them and runs the hybrid mode)\n",
                      (double) packed_bytes / (1 << 30));
@@ -3232,7 +3244,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
     const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
     size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
-    if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
+    {   // (an --expert-vram budget past what is free is cut to it, 512 MiB short of all of it; with --vram-reserve-mib, to that reserve)
+        const size_t left = E.vram_reserve_mib >= 0 ? reserve : (size_t) 512 << 20;
+        if (slot_bytes + staging + (E.vram_reserve_mib >= 0 ? reserve : (size_t) 256 << 20) > fr)
+            slot_bytes = fr > staging + left ? fr - staging - left : 0;
+    }
     // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
     int S = slots > 0 ? (int) std::min<int64_t>(ne, slots) : (int) std::min<size_t>((size_t) ne, slot_bytes / per_slot);
     if (mtp_only) {   // the main layers all, the MTP block what is left
@@ -3342,6 +3358,18 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                  "staging); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30), (double) host / (1 << 30),
                  pinned ? "pinned" : "pageable", E.hybrid_t, E.pool->workers() + (E.pool->host_works() ? 1 : 0),
                  (double) staging / (1 << 30), ms_since(t0) / 1000.0);
+    {   // what is left of the main card, and what could still go to the experts (a slot = one more expert in every layer)
+        size_t frl = 0, totl = 0;
+        CK(cudaMemGetInfo(&frl, &totl));
+        size_t pb = 0;
+        for (const auto& pk : m.packed) pb += std::get<2>(pk);
+        std::fprintf(stderr, "strata-q36: %.2f GiB of VRAM free after the experts (a slot per layer is %.0f MiB; the reserve %zu MiB%s%s)",
+                     (double) frl / (1 << 30), (double) per_slot / (1 << 20), reserve >> 20,
+                     E.vram_reserve_mib < 0 ? ", --vram-reserve-mib N changes it" : "",
+                     pb ? ", --drop-packed gives back the packed Q8_0 copies:" : "");
+        if (pb) std::fprintf(stderr, " %.2f GiB = %.1f slots", (double) pb / (1 << 30), (double) pb / (double) per_slot);
+        std::fprintf(stderr, "\n");
+    }
     return true;
 #endif
 }
@@ -4077,6 +4105,8 @@ int strata::qwen35::run(int argc, char** argv) {
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false, kv16 = false;
+    int vram_reserve = -1;
+    bool drop_packed = false;
     int kv_gpu = -1;   // --kv-gpu N: the K / V cache and the attention on device N (-1: all on the main device)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -4136,6 +4166,14 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
+        else if (a == "--vram-reserve-mib") {   // MiB left free on the main card after the experts (default 768)
+            vram_reserve = std::atoi(next().c_str());
+            if (vram_reserve < 128) {
+                std::fprintf(stderr, "strata-q36: --vram-reserve-mib takes at least 128 (cuBLAS, the driver and the display need some)\n");
+                return 2;
+            }
+        }
+        else if (a == "--drop-packed") drop_packed = true;   // the packed Q8_0 decode copies back to the experts (hybrid mode too)
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
@@ -4177,6 +4215,8 @@ int strata::qwen35::run(int argc, char** argv) {
     Engine E;
     E.use_graph = graph;
     E.kv16 = kv16;
+    E.vram_reserve_mib = vram_reserve;
+    E.drop_packed = drop_packed;
     if (kv_gpu >= 0) {
         int n_dev = 0;
         CK(cudaGetDeviceCount(&n_dev));
