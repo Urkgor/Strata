@@ -124,6 +124,11 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
 - **GGUF sans couche MTP** (un GGUF « ordinaire » de Qwen3.6, pas ceux d'Unsloth nommés `-MTP-GGUF`) : le moteur répondait `strata-q36: missing qwen35moe.nextn_predict_layers`. Corrigé (`git pull`, puis relancer `tools/build_rhel7.sh`) : l'absence de cette clé veut dire « pas de bloc MTP ». Dans ce cas mettez `"--mtp", "0"` : les brouillons MTP n'existent pas pour ce fichier (le moteur les désactive de lui-même, mais autant ne pas les demander).
 - Réglages à essayer : `--max-context` plus petit (16384) pour économiser la mémoire ; `"--mtp", "0"` si les brouillons posent problème ; `"--expert-vram", "6"` dans `args` pour limiter la VRAM (valeur d'essai, pas une mesure).
 
+## Décodage lent avec un long contexte (6 tk/s à 25 000 tokens contre 60 à petit contexte)
+
+Cause trouvée dans le code : l'attention du décode lisait la mémoire des clés (K) de façon non coalescée (chaque fil lisait sa propre ligne de 1 Ko) et relisait K et V pour chacune des 8 têtes d'un même groupe. Corrigé (`git pull`, puis recompiler, étape 3) : un bloc sert les 8 têtes et lit K par tranches en mémoire partagée. Les résultats sont **identiques bit à bit** à l'ancien noyau (test CPU `q36_attn_gqa_test`), seul l'ordre des lectures change.
+**Le gain n'est pas mesuré** (pas de carte ici) : comparez sur le même prompt de 25 000 tokens, avec et sans `STRATA_Q36_OLD_ATTN=1` (variable d'environnement : l'ancien noyau). Les deux doivent donner le même texte en décodage glouton (température 0).
+
 ## Se connecter depuis un autre poste (autre outil, autre machine)
 
 ```sh

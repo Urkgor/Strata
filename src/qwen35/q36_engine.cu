@@ -27,6 +27,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/qwen35/engine.hpp"
 #include "q36_kernels.cuh"
+#include "q36_attn.cuh"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -1993,10 +1994,26 @@ struct Engine {
                 // split-K over 256-cell chunks; the chunk grid covers every cell a row can see (graph mode: the whole
                 // context, past-the-end chunks return at once)
                 const int rows_per = att_rows / H;
+#if defined(__HIPCC__)
+                const bool gqa_attn_ok = false;
+#else
+                const bool gqa_attn_ok = HD == q36k::kAttnHD && kChunkCells == q36k::kAttnChunk && kThreads == q36k::kAttnThreads &&
+                                         HKV > 0 && H == HKV * q36k::kAttnGroup;
+#endif
                 for (int t0 = 0; t0 < T; t0 += rows_per) {
                     const int nt = std::min(rows_per, T - t0);
                     const int nc = graph_mode ? n_chunk
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
+                    // grouped queries (16 heads over 2 KV heads): one block serves the 8 heads of a KV head and reads K through
+                    // shared memory, coalesced; the same bits as k_attn_part (q36_attn.cuh, which says why: a GTX 1080 Ti
+                    // decoded 6 tokens/s at 25K of context against 60 at a short one).  STRATA_Q36_OLD_ATTN=1: the old kernel
+                    // (A/B).  HIP keeps the old one.
+                    static const bool gqa_attn = std::getenv("STRATA_Q36_OLD_ATTN") == nullptr;
+                    if (gqa_attn_ok && gqa_attn)
+                        q36k::k_attn_part_gqa<<<dim3(nc, nt * HKV), kChunkCells, 0, st>>>(
+                            q, rows_mode ? nullptr : kc[li], rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
+                            1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs.cell, rs.slot, rs.kc, rs.vc);
+                    else
                     k_attn_part<<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, rows_mode ? nullptr : kc[li],
                                                                          rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
                                                                          1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
