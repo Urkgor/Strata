@@ -65,16 +65,18 @@ case "$CMAKE_ARG" in */*) CMAKE_ARG=$(abs "$CMAKE_ARG") ;; esac
 gcc_major() { "$1" -dumpversion 2>/dev/null | cut -d. -f1; }
 CXX_BIN=${CXX:-g++}
 if ! command -v "$CXX_BIN" >/dev/null 2>&1 || [ "$(gcc_major "$CXX_BIN" || echo 0)" -lt 10 ]; then
-  for v in 11 12 10; do
-    if [ -f "/opt/rh/devtoolset-$v/enable" ]; then
-      set +u; . "/opt/rh/devtoolset-$v/enable"; set -u      # Red Hat's script reads variables that may be unset
-      CXX_BIN=g++; note "devtoolset-$v switched on"; break
-    fi
+  for tool in devtoolset gcc-toolset; do   # RHEL 7: devtoolset-N; RHEL 8 / 9: gcc-toolset-N
+    for v in 11 12 10 13; do
+      if [ -f "/opt/rh/$tool-$v/enable" ]; then
+        set +u; . "/opt/rh/$tool-$v/enable"; set -u      # Red Hat's script reads variables that may be unset
+        CXX_BIN=g++; note "$tool-$v switched on"; break 2
+      fi
+    done
   done
 fi
-command -v "$CXX_BIN" >/dev/null 2>&1 || die "no C++ compiler.  RHEL 7: sudo yum install devtoolset-11-gcc-c++ devtoolset-11-binutils (CentOS 7: after yum install centos-release-scl)"
+command -v "$CXX_BIN" >/dev/null 2>&1 || die "no C++ compiler.  RHEL 7: sudo yum install devtoolset-11-gcc-c++ devtoolset-11-binutils (CentOS 7: after yum install centos-release-scl); RHEL 8: sudo dnf install gcc-toolset-11-gcc-c++ gcc-toolset-11-binutils"
 GCC_V=$(gcc_major "$CXX_BIN" || echo 0)
-[ "$GCC_V" -ge 10 ] || die "$CXX_BIN is GCC $GCC_V; the engine is C++20 and needs GCC 10 or newer.  RHEL 7: sudo yum install devtoolset-11-gcc-c++ devtoolset-11-binutils, or point CXX at one"
+[ "$GCC_V" -ge 10 ] || die "$CXX_BIN is GCC $GCC_V; the engine is C++20 and needs GCC 10 or newer.  RHEL 7: sudo yum install devtoolset-11-gcc-c++ devtoolset-11-binutils (RHEL 8: gcc-toolset-11-gcc-c++), or point CXX at one"
 CXX_PATH=$(command -v "$CXX_BIN")
 CC_BIN=${CC:-gcc}; command -v "$CC_BIN" >/dev/null 2>&1 || CC_BIN=$(dirname "$CXX_PATH")/gcc
 note "C++ compiler: $CXX_PATH (GCC $GCC_V)"

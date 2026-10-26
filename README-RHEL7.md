@@ -63,6 +63,8 @@ Vérifier :
 
 ```sh
 tools/check_glibc_symbols.sh build-rhel7/strata build-rhel7/libstrata_kq.so     # doit finir par « (ok) »
+# RHEL 8 (glibc 2.28, GCC 8.5) : le contrôle ci-dessus vise RHEL 7 et signale GLIBC_2.27 / GLIBCXX_3.4.22 / CXXABI_1.3.11, ce qui est normal et sans gravité ; pour RHEL 8 :
+tools/check_glibc_symbols.sh build-rhel7/strata build-rhel7/libstrata_kq.so --max-glibc 2.28 --max-glibcxx 3.4.25 --max-cxxabi 1.3.11
 build-rhel7/strata --help | head
 ```
 
