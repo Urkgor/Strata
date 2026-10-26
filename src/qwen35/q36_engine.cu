@@ -1415,6 +1415,8 @@ struct Engine {
     void init(const Model& model, int ctx_, int tmax_, int n_sessions = 1, bool vision_ = false) {
         m = &model;
         CK(cudaGetDevice(&main_dev));
+        size_t fr_init0 = 0, tot_init0 = 0;
+        CK(cudaMemGetInfo(&fr_init0, &tot_init0));   // (the breakdown at the end of init)
         ctx = ctx_;
         n_sess = std::max(1, std::min(n_sessions, kVerify));
         vision = vision_;
@@ -1509,7 +1511,10 @@ struct Engine {
         ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
         CK(cudaHostAlloc((void**) &hpin, 64 * sizeof(int32_t), cudaHostAllocDefault));
         n_chunk = (ctx + kChunkCells - 1) / kChunkCells;
-        att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, 64));   // 64 query tokens per attention batch
+        // The split-K partials: att_rows query rows x every chunk of the context x 256 floats (0.54 GiB at 128K cells for 64 rows).  On
+        // this device the split-K kernels only see decode rows and verify windows (<= kGemmT; a prompt chunk is GEMMs), so 8 rows
+        // are enough here (the same results, 7/8 of the memory back); the cache's card keeps 64 for the slices cuBLAS may refuse.
+        att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, kvr ? 64 : kGemmT));
         if (!kvr) {
             pacc = dalloc((size_t) att_rows * n_chunk * g.head_dim);
             pm = dalloc((size_t) att_rows * n_chunk);
@@ -1628,6 +1633,19 @@ struct Engine {
         std::fprintf(stderr, "strata-q36: context %d cells%s, prompt chunk %d%s, %.2f GiB of VRAM free\n", ctx,
                      kv16 ? " (K / V cache in f16)" : "", tmax, m->has_mtp ? ", MTP block loaded" : "",
                      (double) fr / (1 << 30));
+        if (!kvr) {   // where the engine's buffers went (the experts get what is left, less the reserve and the staging pair)
+            size_t n_attn = m->has_mtp ? 1 : 0;
+            for (const Layer& L : m->layers) n_attn += L.attn ? 1 : 0;
+            const double GiB = (double) (1ull << 30);
+            const double kv_b = (double) n_attn * 2 * g.n_head_kv * ctx * g.head_dim * kv_elem() * n_sess;
+            const double part_b = ((double) att_rows * n_chunk * g.head_dim + 2.0 * att_rows * n_chunk) * 4;
+            const double sc_b = (double) kAttScoreFloats * 6 + (kv16 ? 0.0 : 4.0 * g.n_head_kv * ctx * g.head_dim * 2 / 2);
+            const double used = fr_init0 > fr ? (double) (fr_init0 - fr) : 0.0;
+            std::fprintf(stderr, "strata-q36: the engine took %.2f GiB of VRAM: K / V caches %.2f, attention partials %.2f, prompt scores "
+                         "%.2f, the rest %.2f (prompt chunk %d: about 0.5 MiB per token; a smaller --prefill or --max-context frees "
+                         "more for the experts)\n", used / GiB, kv_b / GiB, part_b / GiB, sc_b / GiB,
+                         std::max(0.0, used - kv_b - part_b - sc_b) / GiB, tmax);
+        }
         if (kvr) {
             size_t frk = 0, totk = 0;
             DevScope ds(kv_dev);

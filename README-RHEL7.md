@@ -142,6 +142,19 @@ Idée : la carte de 11 Go garde les poids et le plus d'experts possible ; la car
 - Les deux cartes échangent, par couche d'attention (10 sur 40) et par token, 36 Ko aller + 16 Ko retour, via la mémoire de l'hôte (pas besoin de P2P entre les cartes). Pas de graphes CUDA avec cette option (un graphe ne peut pas couvrir deux cartes ; en mode hybride ils étaient déjà coupés). Le prompt envoie environ 52 Ko par token et par couche d'attention.
 - **Pas testé sur une carte** (je n'ai pas de GPU ici) : le code compile sous CentOS 7 / CUDA 12.4 mais n'a jamais tourné. Dites-moi ce que donnent les lignes du journal, le débit en prompt et en décodage, avec et sans `--kv-gpu`.
 
+## « hybrid experts: 3 of 256 per layer in VRAM » alors que la carte est pleine
+
+Les experts n'ont que ce qui reste après le reste. Sur une carte de 11 Go avec un contexte de 128 000 tokens, tout le reste prend presque tout : le cache K/V (2,7 Go en f16, **5,4 Go en f32** : vérifiez que `--kv f16` est bien dans `args`), les tampons du bloc de prompt (≈ 0,5 Mo par token de bloc, soit ≈ 1 Go à `--prefill auto` = 2048), le double tampon de diffusion des experts (≈ 0,9 Go), la réserve (768 Mo) et les poids hors experts. Un « emplacement » = 1 expert de plus dans chacune des 40 couches ≈ 80 Mo.
+
+Le moteur à jour écrit, juste après `context N cells …`, la ligne `the engine took X GiB of VRAM: K / V caches …, attention partials …, prompt scores …, the rest …` : envoyez-la avec `hybrid experts:` et `GiB of VRAM free after the experts`. Leviers, du plus gros au plus petit (rien n'est mesuré ici) :
+
+- `--max-context 65536` (ou 32768) : le cache et les tampons de l'attention sont proportionnels au contexte (f16 : 22 Ko par token).
+- `--kv f16` si ce n'est pas déjà le cas : moitié du cache.
+- `--prefill 1024` : ≈ 0,5 Go de moins, mais le prompt est nettement plus lent.
+- `--vram-reserve-mib 384` : ≈ 0,4 Go de plus pour les experts ; `--drop-packed` : rend les copies Q8_0 packées.
+- Le moteur à jour ne réserve plus que 8 lignes de requêtes pour les tampons de l'attention (au lieu de 64) : ≈ 0,47 Go de VRAM rendus à 128 000 tokens, mêmes résultats.
+- Le vrai gain à 128 000 tokens : mettre le cache sur la 2e carte (`--kv-gpu`).
+
 ## Remplir davantage la carte principale avec des experts
 
 Avec `--kv-gpu`, la carte de 11 Go n'a plus le cache : tout ce qui reste (moins une réserve) va aux experts, le même nombre par couche. Le journal finit par une ligne `… GiB of VRAM free after the experts (a slot per layer is … MiB; the reserve … MiB …)` : c'est ce qu'il reste. Deux réglages **optionnels** (rien ne change sans eux) pour en gagner, chacun rendant « un emplacement par couche » = un expert de plus dans chacune des 40 couches (≈ 80 Mo) :
