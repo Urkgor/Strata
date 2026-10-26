@@ -2084,6 +2084,14 @@ struct Engine {
     cudaEvent_t ev_in = nullptr, ev_out = nullptr;    // the inputs are in host memory / the output is
     std::vector<float*> qn_kv, kn_kv;                 // per attention layer (the MTP block's last): q / k norm weights on that card
     int32_t* d_mtab_kv = nullptr;                     // the M-RoPE table there (vision)
+    bool kv_p2p = false;                              // --kv-p2p asked: the hand-off by peer copies between the cards, not through the host
+    bool p2p_on = false;                              // ... and the check at load passed
+    bool kv_prof = false;                             // STRATA_Q36_KV_PROFILE=1: time the hand-off and the other card's attention
+    cudaEvent_t pe[2] = {}, pk_ev[2] = {};            // its timing events (main device / cache's card)
+    struct Prof {
+        long n = 0;
+        double tot = 0, rem = 0;   // microseconds: the whole call on the main stream / the attention on the cache's card
+    } prof[2];                     // [0] decode rows (T <= kGemmT), [1] prompt chunks
 
     /// --kv-gpu: the two prompt-attention GEMMs on the cache's card against a host reference (q36_blas_check.hpp), on the shapes of a
     /// prompt's tail and of bigger slices.  A T1000 (TU117) answered INTERNAL_ERROR for a 9-query slice; a card can also answer
@@ -2204,6 +2212,18 @@ struct Engine {
         pk_kv = dalloc((size_t) kAttnHdr + T * (2 * H * HD + 2 * HKV * HD));
         att_kv = dalloc(T * H * HD);
         blas_selftest(R);   // (also cuBLAS's first call on this card: it takes its own memory then, before the caches are sized)
+        kv_prof = std::getenv("STRATA_Q36_KV_PROFILE") != nullptr;
+        if (kv_prof) {
+            CK(cudaEventCreate(&pk_ev[0]));
+            CK(cudaEventCreate(&pk_ev[1]));
+            DevScope dm(main_dev);
+            CK(cudaEventCreate(&pe[0]));
+            CK(cudaEventCreate(&pe[1]));
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_KV_PROFILE: the hand-off to device %d timed (it syncs the main stream after every "
+                         "attention layer: slower on its own), said every 200 decode layers / 10 prompt layers\n", kv_dev);
+        }
+        if (kv_p2p && kv_dev != main_dev) setup_p2p();
+        else if (kv_p2p) std::fprintf(stderr, "strata-q36: --kv-p2p: the cache's card is the main device, nothing to copy between\n");
         const int32_t* hdr = reinterpret_cast<const int32_t*>(pk_kv);   // the header's scalars and rows, as the kernels read them
         R.delta = hdr + 1;
         R.rcell = hdr + 2;
@@ -2226,6 +2246,63 @@ struct Engine {
         }
     }
 
+    /// --kv-p2p: peer access between the two cards and a check that a pattern survives the trip both ways.  If it does not work, the
+    /// hand-off stays on the host path.
+    void setup_p2p() {
+        int a = 0, b = 0;
+        CK(cudaDeviceCanAccessPeer(&a, main_dev, kv_dev));
+        CK(cudaDeviceCanAccessPeer(&b, kv_dev, main_dev));
+        if (!a || !b) {
+            std::fprintf(stderr, "strata-q36: --kv-p2p: the driver gives no peer access between devices %d and %d (%d / %d): the hand-off "
+                         "stays on the host path\n", main_dev, kv_dev, a, b);
+            return;
+        }
+        cudaError_t e1, e2;
+        {
+            DevScope dm(main_dev);
+            e1 = cudaDeviceEnablePeerAccess(kv_dev, 0);
+        }
+        e2 = cudaDeviceEnablePeerAccess(main_dev, 0);   // (the cache's card is current in init_kv_card)
+        if (e1 == cudaErrorPeerAccessAlreadyEnabled) e1 = cudaSuccess;
+        if (e2 == cudaErrorPeerAccessAlreadyEnabled) e2 = cudaSuccess;
+        (void) cudaGetLastError();
+        if (e1 != cudaSuccess || e2 != cudaSuccess) {
+            std::fprintf(stderr, "strata-q36: --kv-p2p: enabling peer access failed (%s / %s): the hand-off stays on the host path\n",
+                         cudaGetErrorString(e1), cudaGetErrorString(e2));
+            return;
+        }
+        // the trip: host pattern -> main card -> cache's card -> main card -> host, 4 MiB, compared
+        const size_t n = (size_t) 1 << 20;
+        std::vector<uint32_t> pat(n), back(n, 0);
+        uint32_t s = 2463534242u;
+        for (auto& v : pat) { s ^= s << 13; s ^= s >> 17; s ^= s << 5; v = s; }
+        uint32_t *dm_ = nullptr, *dm2 = nullptr, *dk = nullptr;
+        {
+            DevScope dm(main_dev);
+            CK(cudaMalloc(&dm_, n * 4));
+            CK(cudaMalloc(&dm2, n * 4));
+            CK(cudaMemcpy(dm_, pat.data(), n * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemset(dm2, 0, n * 4));
+        }
+        CK(cudaMalloc(&dk, n * 4));
+        const cudaError_t c1 = cudaMemcpyPeer(dk, kv_dev, dm_, main_dev, n * 4);
+        const cudaError_t c2 = cudaMemcpyPeer(dm2, main_dev, dk, kv_dev, n * 4);
+        {
+            DevScope dm(main_dev);
+            CK(cudaMemcpy(back.data(), dm2, n * 4, cudaMemcpyDeviceToHost));
+            CK(cudaFree(dm_));
+            CK(cudaFree(dm2));
+        }
+        CK(cudaFree(dk));
+        const bool ok = c1 == cudaSuccess && c2 == cudaSuccess && back == pat;
+        p2p_on = ok;
+        std::fprintf(stderr, ok ? "strata-q36: --kv-p2p: peer copies between devices %d and %d work (4 MiB round trip identical): the "
+                                  "hand-off goes card to card, not through the host\n"
+                                : "strata-q36: --kv-p2p: the peer copy between devices %d and %d FAILED its check (%s / %s%s): the hand-off "
+                                  "stays on the host path\n", main_dev, kv_dev, ok ? "" : cudaGetErrorString(c1),
+                     ok ? "" : cudaGetErrorString(c2), ok || (c1 == cudaSuccess && c2 == cudaSuccess) ? ", the data differs" : "");
+    }
+
     /// --kv-gpu: attention layer li for T rows on the cache's card.  The rows projected here (qg / kx / vx) are packed with the
     /// position into one buffer and go through pinned host memory to the card; attn_core runs there on its own stream; the output
     /// comes back the same way.  Every hand-off is an event (the host does not wait), and the main stream is held until the
@@ -2235,24 +2312,50 @@ struct Engine {
         const int H = (int) g.n_head, HKV = (int) g.n_head_kv, HD = (int) g.head_dim;
         const int64_t nq = (int64_t) T * 2 * H * HD, nk = (int64_t) T * HKV * HD;
         const size_t in_bytes = (size_t) (kAttnHdr + nq + 2 * nk) * 4, out_bytes = (size_t) T * H * HD * 4;
+        if (kv_prof) CK(cudaEventRecord(pe[0], st));
         k_pack_attn<<<grid1(nq + 2 * nk), kThreads, 0, st>>>(pk_main, qg, kx, vx, nq, nk, dpos, d_delta,
                                                              rows_mode ? d_rcell : nullptr, rows_mode ? d_rslot : nullptr,
                                                              rows_mode ? d_rdelta : nullptr, rows_mode ? T : 0);
-        CK(cudaMemcpyAsync(stage_in, pk_main, in_bytes, cudaMemcpyDeviceToHost, st));
+        if (p2p_on) CK(cudaMemcpyPeerAsync(pk_kv, kv_dev, pk_main, main_dev, in_bytes, st));
+        else CK(cudaMemcpyAsync(stage_in, pk_main, in_bytes, cudaMemcpyDeviceToHost, st));
         CK(cudaEventRecord(ev_in, st));
         {
             DevScope ds(kv_dev);
             const AttnRes& R = ar_kv;
             CK(cudaStreamWaitEvent(R.st, ev_in, 0));
-            CK(cudaMemcpyAsync(pk_kv, stage_in, in_bytes, cudaMemcpyHostToDevice, R.st));
+            if (!p2p_on) CK(cudaMemcpyAsync(pk_kv, stage_in, in_bytes, cudaMemcpyHostToDevice, R.st));
+            if (kv_prof) CK(cudaEventRecord(pk_ev[0], R.st));
             const float* in = pk_kv + kAttnHdr;
             attn_core(R, li, T, p0, reinterpret_cast<const int32_t*>(pk_kv), false, in, in + nq, in + nq + nk, qn_kv[li],
                       kn_kv[li], mtab_now ? d_mtab_kv : nullptr, att_kv);
-            CK(cudaMemcpyAsync(stage_out, att_kv, out_bytes, cudaMemcpyDeviceToHost, R.st));
+            if (kv_prof) CK(cudaEventRecord(pk_ev[1], R.st));
+            if (p2p_on) CK(cudaMemcpyPeerAsync(att, main_dev, att_kv, kv_dev, out_bytes, R.st));
+            else CK(cudaMemcpyAsync(stage_out, att_kv, out_bytes, cudaMemcpyDeviceToHost, R.st));
             CK(cudaEventRecord(ev_out, R.st));
         }
         CK(cudaStreamWaitEvent(st, ev_out, 0));
-        CK(cudaMemcpyAsync(att, stage_out, out_bytes, cudaMemcpyHostToDevice, st));
+        if (!p2p_on) CK(cudaMemcpyAsync(att, stage_out, out_bytes, cudaMemcpyHostToDevice, st));
+        if (kv_prof) {   // the whole call on the main stream, and the attention alone on the other card (microseconds)
+            CK(cudaEventRecord(pe[1], st));
+            CK(cudaStreamSynchronize(st));
+            float ms_all = 0, ms_rem = 0;
+            CK(cudaEventElapsedTime(&ms_all, pe[0], pe[1]));
+            {
+                DevScope ds(kv_dev);
+                CK(cudaEventElapsedTime(&ms_rem, pk_ev[0], pk_ev[1]));
+            }
+            Prof& P = prof[T > kGemmT ? 1 : 0];
+            ++P.n;
+            P.tot += ms_all * 1000.0;
+            P.rem += ms_rem * 1000.0;
+            if (P.n >= (T > kGemmT ? 10 : 200)) {
+                std::fprintf(stderr, "strata-q36 KV PROFILE (%s, %ld layers): %.0f us per layer on the main stream, of which %.0f us the "
+                             "attention on device %d and %.0f us the hand-off (packing, copies, waits)%s\n",
+                             T > kGemmT ? "prompt chunks" : "decode rows", P.n, P.tot / P.n, P.rem / P.n, kv_dev,
+                             (P.tot - P.rem) / P.n, p2p_on ? " [peer copies]" : " [through the host]");
+                P = Prof();
+            }
+        }
     }
 
     /// The core of an attention layer on the device `R` belongs to: the q / k norm, the rotary position and the cache write
@@ -4211,6 +4314,7 @@ int strata::qwen35::run(int argc, char** argv) {
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false, kv16 = false;
     int vram_reserve = -1;
     bool drop_packed = false;
+    bool kv_p2p = false;
     int kv_gpu = -1;   // --kv-gpu N: the K / V cache and the attention on device N (-1: all on the main device)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -4255,6 +4359,7 @@ int strata::qwen35::run(int argc, char** argv) {
             else if (v == "f32" || v == "fp32" || v == "float") kv16 = false;
             else std::fprintf(stderr, "strata-q36: ignoring --kv %s (this family's cache is f16 or f32)\n", v.c_str());
         }
+        else if (a == "--kv-p2p") kv_p2p = true;   // --kv-gpu: the cards trade the attention's rows by peer copies (checked at load)
         else if (a == "--kv-gpu") {
             // the cache and the attention on another card (the weights and the experts stay on the first of --gpu's cards): a
             // device number among the visible ones, 0 = the first of --gpu (the main one: the same path on one card, a check)
@@ -4350,6 +4455,7 @@ int strata::qwen35::run(int argc, char** argv) {
         CK(cudaGetDevice(&cur_dev));
         E.kvr = true;
         E.kv_dev = kv_gpu;
+        E.kv_p2p = kv_p2p;
         E.use_graph = false;   // a CUDA graph cannot span two devices
         E.mtp_graph = false;
         cudaDeviceProp pr{};

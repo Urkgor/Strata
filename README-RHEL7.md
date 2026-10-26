@@ -142,6 +142,18 @@ Idée : la carte de 11 Go garde les poids et le plus d'experts possible ; la car
 - Les deux cartes échangent, par couche d'attention (10 sur 40) et par token, 36 Ko aller + 16 Ko retour, via la mémoire de l'hôte (pas besoin de P2P entre les cartes). Pas de graphes CUDA avec cette option (un graphe ne peut pas couvrir deux cartes ; en mode hybride ils étaient déjà coupés). Le prompt envoie environ 52 Ko par token et par couche d'attention.
 - **Pas testé sur une carte** (je n'ai pas de GPU ici) : le code compile sous CentOS 7 / CUDA 12.4 mais n'a jamais tourné. Dites-moi ce que donnent les lignes du journal, le débit en prompt et en décodage, avec et sans `--kv-gpu`.
 
+## Avec `--kv-gpu`, c'est plus lent qu'une seule carte : pourquoi, et quoi mesurer
+
+`--kv-gpu` n'est pas gratuit. Chaque couche d'attention (10 sur 40) fait un aller-retour entre les deux cartes **à chaque token** : empaquetage, copie, attente, calcul sur la 2e carte, copie, attente. Ordre de grandeur (estimation, pas une mesure) : 0,1 à 0,2 ms par couche, donc 1 à 2 ms par token, soit 5 à 10 % du temps d'un token à 60 tk/s. La 2e carte lit en plus le cache plus lentement (une T1000 : ≈ 160 Go/s, une 1080 Ti : ≈ 480 Go/s), ce qui pèse à contexte long. Et pendant ce temps la carte principale attend.
+
+Le gain, lui, ne vient que des experts en plus sur la carte principale : le cache en f16 coûte 22 Ko par token, donc à `--max-context 32768` il ne libère que ≈ 0,7 Go (≈ 9 emplacements sur 256, ≈ 3,5 % des experts) : **moins que ce que ça coûte**. Il ne devient intéressant qu'à grand contexte (64 000 tokens et plus : ≥ 1,4 Go libérés). À petit contexte, restez sur une seule carte.
+
+Pour savoir où part le temps :
+
+- `STRATA_Q36_KV_PROFILE=1` (variable d'environnement du moteur ; dans le fichier de configuration du serveur, au premier niveau : `"env": {"STRATA_Q36_KV_PROFILE": "1"}`) : toutes les 200 couches de décodage / 10 couches de prompt, une ligne `KV PROFILE … µs per layer on the main stream, of which … µs the attention on device 1 and … µs the hand-off`. Ça force une synchronisation après chaque couche (plus lent en soi) : à utiliser pour mesurer le partage, pas le débit.
+- `--kv-p2p` (avec `--kv-gpu`) : les deux cartes s'échangent les lignes **directement** (copies pair à pair) au lieu de passer par la mémoire de l'hôte, ce qui supprime deux sauts par échange. Le moteur vérifie au chargement qu'un motif de 4 Mo fait l'aller-retour intact ; sinon (pilote sans accès pair à pair, ce qui est fréquent entre une GeForce et une autre carte) il reste sur le chemin par l'hôte et le dit.
+- À comparer sur le même prompt : `hybrid experts: N of 256 per layer in VRAM` et le débit, avec et sans `--kv-gpu`.
+
 ## « hybrid experts: 3 of 256 per layer in VRAM » alors que la carte est pleine
 
 Les experts n'ont que ce qui reste après le reste. Sur une carte de 11 Go avec un contexte de 128 000 tokens, tout le reste prend presque tout : le cache K/V (2,7 Go en f16, **5,4 Go en f32** : vérifiez que `--kv f16` est bien dans `args`), les tampons du bloc de prompt (≈ 0,5 Mo par token de bloc, soit ≈ 1 Go à `--prefill auto` = 2048), le double tampon de diffusion des experts (≈ 0,9 Go), la réserve (768 Mo) et les poids hors experts. Un « emplacement » = 1 expert de plus dans chacune des 40 couches ≈ 80 Mo.
