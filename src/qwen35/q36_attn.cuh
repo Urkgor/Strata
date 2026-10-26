@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 #ifndef Q36_ATTN_NO_CUDA_HEADERS   // the CPU test brings its own __half
 #include <cuda_fp16.h>
 #endif
@@ -32,6 +33,31 @@ __device__ __forceinline__ float kv_to_float(float x) { return x; }
 __device__ __forceinline__ float kv_to_float(__half x) { return __half2float(x); }
 __device__ __forceinline__ void kv_store(float* p, float v) { *p = v; }
 __device__ __forceinline__ void kv_store(__half* p, float v) { *p = __float2half(v); }
+
+// --kv q8_0: the cache holds Q8_0 blocks (32 values: int8 quants and one half scale d = max|x| / 127, x ~ q * d, as ggml's Q8_0), split
+// in two arrays of one allocation so every access is aligned: [HKV][ctx][HD] int8, then [HKV][ctx][HD / 32] half.  KvQ8 is the
+// element-type tag the kernels are templated on (float, __half, KvQ8); only the head dimension 256 / block 32 case exists.
+struct KvQ8 {};
+constexpr int kQ8Block = 32;
+/// bytes of one (KV head, cell): HD quants and HD / 32 scales
+constexpr size_t q8_cell_bytes(int HD) { return (size_t) HD + (size_t) (HD / kQ8Block) * 2; }
+
+/// The Q8_0 store of one value per thread (block of HD threads, HD a multiple of 32 and equal to blockDim.x): `qb` is a shared
+/// float[HD] scratch, `qs` / `sc` the destination row's quants (HD int8) and scales (HD / 32 half).  Same formula as ggml's
+/// quantize_row_q8_0: d = amax / 127, q = round(x / d) (half away from zero); the scale is stored as a half.  Contains barriers.
+__device__ inline void q8_store(float v, float* qb, int8_t* qs, __half* sc) {
+    const int i = threadIdx.x;
+    qb[i] = v;
+    __syncthreads();
+    const int b0 = i & ~(kQ8Block - 1);
+    float amax = 0.f;
+    for (int k = 0; k < kQ8Block; ++k) amax = fmaxf(amax, fabsf(qb[b0 + k]));
+    const float d = amax / 127.0f;
+    const float id = d != 0.f ? 1.0f / d : 0.f;
+    qs[i] = (int8_t) roundf(v * id);
+    if ((i & (kQ8Block - 1)) == 0) sc[i / kQ8Block] = __float2half(d);
+    __syncthreads();   // qb is free again
+}
 
 constexpr int kAttnThreads = 256;   // threads per block == cells per chunk == the head dimension
 constexpr int kAttnChunk = 256;
@@ -83,21 +109,37 @@ k_attn_part_gqa(const float* q, const float* kc_, const float* vc_, const int32_
         kc_ = rs_kc[rs_slot[t]];
         vc_ = rs_vc[rs_slot[t]];
     }
-    const KT* kc = reinterpret_cast<const KT*>(kc_);
-    const KT* vc = reinterpret_cast<const KT*>(vc_);
+    constexpr bool Q8 = std::is_same_v<KT, KvQ8>;
+    using KE = std::conditional_t<Q8, float, KT>;   // (the element type of the float / half caches; a stand-in for Q8)
+    const KE* kc = reinterpret_cast<const KE*>(kc_);
+    const KE* vc = reinterpret_cast<const KE*>(vc_);
     const int p0 = c * NC;
     if (p0 >= npos) return;
     const int j = threadIdx.x;
 #pragma unroll
     for (int i = 0; i < G; ++i) qs[i][j] = q[((size_t) t * H + (size_t) kvh * G + i) * HD + j];
     const int p = p0 + j;
-    const KT* kbase = kc + ((size_t) kvh * ctx + p0) * HD;
+    const KE* kbase = kc + ((size_t) kvh * ctx + p0) * HD;
     float a[G];
 #pragma unroll
     for (int i = 0; i < G; ++i) a[i] = 0.f;
     for (int d0 = 0; d0 < HD; d0 += KS) {
         __syncthreads();   // the last slice is consumed (the first time: qs is written)
-        if constexpr (sizeof(KT) == 4) {
+        if constexpr (Q8) {
+            // cell j's 16 quants of this slice (one 16-byte load) and its block's scale, dequantized as q * d
+            const int8_t* qk = reinterpret_cast<const int8_t*>(kc_);
+            const __half* sk = reinterpret_cast<const __half*>(qk + (size_t) HKV * ctx * HD);
+            const size_t row = (size_t) kvh * ctx + p0 + j;
+            uint4 u = make_uint4(0u, 0u, 0u, 0u);
+            float dk = 0.f;
+            if (p0 + j < npos) {
+                u = *reinterpret_cast<const uint4*>(qk + row * HD + d0);
+                dk = __half2float(sk[row * (HD / kQ8Block) + d0 / kQ8Block]);
+            }
+            const int8_t* b = reinterpret_cast<const int8_t*>(&u);
+#pragma unroll
+            for (int k = 0; k < KS; ++k) ks[j][k] = (float) b[k] * dk;
+        } else if constexpr (sizeof(KT) == 4) {
 #pragma unroll
             for (int rr = 0; rr < NC * KS / 4 / kAttnThreads; ++rr) {   // the slice: 256 cells x 16 floats, 4 float4 per thread
                 const int idx = j + rr * kAttnThreads, cell = idx / (KS / 4), part = idx % (KS / 4);
@@ -114,7 +156,7 @@ k_attn_part_gqa(const float* q, const float* kc_, const float* vc_, const int32_
                 const int idx = j + rr * kAttnThreads, cell = idx / (KS / 8), part = idx % (KS / 8);
                 uint4 u = make_uint4(0u, 0u, 0u, 0u);
                 if (p0 + cell < npos) u = *reinterpret_cast<const uint4*>(kbase + (size_t) cell * HD + d0 + part * 8);
-                const KT* h = reinterpret_cast<const KT*>(&u);
+                const KE* h = reinterpret_cast<const KE*>(&u);
 #pragma unroll
                 for (int k = 0; k < 8; ++k) ks[cell][part * 8 + k] = kv_to_float(h[k]);
             }
@@ -140,12 +182,20 @@ k_attn_part_gqa(const float* q, const float* kc_, const float* vc_, const int32_
         l_[i] = attn_block_sum(e, sh);   // its syncs also publish sc[i][*] to the V loop below
     }
     const int n = NC < npos - p0 ? NC : npos - p0;
-    const KT* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
+    const KE* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
     float acc[G];
 #pragma unroll
     for (int i = 0; i < G; ++i) acc[i] = 0.f;
     for (int k = 0; k < n; ++k) {
-        const float v = kv_to_float(vp[(size_t) k * HD]);
+        float v;
+        if constexpr (Q8) {
+            const int8_t* qv = reinterpret_cast<const int8_t*>(vc_);
+            const __half* sv = reinterpret_cast<const __half*>(qv + (size_t) HKV * ctx * HD);
+            const size_t row = (size_t) kvh * ctx + p0 + k;
+            v = (float) qv[row * HD + j] * __half2float(sv[row * (HD / kQ8Block) + (j >> 5)]);
+        } else {
+            v = kv_to_float(vp[(size_t) k * HD]);
+        }
 #pragma unroll
         for (int i = 0; i < G; ++i) acc[i] += sc[i][k] * v;
     }

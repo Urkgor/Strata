@@ -296,8 +296,20 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
         gate[((size_t) t * H + head) * HD + i] = qg[((size_t) t * H + head) * 2 * HD + HD + i];
     } else {
         const int kh = head - H;
-        q36k::kv_store(kc + ((size_t) kh * ctx + pos) * HD + i, v);
-        q36k::kv_store(vc + ((size_t) kh * ctx + pos) * HD + i, vx[((size_t) t * HKV + kh) * HD + i]);
+        if constexpr (std::is_same_v<KT, q36k::KvQ8>) {
+            // --kv q8_0 (HD = 256 = blockDim.x): K and V of the cell as Q8_0 blocks, quants then scales (q36_attn.cuh)
+            __shared__ float qb[256];
+            const size_t row = (size_t) kh * ctx + pos;
+            const size_t split = (size_t) HKV * ctx * HD;   // the scales start after every cell's quants
+            int8_t* kq = reinterpret_cast<int8_t*>(kc_);
+            int8_t* vq = reinterpret_cast<int8_t*>(vc_);
+            q36k::q8_store(v, qb, kq + row * HD, reinterpret_cast<__half*>(kq + split) + row * (HD / q36k::kQ8Block));
+            q36k::q8_store(vx[((size_t) t * HKV + kh) * HD + i], qb, vq + row * HD,
+                           reinterpret_cast<__half*>(vq + split) + row * (HD / q36k::kQ8Block));
+        } else {
+            q36k::kv_store(kc + ((size_t) kh * ctx + pos) * HD + i, v);
+            q36k::kv_store(vc + ((size_t) kh * ctx + pos) * HD + i, vx[((size_t) t * HKV + kh) * HD + i]);
+        }
     }
 }
 
@@ -442,6 +454,13 @@ __global__ void k_kv_f16(const float* kc, const float* vc, __half* k16, __half* 
     const size_t src = (size_t) kvh * ctx * HD + rest;
     k16[i] = __float2half(kc[src]);
     v16[i] = __float2half(vc[src]);
+}
+/// --kv q8_0: one KV head's cache (P cells, quants `qs` and scales `sc` already offset to the head) as halves for the prompt
+/// attention's GEMMs: out[p][d] = q * d.  grid over P * HD.
+__global__ void k_q8_to_f16(const int8_t* qs, const __half* sc, __half* out, int64_t n, int HD) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = __float2half((float) qs[i] * __half2float(sc[(i / HD) * (HD / q36k::kQ8Block) + (int) (i % HD) / q36k::kQ8Block]));
 }
 /// The prompt's causal softmax: row (h, t) of S (ld floats, P cells) -> softmax(S * scale) over the cells
 /// [0, pos0 + t], 0 past them, as FP16 probabilities (S16, the same row offsets, ld halves).  grid (T, H), block 256.
@@ -1219,7 +1238,17 @@ struct Engine {
     /// --kv f16: the K / V cache holds halves (2 bytes a cell and dimension instead of 4); kc / vc below are then half arrays
     /// held in float* handles, and the prompt attention reads the cache itself as its FP16 operands (no k16 / v16 copies)
     bool kv16 = false;
-    size_t kv_elem() const { return kv16 ? 2 : 4; }
+    /// --kv q8_0: the cache holds Q8_0 blocks (int8 quants + a half scale per 32 values: 34 bytes per 32, as ggml): 53% of f16, 27% of
+    /// f32.  The attention reads them with the grouped-query kernel (dequantized as it loads); the prompt attention converts one KV head
+    /// at a time to halves for its GEMMs.  The handles in kc / vc point at one allocation: quants, then scales (q36_attn.cuh).
+    bool kvq8 = false;
+    const char* kv_name() const { return kvq8 ? "q8_0" : kv16 ? "f16" : "f32"; }
+    /// bytes of one KV head's cell (K or V) in the cache
+    size_t kv_cell_bytes() const { return kvq8 ? q36k::q8_cell_bytes((int) m->g.head_dim) : (size_t) m->g.head_dim * (kv16 ? 2 : 4); }
+    /// bytes of one K (or V) array of a layer
+    size_t kv_array_bytes() const { return (size_t) m->g.n_head_kv * ctx * kv_cell_bytes(); }
+    /// the prompt attention's FP16 copies of the cache (halves): all heads for f32, one head for q8_0, none for f16
+    size_t kv_half_copy() const { return kv16 ? 0 : (kvq8 ? (size_t) ctx * m->g.head_dim : (size_t) m->g.n_head_kv * ctx * m->g.head_dim); }
     /// --kv-gpu N: the K / V cache and the attention (the norm / rotary / cache write, the scores, the softmax, the sum over V) run
     /// on device N; the weights, the experts and all the rest stay on the main device.  The two cards trade the projected rows
     /// (36 KB per token and attention layer) and the attention's output (16 KB) through pinned host memory, ordered by events:
@@ -1230,8 +1259,7 @@ struct Engine {
     int kv_dev = 0, main_dev = 0;
     float* alloc_kv() const {
         DevScope ds(kvr ? kv_dev : -1);
-        const size_t n = (size_t) m->g.n_head_kv * ctx * m->g.head_dim;
-        return kv16 ? reinterpret_cast<float*>(dalloc_t<__half>(n)) : dalloc(n);
+        return reinterpret_cast<float*>(dalloc_t<uint8_t>(kv_array_bytes()));   // (zeroed: any element type)
     }
     std::vector<float*> conv, S, kc, vc;   // per layer; the MTP block's K / V at index n_layers: the CURRENT session's (select)
     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
@@ -1450,9 +1478,9 @@ struct Engine {
         if (!kvr) {   // (--kv-gpu: the attention's scratch is the cache card's, see init_kv_card)
             att_s = dalloc(kAttScoreFloats);
             att_p16 = dalloc_t<__half>(kAttScoreFloats);
-            if (!kv16) {   // (--kv f16: the cache is the FP16 operand)
-                k16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
-                v16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
+            if (!kv16) {   // (--kv f16: the cache is the FP16 operand; q8_0: one head's)
+                k16 = dalloc_t<__half>(kv_half_copy());
+                v16 = dalloc_t<__half>(kv_half_copy());
             }
             q16 = dalloc_t<__half>(T * g.n_head * g.head_dim);
         }
@@ -1546,7 +1574,7 @@ struct Engine {
             // the MTP block, and its recurrent state)
             size_t n_attn = m->has_mtp ? 1 : 0, n_gdn = 0;
             for (const Layer& L : m->layers) (L.attn ? n_attn : n_gdn) += 1;
-            const size_t per_kv = (size_t) (g.n_head_kv * g.head_dim * 2) * kv_elem() * (size_t) ctx * n_attn;
+            const size_t per_kv = kv_array_bytes() * 2 * n_attn;
             const size_t per_gdn = (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn;
             if (kvr) {   // the K / V caches on the cache's card, the recurrent states here: each card is asked for its share
                 size_t frk = 0, totk = 0;
@@ -1555,14 +1583,15 @@ struct Engine {
                     CK(cudaMemGetInfo(&frk, &totk));
                 }
                 std::fprintf(stderr, "strata-q36: --kv-gpu %d: K / V cache%s of %.2f GiB per session at a context of %d, %.2f "
-                             "GiB free on that card (%d session%s)\n", kv_dev, kv16 ? " (f16)" : "", (double) per_kv / (1 << 30), ctx,
+                             "GiB free on that card (%d session%s)\n", kv_dev, kvq8 ? " (q8_0)" : kv16 ? " (f16)" : "", (double) per_kv / (1 << 30), ctx,
                              (double) frk / (1 << 30), n_sess, n_sess > 1 ? "s" : "");
                 if (per_kv * (size_t) n_sess + ((size_t) 512 << 20) > frk) {
                     std::fprintf(stderr, "strata-q36: not enough VRAM on device %d for the K / V cache of %d session%s at a context "
                                  "of %d (%.2f GiB each, %.2f GiB free): %s\n", kv_dev, n_sess, n_sess > 1 ? "s" : "", ctx,
                                  (double) per_kv / (1 << 30), (double) frk / (1 << 30),
-                                 kv16 ? "use a shorter --max-context or fewer slots"
-                                      : "use --kv f16 (half the size), a shorter --max-context or fewer slots");
+                                 kvq8 ? "use a shorter --max-context or fewer slots"
+                                      : kv16 ? "use --kv q8_0 (about half the size), a shorter --max-context or fewer slots"
+                                             : "use --kv f16 or q8_0 (half the size or less), a shorter --max-context or fewer slots");
                     std::exit(1);
                 }
             }
@@ -1631,15 +1660,15 @@ struct Engine {
         size_t fr = 0, tot = 0;
         CK(cudaMemGetInfo(&fr, &tot));
         std::fprintf(stderr, "strata-q36: context %d cells%s, prompt chunk %d%s, %.2f GiB of VRAM free\n", ctx,
-                     kv16 ? " (K / V cache in f16)" : "", tmax, m->has_mtp ? ", MTP block loaded" : "",
+                     kvq8 ? " (K / V cache in q8_0)" : kv16 ? " (K / V cache in f16)" : "", tmax, m->has_mtp ? ", MTP block loaded" : "",
                      (double) fr / (1 << 30));
         if (!kvr) {   // where the engine's buffers went (the experts get what is left, less the reserve and the staging pair)
             size_t n_attn = m->has_mtp ? 1 : 0;
             for (const Layer& L : m->layers) n_attn += L.attn ? 1 : 0;
             const double GiB = (double) (1ull << 30);
-            const double kv_b = (double) n_attn * 2 * g.n_head_kv * ctx * g.head_dim * kv_elem() * n_sess;
+            const double kv_b = (double) n_attn * 2 * (double) kv_array_bytes() * n_sess;
             const double part_b = ((double) att_rows * n_chunk * g.head_dim + 2.0 * att_rows * n_chunk) * 4;
-            const double sc_b = (double) kAttScoreFloats * 6 + (kv16 ? 0.0 : 4.0 * g.n_head_kv * ctx * g.head_dim * 2 / 2);
+            const double sc_b = (double) kAttScoreFloats * 6 + 2.0 * kv_half_copy() * 2;
             const double used = fr_init0 > fr ? (double) (fr_init0 - fr) : 0.0;
             std::fprintf(stderr, "strata-q36: the engine took %.2f GiB of VRAM: K / V caches %.2f, attention partials %.2f, prompt scores "
                          "%.2f, the rest %.2f (prompt chunk %d: about 0.5 MiB per token; a smaller --prefill or --max-context frees "
@@ -2201,9 +2230,9 @@ struct Engine {
         R.score_floats = kAttScoreFloats;
         R.att_s = dalloc(R.score_floats);
         R.att_p16 = dalloc_t<__half>(R.score_floats);
-        if (!kv16) {   // (--kv f16: the cache is the FP16 operand)
-            R.k16 = dalloc_t<__half>(HKV * ctx * HD);
-            R.v16 = dalloc_t<__half>(HKV * ctx * HD);
+        if (!kv16) {   // (--kv f16: the cache is the FP16 operand; q8_0: one head's)
+            R.k16 = dalloc_t<__half>(kv_half_copy());
+            R.v16 = dalloc_t<__half>(kv_half_copy());
         }
         R.q16 = dalloc_t<__half>(T * H * HD);
         R.pacc = dalloc((size_t) att_rows * n_chunk * HD);
@@ -2358,6 +2387,15 @@ struct Engine {
         }
     }
 
+    /// --kv q8_0: KV head `kvh`'s first P cells of the K (or V) array `arr` as halves in `out` (P * HD), on R's stream.
+    void q8_head_to_f16(const float* arr, int kvh, int P, __half* out, const AttnRes& R) const {
+        const int HD = (int) m->g.head_dim;
+        const int8_t* qs = reinterpret_cast<const int8_t*>(arr);
+        const __half* sc = reinterpret_cast<const __half*>(qs + (size_t) m->g.n_head_kv * ctx * HD);
+        k_q8_to_f16<<<grid1((int64_t) P * HD), kThreads, 0, R.st>>>(qs + (size_t) kvh * ctx * HD, sc + (size_t) kvh * ctx * (HD / 32), out,
+                                                                    (int64_t) P * HD, HD);
+    }
+
     /// The core of an attention layer on the device `R` belongs to: the q / k norm, the rotary position and the cache write
     /// of the T projected rows (qg_ [T][2 H HD] as [q | gate] pairs, kx_ / vx_ [T][HKV HD]), then the attention over the cache
     /// (graph_mode: the chunk grid covers the whole context); the gated result in att_ [T][H HD].  All on R.st, with R's scratch.
@@ -2381,7 +2419,8 @@ struct Engine {
                                                                   H, HKV, HD, m->n_rot, dpos, ctx, m->rope_base, m->eps,
                                                                   R.delta, mtab, rs);
         };
-        if (kv16) prep(std::type_identity<__half>{});
+        if (kvq8) prep(std::type_identity<q36k::KvQ8>{});
+        else if (kv16) prep(std::type_identity<__half>{});
         else prep(std::type_identity<float>{});
         auto split_k = [&](int tb, int te) {   // the queries tb .. te - 1 of the chunk
             // split-K over 256-cell chunks; the chunk grid covers every cell a row can see (graph mode: the whole
@@ -2402,9 +2441,13 @@ struct Engine {
                 // decoded 6 tokens/s at 25K of context against 60 at a short one).  STRATA_Q36_OLD_ATTN=1: the old kernel
                 // (A/B).  HIP keeps the old one.
                 static const bool gqa_attn = std::getenv("STRATA_Q36_OLD_ATTN") == nullptr;
-                auto part = [&](auto kt) {   // kt: std::type_identity<float or __half>, the cache's element type
+                auto part = [&](auto kt) {   // kt: std::type_identity<float, __half or KvQ8>, the cache's element type
                     using KT = typename decltype(kt)::type;
-                    if (gqa_attn_ok && gqa_attn)
+                    if constexpr (std::is_same_v<KT, q36k::KvQ8>) {   // (q8_0 has the grouped-query kernel only: init checked its shape)
+                        q36k::k_attn_part_gqa<KT><<<dim3(nc, nt * HKV), kChunkCells, 0, R.st>>>(
+                            R.q, rows_mode ? nullptr : kc[li], rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
+                            1.0f / sqrtf((float) HD), n_chunk, R.pacc, R.pm, R.pl, rs.cell, rs.slot, rs.kc, rs.vc);
+                    } else if (gqa_attn_ok && gqa_attn)
                         q36k::k_attn_part_gqa<KT><<<dim3(nc, nt * HKV), kChunkCells, 0, R.st>>>(
                             R.q, rows_mode ? nullptr : kc[li], rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
                             1.0f / sqrtf((float) HD), n_chunk, R.pacc, R.pm, R.pl, rs.cell, rs.slot, rs.kc, rs.vc);
@@ -2413,7 +2456,8 @@ struct Engine {
                             R.q, rows_mode ? nullptr : kc[li], rows_mode ? nullptr : vc[li], dpos, t0, H, HKV, ctx,
                             1.0f / sqrtf((float) HD), n_chunk, R.pacc, R.pm, R.pl, rs);
                 };
-                if (kv16) part(std::type_identity<__half>{});
+                if (kvq8) part(std::type_identity<q36k::KvQ8>{});
+                else if (kv16) part(std::type_identity<__half>{});
                 else part(std::type_identity<float>{});
                 k_attn_merge<<<nt * H, HD, 0, R.st>>>(R.pacc, R.pm, R.pl, R.gate, dpos, t0, H, n_chunk, att_, rs);
             }
@@ -2425,9 +2469,11 @@ struct Engine {
         auto gemm_slice = [&](int t0, int nt, int P, int ldp, int G) -> bool {
             const float one = 1.0f, zero = 0.0f;
             for (int kvh = 0; kvh < HKV; ++kvh) {
-                // --kv f16: the cache rows are the FP16 operand already (cells HD apart, a KV head ctx * HD)
+                // --kv f16: the cache rows are the FP16 operand already (cells HD apart, a KV head ctx * HD); q8_0: this head's P cells
+                // converted to halves in R.k16
                 const __half* Kh = kv16 ? reinterpret_cast<const __half*>(kc[li]) + (size_t) kvh * ctx * HD
-                                        : R.k16 + (size_t) kvh * P * HD;
+                                        : kvq8 ? R.k16 : R.k16 + (size_t) kvh * P * HD;
+                if (kvq8) q8_head_to_f16(kc[li], kvh, P, R.k16, R);
                 const __half* Qh = R.q16 + ((size_t) t0 * H + kvh * G) * HD;
                 float* Sh = R.att_s + (size_t) kvh * G * nt * ldp;
                 const cublasStatus_t cs = cublasGemmStridedBatchedEx(
@@ -2442,7 +2488,8 @@ struct Engine {
                                                                1.0f / sqrtf((float) HD));
             for (int kvh = 0; kvh < HKV; ++kvh) {
                 const __half* Vh = kv16 ? reinterpret_cast<const __half*>(vc[li]) + (size_t) kvh * ctx * HD
-                                        : R.v16 + (size_t) kvh * P * HD;
+                                        : kvq8 ? R.v16 : R.v16 + (size_t) kvh * P * HD;
+                if (kvq8) q8_head_to_f16(vc[li], kvh, P, R.v16, R);
                 const __half* Sh = R.att_p16 + (size_t) kvh * G * nt * ldp;
                 float* Oh = att_ + ((size_t) t0 * H + kvh * G) * HD;
                 const cublasStatus_t cs = cublasGemmStridedBatchedEx(
@@ -2462,7 +2509,7 @@ struct Engine {
             const int ldp = (P + 7) / 8 * 8;
             const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (R.score_floats / ((size_t) H * ldp))));
             const int G = H / HKV;
-            if (!kv16)
+            if (!kv16 && !kvq8)
                 k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, R.st>>>(kc[li], vc[li], R.k16, R.v16, ctx, P, HD, HKV);
             k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, R.st>>>(R.q, R.q16, (int64_t) T * H * HD);
             for (int t0 = 0; t0 < T; t0 += tq) {
@@ -3195,7 +3242,7 @@ struct Engine {
         const Sess& a = sess[(size_t) src];
         Sess& b = sess[(size_t) dst];
         const size_t C = (size_t) g.ssm_conv_channels;
-        const size_t row = (size_t) ctx * g.head_dim * kv_elem();
+        const size_t row = (size_t) ctx * g.head_dim * (kvq8 ? 1 : (kv16 ? 2 : 4));   // one head's row of the (first) array
         for (size_t l = 0; l < a.conv.size(); ++l) {
             if (a.conv[l]) {
                 CK(cudaMemcpyAsync(b.conv[l], a.conv[l], C * (g.ssm_d_conv - 1) * 4, cudaMemcpyDeviceToDevice, st));
@@ -3205,10 +3252,18 @@ struct Engine {
             if (a.kc[l] && a.pos > 0) {
                 DevScope ds(kvr ? kv_dev : -1);
                 cudaStream_t cs = kvr ? ar_kv.st : st;
-                CK(cudaMemcpy2DAsync(b.kc[l], row, a.kc[l], row, (size_t) a.pos * g.head_dim * kv_elem(), (size_t) g.n_head_kv,
-                                     cudaMemcpyDeviceToDevice, cs));
-                CK(cudaMemcpy2DAsync(b.vc[l], row, a.vc[l], row, (size_t) a.pos * g.head_dim * kv_elem(), (size_t) g.n_head_kv,
-                                     cudaMemcpyDeviceToDevice, cs));
+                auto copy_arr = [&](float* dst, const float* src) {
+                    // the first src.pos cells of every KV head: f32 / f16 one array of rows; q8_0 two (the quants, then the scales)
+                    CK(cudaMemcpy2DAsync(dst, row, src, row, (size_t) a.pos * g.head_dim * (kvq8 ? 1 : (kv16 ? 2 : 4)),
+                                         (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, cs));
+                    if (kvq8) {
+                        const size_t off = (size_t) g.n_head_kv * ctx * g.head_dim, srow = (size_t) ctx * (g.head_dim / 32) * 2;
+                        CK(cudaMemcpy2DAsync(reinterpret_cast<char*>(dst) + off, srow, reinterpret_cast<const char*>(src) + off, srow,
+                                             (size_t) a.pos * (g.head_dim / 32) * 2, (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, cs));
+                    }
+                };
+                copy_arr(b.kc[l], a.kc[l]);
+                copy_arr(b.vc[l], a.vc[l]);
             }
         }
         if (kvr) {   // (the cache's copies are on the cache card's stream)
@@ -4311,7 +4366,7 @@ int strata::qwen35::run(int argc, char** argv) {
     double expert_vram = -1.0;
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
-    bool serve_mode = false, graph = true, vision = false, batch_mtp = false, kv16 = false;
+    bool serve_mode = false, graph = true, vision = false, batch_mtp = false, kv16 = false, kvq8 = false;
     int vram_reserve = -1;
     bool drop_packed = false;
     bool kv_p2p = false;
@@ -4355,9 +4410,10 @@ int strata::qwen35::run(int argc, char** argv) {
             // default, unchanged).  Flash-Next's int8 / q4_0 / k8v4 are not this family's: said, and the default kept.
             std::string v = next();
             for (char& ch : v) ch = (char) std::tolower((unsigned char) ch);
-            if (v == "f16" || v == "fp16" || v == "half") kv16 = true;
-            else if (v == "f32" || v == "fp32" || v == "float") kv16 = false;
-            else std::fprintf(stderr, "strata-q36: ignoring --kv %s (this family's cache is f16 or f32)\n", v.c_str());
+            if (v == "f16" || v == "fp16" || v == "half") { kv16 = true; kvq8 = false; }
+            else if (v == "f32" || v == "fp32" || v == "float") { kv16 = false; kvq8 = false; }
+            else if (v == "q8_0" || v == "q8" || v == "int8") { kv16 = false; kvq8 = true; }
+            else std::fprintf(stderr, "strata-q36: ignoring --kv %s (this family's cache is f16, q8_0 or f32)\n", v.c_str());
         }
         else if (a == "--kv-p2p") kv_p2p = true;   // --kv-gpu: the cards trade the attention's rows by peer copies (checked at load)
         else if (a == "--kv-gpu") {
@@ -4424,6 +4480,20 @@ int strata::qwen35::run(int argc, char** argv) {
     Engine E;
     E.use_graph = graph;
     E.kv16 = kv16;
+    E.kvq8 = kvq8;
+    if (kvq8) {   // the Q8_0 cache has the grouped-query kernel and the 256-wide head only (and not on HIP)
+#if defined(__HIPCC__)
+        const bool shape_ok = false;
+#else
+        const bool shape_ok = m.g.head_dim == q36k::kAttnHD && m.g.n_head == m.g.n_head_kv * q36k::kAttnGroup &&
+                              kChunkCells == q36k::kAttnChunk && kThreads == q36k::kAttnThreads;
+#endif
+        if (!shape_ok) {
+            std::fprintf(stderr, "strata-q36: --kv q8_0 needs the CUDA grouped-query attention (head dimension 256, 8 query heads per KV "
+                         "head); use --kv f16\n");
+            return 2;
+        }
+    }
     E.vram_reserve_mib = vram_reserve;
     E.drop_packed = drop_packed;
     if (kv_gpu >= 0) {
@@ -4488,7 +4558,7 @@ int strata::qwen35::run(int argc, char** argv) {
             // (measured on a 32 GB R9700 at 8192 cells, 512 chunk: 1.77 GiB of buffers + K / V; the free room after init must still hold
             // every expert and the 0.77 GiB reserve, or place_experts gives the packed decode copies back - slower decode - or goes hybrid)
             const int ns = std::max(1, batch);
-            double kv_one = kv16 ? 22528.0 : 45056.0, kv_shared = kv16 ? 3072.0 : 5120.0;   // per cell: a session's K / V, and the fp16 copies the prompt attention keeps (--kv f16: none)
+            double kv_one = kvq8 ? 11968.0 : kv16 ? 22528.0 : 45056.0, kv_shared = kv16 || kvq8 ? 3072.0 : 5120.0;   // per cell: a session's K / V, and the fp16 copies the prompt attention keeps (--kv f16: none)
             if (E.kvr) kv_one = kv_shared = 0.0;   // --kv-gpu: they are the other card's
             const double sess_extra = std::max(0.0, (double) ctx * (kv_one * ns + kv_shared) - 8192.0 * (kv_one + kv_shared));
             const int cap = ns > 1 ? 1024 : 4096;

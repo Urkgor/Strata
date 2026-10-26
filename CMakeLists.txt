@@ -291,7 +291,7 @@ if(STRATA_BUILD_TESTS)
   # the Qwen3.6 decode attention for grouped queries against the old kernel, bit for bit, on the CPU (one std::thread per CUDA thread)
   add_executable(q36_attn_gqa_test tests/core/q36_attn_gqa_test.cpp)
   target_include_directories(q36_attn_gqa_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
-  target_compile_options(q36_attn_gqa_test PRIVATE -ffp-contract=off)
+  target_compile_options(q36_attn_gqa_test PRIVATE -ffp-contract=off -fno-strict-aliasing)
   target_link_libraries(q36_attn_gqa_test PRIVATE Threads::Threads)
   add_test(NAME q36_attn_gqa_test COMMAND q36_attn_gqa_test)
   # the check of the prompt attention's cuBLAS GEMMs on the cache's card (--kv-gpu): its index arithmetic against a CPU model of the GEMM
