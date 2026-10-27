@@ -75,7 +75,7 @@ class Translation(unittest.TestCase):
 @unittest.skipUnless(regex, "needs the `regex` module to compare with")
 class AgainstRegex(unittest.TestCase):
     def test_every_code_point_of_every_class(self):
-        for pattern in (r"\p{L}", r"\p{M}", r"\p{N}", r"\s", r"\S", r"\P{L}"):
+        for pattern in (r"\p{L}", r"\p{M}", r"\p{N}", r"\p{P}", r"\p{S}", r"\s", r"\S", r"\P{L}", r"\P{P}"):
             a, b = regex.compile(pattern), ST.compile_pattern(pattern)
             bad = [cp for cp in range(0x110000) if (a.fullmatch(chr(cp)) is None) != (b.fullmatch(chr(cp)) is None)]
             self.assertEqual(bad, [], "%s differs at %s" % (pattern, [hex(c) for c in bad[:5]]))
@@ -96,6 +96,16 @@ class AgainstRegex(unittest.TestCase):
         for _ in range(20000):
             text = "".join(chr(rng.choice(pools[rng.choice(keys)])) for _ in range(rng.randint(0, 24)))
             self.assertEqual(b.findall(text), a.findall(text), repr(text))
+
+    def test_the_deepseek_pattern_sequence_splits_the_same(self):
+        # the DeepSeek-V3 / V4.1 pre-tokenizer: a sequence of patterns, with \p{P} and \p{S} inside a negated set
+        rng = random.Random(5)
+        alphabet = "aZ\u00e9\u4e2d\u3072\u30ab 01!?\n\r\t.,;-\u2014\u20ac\u00a9\U0001f600\u00a0\u2028_`{}[]\\"
+        seq_a = [regex.compile(x) for x in ST.DEEPSEEK3_PATTERNS]
+        seq_b = [ST.compile_pattern(x) for x in ST.DEEPSEEK3_PATTERNS]
+        for _ in range(5000):
+            text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 40)))
+            self.assertEqual(ST._sequence_findall(seq_b, text), ST._sequence_findall(seq_a, text), repr(text))
 
     def test_the_table_is_what_regex_gives_today(self):
         import gen_unicode_classes
