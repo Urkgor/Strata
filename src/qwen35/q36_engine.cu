@@ -4315,6 +4315,19 @@ struct Serve {
                 rc.src = q36ck::kLive;
             }
         }
+        if (E.ck_on) {   // why a held start was or was not reused: how far each one agrees with this prompt, and the first token that differs
+            auto lcp = [&](const std::vector<int32_t>& h) {
+                return (size_t) (std::mismatch(h.begin(), h.end(), ids.begin(), ids.end()).first - h.begin());
+            };
+            auto diff = [&](const std::vector<int32_t>& h, size_t l) {
+                return l < h.size() && l < ids.size() ? "token " + std::to_string(ids[l]) + " here, " + std::to_string(h[l]) + " there" : std::string("none");
+            };
+            const size_t ll = lcp(ss.live), lt = ss.turn.valid ? lcp(ss.turn.ids) : 0, lp = E.pin.valid ? lcp(E.pin.ids) : 0;
+            std::fprintf(stderr, "strata serve: prompt %zu tokens, pin=%lld; agrees with the held state on %zu of %zu (%s), the turn "
+                         "checkpoint on %zu of %zu, the pin on %zu of %zu (%s)\n", ids.size(), req_pin, ll, ss.live.size(),
+                         diff(ss.live, ll).c_str(), lt, ss.turn.valid ? ss.turn.ids.size() : (size_t) 0, lp,
+                         E.pin.valid ? E.pin.ids.size() : (size_t) 0, diff(E.pin.ids, lp).c_str());
+        }
         E.select(s);
         if (rc.src != q36ck::kLive && reuse > 0) {   // a checkpoint's state back: its tokens are the start of this prompt
             E.ck_restore(rc.src == q36ck::kPin ? E.pin : ss.turn, ss, rc.src == q36ck::kPin);
