@@ -128,6 +128,51 @@ the new kernels off. Gate/up for Q4_K experts uses the V2K kernels (`STRATA_EXPE
 
 More numbers are in [History](#history--older-measurements).
 
+## Prompt cache: turn checkpoint and pinned prefix
+
+The engine holds a conversation as a recurrent state (the GDN layers cannot step back) and a K / V cache. A request used to
+reuse that state only when **all** the tokens it held, the prompt and every token generated for it, were the start of the
+new prompt. A chat client sends the previous reply again as its chat template renders it (thinking trimmed, tool calls
+written out again), so one token of difference anywhere and the whole prompt was read again. Two more reuse points fix
+that, as in the Flash-Next engine:
+
+- **The turn checkpoint.** A prompt is read in two parts, up to its last turn token (`<|im_start|>`, the start of the new
+  assistant turn) and then on. At that point the engine keeps the recurrent state. The next request of the same chat renders
+  the conversation so far the same way (the header and the reply's thinking are what may differ, and they come after the
+  checkpoint), so it starts there. One per conversation slot.
+- **The pin.** A request that carries `pin=N` (the server turns `"strata_prefix"` into it) is also cut and checkpointed after
+  its first N tokens: a long shared start (a system prompt and a document) followed by something different each time. The
+  pin is kept apart from the turn checkpoint and survives other requests. One pin for the engine; a new `pin` replaces it.
+
+The longest start wins: the held state first (it keeps the MTP drafts and costs nothing to restore), then the turn
+checkpoint, then the pin. `DONE` reports what was not read again, and the server shows it as `cache_n` in `/v1/status`
+(`last_timings`).
+
+| Option | Effect |
+| --- | --- |
+| `--prompt-cache N` | `0` off (the old behaviour, byte for byte), `1` or more the turn checkpoint, `3` or more also the pin. Default 6. `STRATA_Q36_CKPT=0` turns it off for an A/B run. |
+| `--turn-token ID` | The token that opens a chat turn. Default 248045 (`<|im_start|>`). |
+| `"strata_checkpoint": false` (per request) | A one-shot request that no later one continues: it keeps no checkpoint. |
+| `"strata_prefix"` (per request) | See [DETAILS.md](DETAILS.md#conversation-cache). The server resolves it to `pin=N`. |
+
+`--prompt-cache-every`, `--prompt-cache-root` and `--prompt-cache-spread` belong to the other engine and are ignored here
+(one turn checkpoint and one pin per conversation slot, not a series).
+
+**What a checkpoint holds, and what it costs.** The recurrent state of the GDN layers, `hlast`, the position and the
+tokens (about 64 MiB of pinned host RAM per checkpoint; the start-up line gives the exact figure). The attention K / V cache is
+positional: the cells before the checkpoint are not changed by what is decoded after it, so a turn checkpoint does not copy
+them. It is therefore valid only while its conversation slot keeps those cells: a request that reads from before it in the
+same slot (an unrelated prompt in a one-slot engine) drops it, and `--parallel 2` or more keeps a chat apart from side
+requests. The pin cannot rely on that, so it keeps its own copy of the K / V cells in host RAM (about 20 KB per token in
+f16, 11 KB in q8_0, 41 KB in f32; a 20K-token pin is 0.4 GB in f16), taken once when the pin is made and written back when it
+is used. Checkpoints are not copied with a session when the engine moves a conversation between slots.
+
+**Not measured on a card.** The decision (what is reused, where the read is cut, the pin's K / V layout for f32, f16 and q8_0)
+is tested on the CPU (`tests/core/q36_ckpt_test.cpp`). The restore itself, and that a request after a restore gives the same
+tokens as on a fresh engine, have not been run: there was no GPU. A read is cut at the turn token, so the chunk boundaries of
+a prompt differ from a one-piece read, which can change the last bits of a float result; the same prompt read twice is cut the
+same way.
+
 ## Limits
 
 - Eight slots at most (the window holds 8 rows). `--batch-mtp` shares those rows between slots and proposals.

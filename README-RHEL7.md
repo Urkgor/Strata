@@ -179,6 +179,15 @@ Avec `--kv-gpu`, la carte de 11 Go n'a plus le cache : tout ce qui reste (moins 
 
 **Aucun gain n'est mesuré** (pas de carte ici) : comparez le débit en décodage avec et sans, sur le même prompt, et regardez `hybrid experts: N of 256 per layer in VRAM`. Autre levier déjà là : `--prefill 1024` au lieu de `auto` libère de la VRAM (≈ 0,5 Mo par token de bloc) mais ralentit nettement le prompt (le bloc diffuse tous les experts par PCIe à chaque fois).
 
+## Relecture de code : ne pas relire tout le prompt à chaque tour (`--prompt-cache`)
+
+Un client de code renvoie à chaque requête tout l'historique, avec la réponse précédente réécrite par le modèle de conversation (réflexion raccourcie, appels d'outils réécrits). Un seul token différent et le moteur relisait **tout** le prompt. Le moteur garde maintenant, par conversation, l'état juste avant le dernier `<|im_start|>` du prompt (le « point de tour ») : la requête suivante du même chat repart de là. Un `pin=N` (que le serveur déduit de `"strata_prefix"`) garde en plus l'état après un long début commun (prompt système, documents), même si d'autres requêtes passent entre-temps.
+
+- **Activé par défaut** (`--prompt-cache 6`) ; `"--prompt-cache", "0"` ou `STRATA_Q36_CKPT=0` redonne exactement l'ancien comportement. Le pin demande `--prompt-cache 3` ou plus.
+- Le journal dit `prompt cache on: …` au démarrage (mémoire, ≈ 64 Mo de RAM épinglée par conversation), puis `turn checkpoint at N tokens`, `restored the turn checkpoint …`, et à chaque requête `… = N reused (turn checkpoint) + M read`. Dans `/v1/status`, `last_timings.cache_n` est la part non relue.
+- **Une seule place de conversation (`--parallel 1`)** : le point de tour est perdu si une requête sans rapport (titre, sous-agent) passe entre deux tours, car elle écrase le cache K/V de la place. Avec `--parallel 2`, les requêtes annexes tombent dans l'autre place. Le pin, lui, garde sa propre copie du cache K/V en RAM (≈ 0,4 Go pour 20 000 tokens en f16) et survit.
+- Détails, limites : `docs/QWEN36.md`. **Pas exécuté sur une carte** : seule la logique de décision est testée sur CPU. À vérifier chez vous : deux requêtes qui se suivent, la seconde doit afficher `reused` ≈ la taille de la première.
+
 ## Décodage lent avec un long contexte (6 tk/s à 25 000 tokens contre 60 à petit contexte)
 
 Cause trouvée dans le code : l'attention du décode lisait la mémoire des clés (K) de façon non coalescée (chaque fil lisait sa propre ligne de 1 Ko) et relisait K et V pour chacune des 8 têtes d'un même groupe. Corrigé (`git pull`, puis recompiler, étape 3) : un bloc sert les 8 têtes et lit K par tranches en mémoire partagée. Les résultats sont **identiques bit à bit** à l'ancien noyau (test CPU `q36_attn_gqa_test`), seul l'ordre des lectures change.

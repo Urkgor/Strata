@@ -30,6 +30,7 @@
 #include "q36_kernels.cuh"
 #include "q36_attn.cuh"
 #include "q36_blas_check.hpp"
+#include "q36_ckpt.hpp"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -1213,10 +1214,18 @@ template <class T> T* dalloc_t(size_t n) {
 }
 
 /// A picture in a prompt: its first cell, its rows, and the hash the conversation cache compares it by.
-struct ImgKey {
-    int64_t cell = 0, n = 0;
-    uint64_t hash = 0;
-    bool operator==(const ImgKey& o) const { return cell == o.cell && n == o.n && hash == o.hash; }
+using ImgKey = q36ck::ImgKey;
+
+/// A saved recurrent state (the prompt cache's turn checkpoint and pin, q36_ckpt.hpp): the tokens it covers, and in pinned host
+/// memory the GDN state of every layer then hlast.  The K / V cells are NOT in it: a turn checkpoint relies on its session's
+/// cache (valid while no read starts before its position), the pin keeps its own copy (Engine::pin_kv).
+struct Ckpt {
+    bool valid = false;
+    int64_t pos = 0;
+    int32_t rdelta = 0;
+    std::vector<int32_t> ids;
+    std::vector<ImgKey> imgs;
+    uint8_t* state = nullptr;
 };
 
 struct Engine {
@@ -1304,6 +1313,7 @@ struct Engine {
         int32_t rdelta = 0;                 // rotary offset of the text after the last picture (see k_attn_prep)
         std::vector<int32_t> live;          // the tokens whose state it holds (cell i = live[i])
         std::vector<ImgKey> imgs;           // the pictures among them
+        Ckpt turn;                          // the state before the last turn token of the last prompt read here (--prompt-cache)
         bool active = false;                // a batch slot is decoding in it
         uint64_t used = 0;                  // when it was last used (the LRU pick)
     };
@@ -3071,11 +3081,11 @@ struct Engine {
             mtab_now = nullptr;
             map_on = false;
             if (!on_chunk(i + T)) {
-                if (m->hybrid) rebalance(hybrid_swaps_after_prompt);
+                if (m->hybrid && !defer_rebalance) rebalance(hybrid_swaps_after_prompt);
                 return i + T;
             }
         }
-        if (m->hybrid) rebalance(hybrid_swaps_after_prompt);
+        if (m->hybrid && !defer_rebalance) rebalance(hybrid_swaps_after_prompt);
         return n;
     }
 
@@ -3234,6 +3244,151 @@ struct Engine {
         CK(cudaStreamSynchronize(st));
     }
 
+    // ---- the prompt cache (--prompt-cache): checkpoints of the recurrent state, so that a request that shares only a START with
+    // what the engine holds does not read it all again.  The decision is q36_ckpt.hpp's; this is the state it moves.
+    int prompt_cache = 6;          // 0: off; 1 or more: the turn checkpoint; 3 or more: also the pin (the other engine's meaning)
+    int32_t turn_token = 248045;   // <|im_start|>
+    bool ck_on = false;            // the host buffers are there
+    Ckpt pin;                      // one for the engine; its K / V cells are pin_kv (host), apart from every session's cache
+    uint8_t* pin_kv = nullptr;
+    size_t pin_kv_cap = 0;
+    /// bytes of one saved state: the conv and S of every GDN layer, then hlast
+    size_t ck_state_size() const {
+        const auto& g = m->g;
+        size_t n = (size_t) g.n_embd * 4;
+        for (size_t l = 0; l < sess[0].conv.size(); ++l)
+            if (sess[0].conv[l])
+                n += (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1) * 4 +
+                     (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4;
+        return n;
+    }
+    /// the K / V arrays of a session: one K and one V per attention state (layers and the MTP block)
+    size_t kv_array_count() const {
+        size_t n = 0;
+        for (const float* a : sess[0].kc) n += a ? 2 : 0;
+        return n;
+    }
+    /// bytes of the pin's K / V copy for n cells
+    size_t pin_kv_bytes(int64_t n) const { return kv_array_count() * (size_t) m->g.n_head_kv * (size_t) n * kv_cell_bytes(); }
+
+    /// The pinned host buffers (the pin's state and each session's turn checkpoint).  False, and the checkpoints stay off, when
+    /// the host cannot give them.
+    bool ck_init() {
+        const char* env = std::getenv("STRATA_Q36_CKPT");
+        if (prompt_cache <= 0 || (env != nullptr && std::atoi(env) == 0)) {
+            ck_on = false;
+            return false;
+        }
+        const size_t sz = ck_state_size();
+        std::vector<uint8_t**> bufs;
+        for (Sess& ss : sess) bufs.push_back(&ss.turn.state);
+        bufs.push_back(&pin.state);
+        for (uint8_t** buf : bufs)
+            if (cudaHostAlloc((void**) buf, sz, cudaHostAllocPortable) != cudaSuccess) {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata-q36: --prompt-cache: no pinned host memory for the checkpoints (%.0f MiB each): off\n",
+                             (double) sz / (1 << 20));
+                return false;
+            }
+        ck_on = true;
+        const std::string pin_note = prompt_cache >= 3
+            ? "; and one pinned prefix (pin=N: " + std::to_string(sz >> 20) + " MiB + " +
+                  std::to_string((pin_kv_bytes(1000) + ((size_t) 1 << 19)) >> 20) + " MiB of K / V per 1000 tokens, host RAM)"
+            : "; no pin (it needs --prompt-cache 3 or more)";
+        std::fprintf(stderr, "strata-q36: prompt cache on: a turn checkpoint per session (%.0f MiB of pinned host RAM each, %d "
+                     "session%s) taken before the last token %d of a prompt%s; --prompt-cache 0 (or STRATA_Q36_CKPT=0) turns it off\n",
+                     (double) sz / (1 << 20), n_sess, n_sess > 1 ? "s" : "", (int) turn_token, pin_note.c_str());
+        return true;
+    }
+    /// The session's recurrent state to / from a saved one (blocking: the stream is synchronized at the end)
+    void ck_state_io(Sess& ss, uint8_t* host, bool to_host) {
+        const auto& g = m->g;
+        const size_t cb = (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1) * 4;
+        const size_t sb = (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4;
+        size_t off = 0;
+        auto io = [&](void* dev, size_t n) {
+            CK(cudaMemcpyAsync(to_host ? (void*) (host + off) : dev, to_host ? (const void*) dev : (const void*) (host + off), n,
+                               to_host ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice, st));
+            off += n;
+        };
+        for (size_t l = 0; l < ss.conv.size(); ++l) {
+            if (!ss.conv[l]) continue;
+            io(ss.conv[l], cb);
+            io(ss.S[l], sb);
+        }
+        io(ss.hlast, (size_t) g.n_embd * 4);
+        CK(cudaStreamSynchronize(st));
+    }
+    /// The first n cells of every KV head of the session's K / V arrays to / from a dense host buffer (pin_kv).  Raw bytes, so the
+    /// cache comes back exactly: f32 / f16 one array of rows, q8_0 two (the quants, then the scales).
+    void kv_prefix_io(Sess& ss, uint8_t* host, int64_t n, bool to_host) {
+        const auto& g = m->g;
+        DevScope ds(kvr ? kv_dev : -1);
+        size_t off = 0;
+        auto one = [&](float* arr) {
+            std::vector<q36ck::Copy2D> cp;
+            off += q36ck::kv_prefix_copies(off, n, ctx, (int) g.head_dim, (int) g.n_head_kv, kvq8 ? 1 : (kv16 ? 2 : 4), kvq8, cp);
+            uint8_t* dev = reinterpret_cast<uint8_t*>(arr);
+            for (const q36ck::Copy2D& c : cp) {
+                if (to_host) CK(cudaMemcpy2D(host + c.host_off, c.width, dev + c.dev_off, c.dev_pitch, c.width, c.height, cudaMemcpyDeviceToHost));
+                else CK(cudaMemcpy2D(dev + c.dev_off, c.dev_pitch, host + c.host_off, c.width, c.width, c.height, cudaMemcpyHostToDevice));
+            }
+        };
+        for (size_t l = 0; l < ss.kc.size(); ++l)
+            if (ss.kc[l]) {
+                one(ss.kc[l]);
+                one(ss.vc[l]);
+            }
+        CK(cudaDeviceSynchronize());   // (a copy from pageable memory may return before it lands; the kernels run on another stream)
+    }
+    /// Keep the current session's state as of `p` tokens (ids[0, p)) in `c`; for the pin, its K / V cells too.  The pictures
+    /// are those that lie entirely before p.  False when the pin's K / V copy found no host memory (the pin is then not kept).
+    bool ck_take(Ckpt& c, Sess& ss, int64_t p, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, bool with_kv) {
+        const auto t0 = Clock::now();
+        c.valid = false;
+        if (with_kv) {
+            const size_t need = pin_kv_bytes(p);
+            if (need > pin_kv_cap) {
+                if (pin_kv) cudaFreeHost(pin_kv);
+                pin_kv = nullptr;
+                pin_kv_cap = 0;
+                if (cudaHostAlloc((void**) &pin_kv, need, cudaHostAllocPortable) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    pin_kv = static_cast<uint8_t*>(std::malloc(need));   // pageable: slower, still right
+                }
+                if (!pin_kv) {
+                    std::fprintf(stderr, "strata serve: pin: no host memory for %.0f MiB of K / V: not kept\n", (double) need / (1 << 20));
+                    return false;
+                }
+                pin_kv_cap = need;
+            }
+            kv_prefix_io(ss, pin_kv, p, true);
+        }
+        ck_state_io(ss, c.state, true);
+        c.pos = p;
+        c.rdelta = ss.rdelta;
+        c.ids.assign(ids.begin(), ids.begin() + (long) p);
+        c.imgs = q36ck::imgs_before(imgs, p);
+        c.valid = true;
+        std::fprintf(stderr, "strata serve: %s checkpoint at %lld tokens (%.0f ms%s)\n", with_kv ? "pinned" : "turn", (long long) p,
+                     ms_since(t0), with_kv ? ", K / V copied to host RAM" : "");
+        return true;
+    }
+    /// The current session takes checkpoint `c`: its recurrent state back, for the pin its K / V cells too (the session's own
+    /// cells are intact for a turn checkpoint); position and held tokens as the checkpoint says.
+    void ck_restore(const Ckpt& c, Sess& ss, bool with_kv) {
+        const auto t0 = Clock::now();
+        if (with_kv) kv_prefix_io(ss, pin_kv, c.pos, false);
+        ck_state_io(ss, c.state, false);
+        ss.live = c.ids;
+        ss.imgs = c.imgs;
+        ss.pos = c.pos;
+        ss.rdelta = c.rdelta;
+        pos = c.pos;
+        std::fprintf(stderr, "strata serve: restored the %s checkpoint at %lld tokens (%.0f ms)\n", with_kv ? "pinned" : "turn",
+                     (long long) c.pos, ms_since(t0));
+    }
+
     /// Session dst takes session src's state: the recurrent state, the cache's first src.pos cells, the position, the
     /// pictures' offset (for a conversation read in one session that continues in another).
     void copy_session(int src, int dst) {
@@ -3242,6 +3397,7 @@ struct Engine {
         const auto& g = m->g;
         const Sess& a = sess[(size_t) src];
         Sess& b = sess[(size_t) dst];
+        b.turn.valid = false;   // (its cache cells are overwritten; the checkpoints are not copied with the session)
         const size_t C = (size_t) g.ssm_conv_channels;
         const size_t row = (size_t) ctx * g.head_dim * (kvq8 ? 1 : (kv16 ? 2 : 4));   // one head's row of the (first) array
         for (size_t l = 0; l < a.conv.size(); ++l) {
@@ -3280,6 +3436,7 @@ struct Engine {
         if (dst == cur) load_cur();
     }
     int hybrid_swaps_after_prompt = 2048;
+    bool defer_rebalance = false;   // a prompt read in pieces (checkpoints) moves the experts' slots once, after the last piece
     /// the MTP seed rows of a prompt chunk: a buffer the block's own forward does not use (`moe_out`, [tmax][N])
     float* mtp_seed() { return moe_out; }
 
@@ -4017,26 +4174,29 @@ struct Serve {
 
     /// The length of session ss's held tokens when they are a proper start of `ids` with the same pictures, else 0.
     size_t match_len(const Engine::Sess& ss, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) const {
-        const size_t L = ss.live.size();
-        if (L == 0 || L >= ids.size() || !std::equal(ss.live.begin(), ss.live.end(), ids.begin())) return 0;
-        std::vector<ImgKey> in_live;
-        for (const ImgKey& k : imgs) {
-            if (k.cell + k.n <= (int64_t) L) in_live.push_back(k);
-            else if (k.cell < (int64_t) L) return 0;   // the held tokens end inside a picture
-        }
-        return in_live == ss.imgs ? L : 0;
+        return q36ck::match(ss.live, ss.imgs, ids, imgs);
     }
 
-    /// The session a request alone takes: the one holding the longest start of its prompt, else an empty one, else the
-    /// least recently used (never a decoding slot).
+    /// What session ss need not read of `ids`: its held state (the fast path), its turn checkpoint, or the pin - the longest start
+    /// (q36_ckpt.hpp).  The pin is the engine's, usable in any session.
+    q36ck::Choice reuse_choice(const Engine::Sess& ss, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) const {
+        const q36ck::Held turn{E.ck_on && ss.turn.valid, &ss.turn.ids, &ss.turn.imgs};
+        const q36ck::Held pn{E.ck_on && E.pin.valid, &E.pin.ids, &E.pin.imgs};
+        return q36ck::choose(ss.live, ss.imgs, turn, pn, ids, imgs);
+    }
+
+    /// The session a request alone takes: the one holding the longest start of its prompt (its state or its turn checkpoint), else
+    /// an empty one, else the least recently used (never a decoding slot).
     int pick_session(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) const {
         int best = -1, free_empty = -1, lru = -1;
         size_t bl = 0;
         for (int i = 0; i < E.n_sess; ++i) {
             const Engine::Sess& ss = E.sess[(size_t) i];
             if (ss.active) continue;
-            const size_t l = match_len(ss, ids, imgs);
-            if (l > bl) { bl = l; best = i; }
+            // (the pin does not rank sessions: it can be restored into any)
+            const q36ck::Choice c = q36ck::choose(ss.live, ss.imgs, q36ck::Held{E.ck_on && ss.turn.valid, &ss.turn.ids, &ss.turn.imgs},
+                                                  q36ck::Held{}, ids, imgs);
+            if (c.len > bl) { bl = c.len; best = i; }
             if (ss.live.empty() && free_empty < 0) free_empty = i;
             if (lru < 0 || ss.used < E.sess[(size_t) lru].used) lru = i;
         }
@@ -4067,6 +4227,8 @@ struct Serve {
         const long long max_new = std::strtoll(p, &p, 10);
         Sampling smp;
         std::vector<uint64_t> img_keys;
+        long long req_pin = 0;      // pin=N: the first N prompt tokens are a start many requests share (the server resolved it)
+        bool req_ckpt = true;       // ckpt=0: a one-shot request that no later one continues: it keeps no checkpoint
         for (;;) {
             while (*p == ' ') ++p;
             const char* st0 = p;
@@ -4085,6 +4247,8 @@ struct Serve {
             else if (key == "penalty_freq") smp.freq = std::strtof(v, nullptr);
             else if (key == "penalty_present") smp.present = std::strtof(v, nullptr);
             else if (key == "seed") smp.seed = std::strtoull(v, nullptr, 10);
+            else if (key == "pin") req_pin = std::strtoll(v, nullptr, 10);
+            else if (key == "ckpt") req_ckpt = std::atoi(v) != 0;
             else if (key == "img_keys") {
                 const char* q = v;
                 img_keys.clear();
@@ -4134,7 +4298,9 @@ struct Serve {
         // ---- the session: the held state continues when the request extends it (the recurrent state cannot step back)
         const int s = adm ? slot : pick_session(ids, ir.imgs);
         Engine::Sess& ss = E.sess[(size_t) s];
-        size_t reuse = match_len(ss, ids, ir.imgs);
+        // what of the prompt this session need not read again: its held state, its turn checkpoint, or the pin
+        q36ck::Choice rc = reuse_choice(ss, ids, ir.imgs);
+        size_t reuse = rc.len;
         if (adm) {   // another session holding more of this prompt (the conversation was read alone): copy its state
             int src = -1;
             size_t best = reuse;
@@ -4144,35 +4310,78 @@ struct Serve {
                 if (l > best) { best = l; src = i; }
             }
             if (src >= 0) {
-                E.copy_session(src, s);
+                E.copy_session(src, s);   // (the destination's turn checkpoint goes: its cache cells are overwritten)
                 reuse = best;
+                rc.src = q36ck::kLive;
             }
         }
         E.select(s);
+        if (rc.src != q36ck::kLive && reuse > 0) {   // a checkpoint's state back: its tokens are the start of this prompt
+            E.ck_restore(rc.src == q36ck::kPin ? E.pin : ss.turn, ss, rc.src == q36ck::kPin);
+            if (rc.src == q36ck::kPin) ss.turn.valid = false;   // (the pin's cells were written over the session's, from cell 0)
+        }
         if (reuse == 0) {
             E.reset();
             ss.live.clear();
             ss.imgs.clear();
         }
+        // a read from cell `reuse` overwrites the cache from there: a turn checkpoint past it has lost its cells
+        if (ss.turn.valid && !q36ck::survives(ss.turn.pos, (int64_t) reuse)) ss.turn.valid = false;
         if (geni) E.set_images(ir.rows, ir.cell_row, ir.mrope, (int64_t) ids.size(), ir.delta);
         else E.clear_images();
         const auto t0 = Clock::now();
         const int64_t fresh = (int64_t) (ids.size() - reuse);
         bool cancelled = false;
-        const int64_t got = E.process(ids.data() + reuse, fresh, [&](int64_t done) -> bool {
-            std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) fresh, ms_since(t0),
-                        (double) done / std::max(1e-9, ms_since(t0) / 1000.0));
+        // the read in pieces: up to the last turn token (and up to pin=N), a checkpoint at each cut, then on
+        std::vector<q36ck::Cut> cuts;
+        if (E.ck_on && req_ckpt) {
+            const bool pin_ok = E.prompt_cache >= 3 && req_pin > 0;
+            if (req_pin > 0 && !pin_ok)
+                std::fprintf(stderr, "strata serve: pin=%lld ignored: it needs --prompt-cache 3 or more\n", req_pin);
+            else if (req_pin >= (long long) ids.size())
+                std::fprintf(stderr, "strata serve: pin=%lld ignored: the prefix must be shorter than the prompt (%zu tokens)\n",
+                             req_pin, ids.size());
+            else if (pin_ok && req_pin <= (long long) reuse && !(E.pin.valid && E.pin.pos == req_pin))
+                std::fprintf(stderr, "strata serve: pin=%lld: no checkpoint there to keep (the read resumes from %zu)\n", req_pin, reuse);
+            cuts = q36ck::cuts(ids, (int64_t) reuse, E.turn_token, true, req_pin < (long long) ids.size() ? req_pin : 0, pin_ok, ir.imgs);
+        } else if (E.ck_on && req_pin > 0) {
+            std::fprintf(stderr, "strata serve: pin=%lld ignored: ckpt=0 keeps no checkpoint\n", req_pin);
+        }
+        std::vector<int64_t> ends;
+        for (const q36ck::Cut& c : cuts) ends.push_back(c.at);
+        ends.push_back((int64_t) ids.size());
+        int64_t from = (int64_t) reuse, got = 0;
+        auto on_piece = [&](int64_t done) -> bool {
+            const int64_t all = (from - (int64_t) reuse) + done;   // of the whole read, not of this piece
+            std::printf("PP %lld %lld %.0f %.1f\n", (long long) all, (long long) fresh, ms_since(t0),
+                        (double) all / std::max(1e-9, ms_since(t0) / 1000.0));
             std::fflush(stdout);
-            if (n_active > 0 && done < fresh) {
+            if (n_active > 0 && all < fresh) {
                 poll_control();
                 // the slots decoding go on between a read's chunks (the last chunk's
                 for (int w = 0; w < read_windows && n_active > 0; ++w) window();   // logits must stay for the first token)
             } else {
                 poll_control();
             }
-            if (stop.load() && done < fresh) { cancelled = true; return false; }
+            if (stop.load() && all < fresh) { cancelled = true; return false; }
             return true;
-        });
+        };
+        for (size_t k = 0; k < ends.size(); ++k) {
+            const int64_t len = ends[k] - from;
+            E.defer_rebalance = k + 1 < ends.size();
+            const int64_t g = E.process(ids.data() + from, len, on_piece);
+            E.defer_rebalance = false;
+            got += g;
+            if (cancelled || g < len) {
+                if (E.m->hybrid && k + 1 < ends.size()) E.rebalance(E.hybrid_swaps_after_prompt);   // (the read ends here)
+                break;
+            }
+            from = ends[k];
+            if (k < cuts.size()) {   // a cut: the state here is kept
+                if (cuts[k].turn) E.ck_take(ss.turn, ss, from, ids, ir.imgs, false);
+                if (cuts[k].pin) E.ck_take(E.pin, ss, from, ids, ir.imgs, true);
+            }
+        }
         ss.live.insert(ss.live.end(), ids.begin() + (long) reuse, ids.begin() + (long) reuse + (long) got);
         ss.imgs.clear();
         bool cut = false;
@@ -4284,8 +4493,9 @@ struct Serve {
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
                     decode_ms, finish, accepted, offered, reuse, (long long) fresh);
         std::fflush(stdout);
-        std::fprintf(stderr, "strata serve: session %d: prompt %zu tokens = %zu reused + %lld read in %.0f ms (%.1f tok/s), "
+        std::fprintf(stderr, "strata serve: session %d: prompt %zu tokens = %zu reused%s + %lld read in %.0f ms (%.1f tok/s), "
                      "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld (%s)\n", s, ids.size(), reuse,
+                     rc.src == q36ck::kTurn ? " (turn checkpoint)" : rc.src == q36ck::kPin ? " (pinned prefix)" : "",
                      (long long) fresh, prompt_ms, prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, produced,
                      decode_ms, decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, accepted, offered, finish);
     }
@@ -4357,6 +4567,7 @@ int strata::qwen35::run(int argc, char** argv) {
     int vram_reserve = -1;
     bool drop_packed = false;
     bool kv_p2p = false;
+    int prompt_cache = 6, turn_token = 248045;   // the prompt cache's checkpoints (q36_ckpt.hpp)
     int kv_gpu = -1;   // --kv-gpu N: the K / V cache and the attention on device N (-1: all on the main device)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -4402,6 +4613,13 @@ int strata::qwen35::run(int argc, char** argv) {
             else if (v == "q8_0" || v == "q8" || v == "int8") { kv16 = false; kvq8 = true; }
             else std::fprintf(stderr, "strata-q36: ignoring --kv %s (this family's cache is f16, q8_0 or f32)\n", v.c_str());
         }
+        else if (a == "--prompt-cache") prompt_cache = std::atoi(next().c_str());   // 0 off; 1+ the turn checkpoint; 3+ also the pin
+        else if (a == "--turn-token") turn_token = std::atoi(next().c_str());       // the token that opens a chat turn (<|im_start|>)
+        else if (a == "--prompt-cache-every" || a == "--prompt-cache-root") {       // the other engine's: one turn checkpoint + one pin here
+            (void) next();
+            std::fprintf(stderr, "strata-q36: ignoring %s (this engine keeps a turn checkpoint and a pin per session, not a series)\n", a.c_str());
+        }
+        else if (a == "--prompt-cache-spread") std::fprintf(stderr, "strata-q36: ignoring --prompt-cache-spread (this engine keeps a turn checkpoint and a pin per session)\n");
         else if (a == "--kv-p2p") kv_p2p = true;   // --kv-gpu: the cards trade the attention's rows by peer copies (checked at load)
         else if (a == "--kv-gpu") {
             // the cache and the attention on another card (the weights and the experts stay on the first of --gpu's cards): a
@@ -4468,6 +4686,8 @@ int strata::qwen35::run(int argc, char** argv) {
     E.use_graph = graph;
     E.kv16 = kv16;
     E.kvq8 = kvq8;
+    E.prompt_cache = prompt_cache;
+    E.turn_token = turn_token;
     if (kvq8) {   // the Q8_0 cache has the grouped-query kernel and the 256-wide head only (and not on HIP)
 #if defined(__HIPCC__)
         const bool shape_ok = false;
@@ -4585,6 +4805,7 @@ int strata::qwen35::run(int argc, char** argv) {
         }
     } report{E};
     E.reset();
+    if (serve_mode) E.ck_init();   // the prompt cache's host buffers (--prompt-cache; the other modes read one prompt)
     E.mtp_d = m.has_mtp ? mtp_d : 0;
     if (draft_vocab < 0 && std::getenv("STRATA_Q36_DRAFT_VOCAB") != nullptr) draft_vocab = std::atoi(std::getenv("STRATA_Q36_DRAFT_VOCAB"));
     E.draft_n = std::max(0, draft_vocab);
