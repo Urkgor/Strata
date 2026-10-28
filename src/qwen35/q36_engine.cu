@@ -3421,6 +3421,30 @@ struct Engine {
 
     /// Session dst takes session src's state: the recurrent state, the cache's first src.pos cells, the position, the
     /// pictures' offset (for a conversation read in one session that continues in another).
+    /// The first n cells of every KV head of session a's K / V arrays into session b's (device to device).
+    void kv_copy_cells(const Sess& a, Sess& b, int64_t n) {
+        const auto& g = m->g;
+        const size_t row = (size_t) ctx * g.head_dim * (kvq8 ? 1 : (kv16 ? 2 : 4));   // one head's row of the (first) array
+        DevScope ds(kvr ? kv_dev : -1);
+        cudaStream_t cs = kvr ? ar_kv.st : st;
+        for (size_t l = 0; l < a.conv.size(); ++l) {
+            if (!a.kc[l] || n <= 0) continue;
+            auto copy_arr = [&](float* dst, const float* src) {
+                // the first n cells of every KV head: f32 / f16 one array of rows; q8_0 two (the quants, then the scales)
+                CK(cudaMemcpy2DAsync(dst, row, src, row, (size_t) n * g.head_dim * (kvq8 ? 1 : (kv16 ? 2 : 4)),
+                                     (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, cs));
+                if (kvq8) {
+                    const size_t off = (size_t) g.n_head_kv * ctx * g.head_dim, srow = (size_t) ctx * (g.head_dim / 32) * 2;
+                    CK(cudaMemcpy2DAsync(reinterpret_cast<char*>(dst) + off, srow, reinterpret_cast<const char*>(src) + off, srow,
+                                         (size_t) n * (g.head_dim / 32) * 2, (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, cs));
+                }
+            };
+            copy_arr(b.kc[l], a.kc[l]);
+            copy_arr(b.vc[l], a.vc[l]);
+        }
+        if (kvr) CK(cudaStreamSynchronize(ar_kv.st));   // (the cache's copies are on the cache card's stream)
+    }
+
     void copy_session(int src, int dst) {
         if (src == dst) return;
         sess[(size_t) cur].pos = pos;
@@ -3429,40 +3453,38 @@ struct Engine {
         Sess& b = sess[(size_t) dst];
         for (Ckpt& c : b.chain) c.valid = false;   // (its cache cells are overwritten; the checkpoints are not copied with the session)
         const size_t C = (size_t) g.ssm_conv_channels;
-        const size_t row = (size_t) ctx * g.head_dim * (kvq8 ? 1 : (kv16 ? 2 : 4));   // one head's row of the (first) array
         for (size_t l = 0; l < a.conv.size(); ++l) {
             if (a.conv[l]) {
                 CK(cudaMemcpyAsync(b.conv[l], a.conv[l], C * (g.ssm_d_conv - 1) * 4, cudaMemcpyDeviceToDevice, st));
                 CK(cudaMemcpyAsync(b.S[l], a.S[l], (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4,
                                    cudaMemcpyDeviceToDevice, st));
             }
-            if (a.kc[l] && a.pos > 0) {
-                DevScope ds(kvr ? kv_dev : -1);
-                cudaStream_t cs = kvr ? ar_kv.st : st;
-                auto copy_arr = [&](float* dst, const float* src) {
-                    // the first src.pos cells of every KV head: f32 / f16 one array of rows; q8_0 two (the quants, then the scales)
-                    CK(cudaMemcpy2DAsync(dst, row, src, row, (size_t) a.pos * g.head_dim * (kvq8 ? 1 : (kv16 ? 2 : 4)),
-                                         (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, cs));
-                    if (kvq8) {
-                        const size_t off = (size_t) g.n_head_kv * ctx * g.head_dim, srow = (size_t) ctx * (g.head_dim / 32) * 2;
-                        CK(cudaMemcpy2DAsync(reinterpret_cast<char*>(dst) + off, srow, reinterpret_cast<const char*>(src) + off, srow,
-                                             (size_t) a.pos * (g.head_dim / 32) * 2, (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, cs));
-                    }
-                };
-                copy_arr(b.kc[l], a.kc[l]);
-                copy_arr(b.vc[l], a.vc[l]);
-            }
         }
-        if (kvr) {   // (the cache's copies are on the cache card's stream)
-            DevScope ds(kv_dev);
-            CK(cudaStreamSynchronize(ar_kv.st));
-        }
+        kv_copy_cells(a, b, a.pos);
         CK(cudaMemcpyAsync(b.hlast, a.hlast, (size_t) g.n_embd * 4, cudaMemcpyDeviceToDevice, st));
         CK(cudaStreamSynchronize(st));
         b.pos = a.pos;
         b.rdelta = a.rdelta;
         b.live = a.live;
         b.imgs = a.imgs;
+        if (dst == cur) load_cur();
+    }
+
+    /// Session dst takes the conversation of turn checkpoint c of session src - its first c.pos tokens: the cache cells copied here,
+    /// the recurrent state from the checkpoint - and src stays as it was.  A request that shares only a start with src's
+    /// conversation then reads its own end in dst, instead of overwriting what src holds from there on.
+    void branch(int src, int dst, const Ckpt& c) {
+        if (src == dst) return;
+        sess[(size_t) cur].pos = pos;
+        const Sess& a = sess[(size_t) src];
+        Sess& b = sess[(size_t) dst];
+        for (Ckpt& k : b.chain) k.valid = false;
+        kv_copy_cells(a, b, c.pos);
+        ck_state_io(b, c.state, false);
+        b.live = c.ids;
+        b.imgs = c.imgs;
+        b.pos = c.pos;
+        b.rdelta = c.rdelta;
         if (dst == cur) load_cur();
     }
     int hybrid_swaps_after_prompt = 2048;
@@ -4223,7 +4245,7 @@ struct Serve {
     /// The session a request alone takes: the one holding the longest start of its prompt (its state or a turn checkpoint), else
     /// an empty one, else the least recently used (never a decoding slot).
     int pick_session(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) const {
-        int best = -1, free_empty = -1, lru = -1;
+        int best = -1, free_empty = -1;
         size_t bl = 0;
         for (int i = 0; i < E.n_sess; ++i) {
             const Engine::Sess& ss = E.sess[(size_t) i];
@@ -4232,9 +4254,30 @@ struct Serve {
             const q36ck::Choice c = q36ck::choose(ss.live, ss.imgs, held_chain(ss), q36ck::Held{}, ids, imgs);
             if (c.len > bl) { bl = c.len; best = i; }
             if (ss.live.empty() && free_empty < 0) free_empty = i;
-            if (lru < 0 || ss.used < E.sess[(size_t) lru].used) lru = i;
         }
-        return best >= 0 ? best : free_empty >= 0 ? free_empty : lru;
+        return best >= 0 ? best : free_empty >= 0 ? free_empty : least_valuable(-1);
+    }
+
+    /// What a session holds that is worth keeping: its held tokens, or the latest of its valid turn checkpoints.
+    size_t session_value(const Engine::Sess& ss) const {
+        size_t v = ss.live.size();
+        for (const Ckpt& c : ss.chain)
+            if (c.valid) v = std::max(v, (size_t) c.pos);
+        return v;
+    }
+
+    /// The idle session (not `except`, not decoding) that holds the least, the least recently used among equals; -1 when none.
+    int least_valuable(int except) const {
+        int pick = -1;
+        for (int i = 0; i < E.n_sess; ++i) {
+            const Engine::Sess& ss = E.sess[(size_t) i];
+            if (i == except || ss.active) continue;
+            if (pick < 0) { pick = i; continue; }
+            const Engine::Sess& pk = E.sess[(size_t) pick];
+            const size_t vi = session_value(ss), vp = session_value(pk);
+            if (vi < vp || (vi == vp && ss.used < pk.used)) pick = i;
+        }
+        return pick;
     }
 
     void request(const std::string& line) {
@@ -4330,11 +4373,24 @@ struct Serve {
         }
         stop.store(false);
         // ---- the session: the held state continues when the request extends it (the recurrent state cannot step back)
-        const int s = adm ? slot : pick_session(ids, ir.imgs);
-        Engine::Sess& ss = E.sess[(size_t) s];
-        // what of the prompt this session need not read again: its held state, its turn checkpoint, or the pin
-        q36ck::Choice rc = reuse_choice(ss, ids, ir.imgs);
+        int s = adm ? slot : pick_session(ids, ir.imgs);
+        // what of the prompt this session need not read again: its held state, one of its turn checkpoints, or the pin
+        q36ck::Choice rc = reuse_choice(E.sess[(size_t) s], ids, ir.imgs);
         size_t reuse = rc.len;
+        if (!adm && E.ck_on && E.n_sess > 1 && rc.src == q36ck::kTurn && reuse > 0 && session_value(E.sess[(size_t) s]) > reuse) {
+            // the prompt shares only a start with what this session holds (a side request, another item): read its end in another
+            // session, so that this one keeps its conversation beyond the shared start
+            const int d = least_valuable(s);
+            if (d >= 0) {
+                std::fprintf(stderr, "strata serve: the prompt shares %zu tokens with session %d, which holds %zu: it is read in session %d "
+                             "(its %zu tokens are given up) so that session %d keeps them\n", reuse, s, session_value(E.sess[(size_t) s]), d,
+                             session_value(E.sess[(size_t) d]), s);
+                E.branch(s, d, E.sess[(size_t) s].chain[(size_t) rc.idx]);
+                s = d;
+                rc = q36ck::Choice{reuse, q36ck::kLive, -1};
+            }
+        }
+        Engine::Sess& ss = E.sess[(size_t) s];
         if (adm) {   // another session holding more of this prompt (the conversation was read alone): copy its state
             int src = -1;
             size_t best = reuse;

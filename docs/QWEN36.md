@@ -171,6 +171,14 @@ requests. The pin cannot rely on that, so it keeps its own copy of the K / V cel
 f16, 11 KB in q8_0, 41 KB in f32; a 20K-token pin is 0.4 GB in f16), taken once when the pin is made and written back when it
 is used. Checkpoints are not copied with a session when the engine moves a conversation between slots.
 
+**Side requests.** A request that shares only a start with what a conversation slot holds (a title, a summary, another item
+built on the same skill) would overwrite that slot from the shared start on and take the conversation's later checkpoints
+with it. With `--parallel 2` or more the engine reads such a request in **another** slot (the idle one that holds the least,
+the least recently used among equals): the shared start is copied there from the first slot's cache and checkpoint, and
+the first slot keeps its conversation. The journal says it (`… is read in session N so that session M keeps …`). With one
+slot nothing can be kept: the side request wins. A request that matches nothing also goes to the idle slot that holds
+the least, not to the one used longest ago.
+
 **Not measured on a card.** The decision (what is reused, where the read is cut, the pin's K / V layout for f32, f16 and q8_0)
 is tested on the CPU (`tests/core/q36_ckpt_test.cpp`). The restore itself, and that a request after a restore gives the same
 tokens as on a fresh engine, have not been run: there was no GPU. A read is cut at the turn token, so the chunk boundaries of
