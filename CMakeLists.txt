@@ -1851,6 +1851,8 @@ target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 # weight means exactly what it means in llama.cpp.  ggml is built static from a llama.cpp checkout: a local one
 # with -DSTRATA_GGML_DIR=..., otherwise the pinned upstream commit (third_party/ggml/VERSION.txt).
 set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
+set(STRATA_GGML_TAG "3cf03257f219afbe7334045ff7c6a06ac68c627d" CACHE STRING
+    "commit or tag of llama.cpp to fetch when STRATA_GGML_DIR is empty (the pinned commit; v0.6.0 and v0.8.0 are built too)")
 if(STRATA_PREFILL_MMQ AND NOT STRATA_NATIVE_EXPERTS)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_NATIVE_EXPERTS=ON for GGML sources")
 endif()
@@ -1897,34 +1899,71 @@ if(STRATA_NATIVE_EXPERTS)
   else()
     set(GGML_NATIVE ON CACHE BOOL "" FORCE)
   endif()
+  file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/VERSION.txt _strata_ggml_pin LIMIT_COUNT 1)
+  string(REGEX MATCH "^[0-9a-f]+" _strata_ggml_pin "${_strata_ggml_pin}")
   if(STRATA_GGML_DIR)
-    # The CUDA files that call ggml-cuda's mmq.cuh (mul_mat_q_case, struct mmq_args, ...) are written against the pinned commit; on
-    # another llama.cpp they stop with "no instance of function template ... mul_mat_q_case matches the argument list".
-    file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/VERSION.txt _strata_ggml_pin LIMIT_COUNT 1)
-    string(REGEX MATCH "^[0-9a-f]+" _strata_ggml_pin "${_strata_ggml_pin}")
+    set(_strata_ggml_root "${STRATA_GGML_DIR}")
+    # The CUDA files that call ggml-cuda's mmq.cuh (mul_mat_q_case, struct mmq_args, ...) are written against the pinned commit and
+    # against llama.cpp v0.8.0's interface of it (src/prefill/mmq_compat.cuh); any other interface stops with "no
+    # instance of function template ... mul_mat_q_case matches the argument list".  The interface is probed below, not the version.
     find_package(Git QUIET)
-    if(GIT_FOUND AND _strata_ggml_pin)
+    if(GIT_FOUND)
       # no `git -C`: RHEL 7's git 1.8.3 does not have it
       execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse HEAD WORKING_DIRECTORY ${STRATA_GGML_DIR}
                       OUTPUT_VARIABLE _strata_ggml_head OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE _strata_ggml_rc ERROR_QUIET)
-      if(_strata_ggml_rc EQUAL 0 AND NOT _strata_ggml_head STREQUAL _strata_ggml_pin)
-        message(WARNING "STRATA_GGML_DIR ${STRATA_GGML_DIR} is at llama.cpp ${_strata_ggml_head}, the engine is written for "
-                        "${_strata_ggml_pin} (third_party/ggml/VERSION.txt): the CUDA build is likely to stop at mmq_*.cu.  "
-                        "cd ${STRATA_GGML_DIR} && git checkout ${_strata_ggml_pin}")
+      if(_strata_ggml_rc EQUAL 0)
+        message(STATUS "llama.cpp (STRATA_GGML_DIR): ${_strata_ggml_head}")
       endif()
     endif()
     add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   else()
     include(FetchContent)
+    # a commit is fetched whole, a tag (v0.8.0) shallow
+    if(STRATA_GGML_TAG MATCHES "^[0-9a-f]+$")
+      set(_strata_ggml_shallow FALSE)
+    else()
+      set(_strata_ggml_shallow TRUE)
+    endif()
     FetchContent_Declare(strata_llamacpp
       GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-      GIT_TAG 3cf03257f219afbe7334045ff7c6a06ac68c627d
-      GIT_SHALLOW FALSE)
+      GIT_TAG ${STRATA_GGML_TAG}
+      GIT_SHALLOW ${_strata_ggml_shallow})
     FetchContent_GetProperties(strata_llamacpp)
     if(NOT strata_llamacpp_POPULATED)
       FetchContent_Populate(strata_llamacpp)
     endif()
+    set(_strata_ggml_root "${strata_llamacpp_SOURCE_DIR}")
     add_subdirectory(${strata_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
+  endif()
+  # ---- which generation of ggml-cuda's host interface this llama.cpp has (src/prefill/mmq_compat.cuh) ----
+  # Probed on the sources, so any commit with one of the two interfaces builds; one with neither stops here, not in nvcc's
+  # "no instance of function template" later.
+  set(_strata_mmq_h "${_strata_ggml_root}/ggml/src/ggml-cuda/mmq.cuh")
+  set(_strata_cuda_common_h "${_strata_ggml_root}/ggml/src/ggml-cuda/common.cuh")
+  if(EXISTS "${_strata_mmq_h}")
+    file(READ "${_strata_mmq_h}" _strata_mmq_text)
+    if(_strata_mmq_text MATCHES "int64_t ncols_opt;")
+      set(STRATA_GGML_MMQ_GEN 1)
+    elseif(_strata_mmq_text MATCHES "int J_best;")
+      set(STRATA_GGML_MMQ_GEN 2)
+    else()
+      # only the CUDA / HIP engines build against it; a CPU-only or Vulkan build never reads mmq.cuh
+      if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+        message(FATAL_ERROR "llama.cpp at ${_strata_ggml_root}: ggml-cuda/mmq.cuh has neither the interface of the pinned commit "
+                            "(${_strata_ggml_pin}; mmq_args.ncols_opt) nor that of v0.8.0 (mmq_args.J_best, mul_mat_q_case<type, prec>); "
+                            "the engine's prompt kernels (src/prefill/*.cu) cannot be built against it.  Use the pinned commit, "
+                            "v0.6.0 or v0.8.0 (-DSTRATA_GGML_TAG=v0.8.0, or tools/build_rhel7.sh --ggml-tag v0.8.0).")
+      endif()
+      set(STRATA_GGML_MMQ_GEN 1)
+    endif()
+    add_compile_definitions(STRATA_GGML_MMQ_GEN=${STRATA_GGML_MMQ_GEN})
+    message(STATUS "llama.cpp ggml-cuda MMQ interface: generation ${STRATA_GGML_MMQ_GEN} (1: the pinned commit .. v0.6.0, 2: v0.8.0)")
+  endif()
+  if(EXISTS "${_strata_cuda_common_h}")
+    file(READ "${_strata_cuda_common_h}" _strata_cuda_common_text)
+    if(_strata_cuda_common_text MATCHES "new_pool_for_device\\(ggml_backend_cuda_context")
+      add_compile_definitions(STRATA_GGML_POOL_CTX=1)
+    endif()
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
@@ -2061,6 +2100,10 @@ if(STRATA_NATIVE_EXPERTS)
       set(_strata_mmq_tqp ON)   # moe_mmq.cu names GGML_TYPE_TQP5-7 only where the ggml has them (STRATA_MMQ_TQP)
     endif()
     set(_strata_mmq_tq ON)
+  elseif(STRATA_MMQ_TQ_OVERLAY AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND STRATA_GGML_MMQ_GEN GREATER 1)
+    # the overlay's edits are anchored on the pinned commit's mmq.cuh (generation 1); against v0.8.0's they would apply and then
+    # not compile (ggml_cuda_mmq_get_config / ggml_cuda_mmq_util_funcs take another argument list)
+    message(STATUS "trellis MMQ (Gyro prompts): off - the overlay is written for the pinned llama.cpp commit's mmq.cuh, not this one's (generation ${STRATA_GGML_MMQ_GEN}); trellis experts read their prompts through the FP16 path")
   elseif(STRATA_MMQ_TQ_OVERLAY AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
     # an upstream llama.cpp: the trellis MMQ instances come from an overlay of the pinned ggml-cuda headers written at
     # configure time (cmake/strata_ggml_tq_overlay.cmake); off with a message if the llama.cpp tree is not the pinned one

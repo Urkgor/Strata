@@ -40,7 +40,7 @@ tar xzf cmake-3.20.2-linux-x86_64.tar.gz -C ~
 git clone https://github.com/Urkgor/Strata.git ~/Strata
 cd ~/Strata && git checkout feature/RHEL7_compatibility
 
-# llama.cpp EXACTEMENT à ce commit (un autre commit fait échouer le build : « no instance of function template mul_mat_q_case »)
+# llama.cpp : ce commit (le moteur y est écrit), ou la version v0.6.0, ou la version v0.8.0 — voir « Autre version de llama.cpp » plus bas
 git clone https://github.com/ggml-org/llama.cpp.git ~/llama.cpp
 cd ~/llama.cpp && git checkout 3cf03257f219afbe7334045ff7c6a06ac68c627d
 ```
@@ -55,6 +55,12 @@ tools/build_rhel7.sh --cmake ~/cmake-3.20.2-linux-x86_64/bin/cmake --arch 61 --g
 ```
 
 - Sans `--ggml`, CMake télécharge lui-même le bon llama.cpp (il faut GitHub).
+- **Autre version de llama.cpp.** Le moteur se compile contre le commit épinglé, contre **v0.6.0** (même interface) et contre **v0.8.0** :
+  ```sh
+  tools/build_rhel7.sh --arch 61 --ggml-tag v0.8.0                 # CMake télécharge v0.8.0
+  cd ~/llama.cpp && git checkout v0.8.0 && cd ~/Strata && tools/build_rhel7.sh --arch 61 --ggml ~/llama.cpp   # ou un clone local
+  ```
+  Le script (puis CMake) lit l'interface de `ggml-cuda/mmq.cuh` du llama.cpp donné — celle du commit épinglé (jusqu'à v0.6.0) ou celle de v0.8.0 (tuile choisie par l'appelant, précision des activations en paramètre de gabarit) — et le dit (« MMQ interface generation 1 / 2 »). Une autre interface est refusée **avant** la compilation, avec le message qui dit quoi prendre. Avec v0.8.0 : la surcouche des types trellis Gyro (`TQ2_T`, `TQK6`, `TQK7`) est coupée (leurs experts lisent le prompt par le chemin FP16, comme sur un llama.cpp quelconque) ; IQ, Q2_0, Q8_0 et K-quants gardent leurs noyaux MMQ. Vérifié : ça compile et ça se lie dans le conteneur CentOS 7 (CUDA 12.4, GCC 11, sm_61) ; **non exécuté sur un GPU**.
 - Sans `--cmake`, le script prend le premier `cmake` 3.20 ou plus du `PATH`.
 - Moins de RAM : `--jobs 2`. Un `Killed` dans le journal veut dire « trop de tâches pour la mémoire ».
 - Résultat : `build-rhel7/strata`. Journal complet : `build-rhel7/build.log` (le script affiche tout seul les premières erreurs).
@@ -243,7 +249,7 @@ Envoyez cette sortie avec l'erreur : elle suffit à savoir quels types manquent.
 | `strata-q36: missing qwen35moe.nextn_predict_layers` | GGUF sans couche MTP, moteur d'avant le correctif : `git pull` et recompiler (étape 3) |
 | `engine died` / `the engine exited before it was ready` (`server.py`) | le message du serveur ne dit que ça : **la cause est dans les lignes du moteur lui-même**, dans `~/strata-qwen36.log` (`tail -60`). Sans le journal : lancer le moteur seul, `build-rhel7/strata --model $G --tokens "1,2,3" --n 8 --max-context 4096 2>&1 \| tee ~/moteur.log`. Bibliothèque manquante : `ldd build-rhel7/strata \| grep "not found"` |
 | `Error 2` seul | enveloppe de `make` ; lire `build-rhel7/build.log` ou relancer avec `--jobs 1` |
-| `no instance of function template ... mul_mat_q_case` | mauvais commit de llama.cpp (étape 2) |
+| `no instance of function template ... mul_mat_q_case` | llama.cpp d'une autre génération que le commit épinglé, v0.6.0 ou v0.8.0 : le script le refuse maintenant avant de compiler ; prenez l'un des trois (étape 2, `--ggml-tag v0.8.0`). Si vous le voyez encore avec `STRATA_ALLOW_GGML_MISMATCH=1`, c'est ce que ce réglage permet |
 | `Target ... requires the language dialect "CUDA20"` | CMake trop ancien (< 3.20) ou `CMakeLists.txt` pas à jour : `git pull` |
 | `unsupported GNU version` | nvcc plus ancien que 12.4 : utiliser devtoolset-11 (GCC 11) |
 | `Killed` / `out of memory` | `--jobs 1` |

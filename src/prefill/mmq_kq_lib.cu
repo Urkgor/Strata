@@ -8,6 +8,7 @@
 #include "common.cuh"
 #include "mmq.cuh"
 
+#include "mmq_compat.cuh"
 #include "strata/prefill/mmq_kq_abi.hpp"
 
 #include <mutex>
@@ -50,10 +51,10 @@ STRATA_KQ_EXPORT int strata_kq_run(int device, int type, const void* args, void*
     const mmq_args& a = *(const mmq_args*) args;
     const cudaStream_t s = (cudaStream_t) stream;
     switch ((ggml_type) type) {
-        case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
-        case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
-        case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, a, s); break;
-        case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
+        case GGML_TYPE_Q4_K: STRATA_MMQ_CASE(mul_mat_q_case, GGML_TYPE_Q4_K, STRATA_PREC_Q8, ctx, a, s); break;
+        case GGML_TYPE_Q5_K: STRATA_MMQ_CASE(mul_mat_q_case, GGML_TYPE_Q5_K, STRATA_PREC_Q8, ctx, a, s); break;
+        case GGML_TYPE_Q5_1: STRATA_MMQ_CASE(mul_mat_q_case, GGML_TYPE_Q5_1, STRATA_PREC_Q8, ctx, a, s); break;
+        case GGML_TYPE_Q6_K: STRATA_MMQ_CASE(mul_mat_q_case, GGML_TYPE_Q6_K, STRATA_PREC_Q8, ctx, a, s); break;
         default: return -1;
     }
     return (int) cudaGetLastError();

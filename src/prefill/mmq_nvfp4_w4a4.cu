@@ -16,8 +16,15 @@
 #define quantize_mmq_fp4_cuda strata_w4a4_quantize_mmq_fp4_cuda
 #include "mmq.cuh"
 #include "quantize.cu"
+#include "mmq_compat.cuh"
 
+// mmq.cuh generation 1 has one instance per type (its FP4 path is picked by the architecture); generation 2 has one per
+// (type, precision) and this unit is the Q4 one
+#if STRATA_GGML_MMQ_GEN >= 2
+DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
+#else
 DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+#endif
 
 namespace {
 // 1 when this unit's device code has the FP4 MMA (built for the running card's 12xa); a card without an image
@@ -43,7 +50,7 @@ bool w4a4_available() {
     return ran && h == 1;
 }
 void run_nvfp4_w4a4(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s) {
-    strata_w4a4_mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, a, s);
+    STRATA_MMQ_CASE(strata_w4a4_mul_mat_q_case, GGML_TYPE_NVFP4, STRATA_PREC_Q4, ctx, a, s);
 }
 void quantize_nvfp4_w4a4(const float* x, const int32_t* ids, void* xq, float* yscale, bool aligned, int64_t cols,
                          int64_t ld, int64_t rows, int64_t padded, cudaStream_t s) {

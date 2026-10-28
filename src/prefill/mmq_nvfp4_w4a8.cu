@@ -14,11 +14,12 @@
 #define mul_mat_q_switch_J strata_w4a8_mul_mat_q_switch_J
 #define mul_mat_q_case strata_w4a8_mul_mat_q_case
 #include "mmq.cuh"
+#include "mmq_compat.cuh"
 
 DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 
 namespace strata::prefill::mmq {
 void run_nvfp4_w4a8(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s) {
-    strata_w4a8_mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, a, s);
+    STRATA_MMQ_CASE(strata_w4a8_mul_mat_q_case, GGML_TYPE_NVFP4, STRATA_PREC_Q8, ctx, a, s);
 }
 }  // namespace strata::prefill::mmq
