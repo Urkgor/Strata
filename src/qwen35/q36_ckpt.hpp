@@ -51,21 +51,25 @@ struct Held {
 
 struct Choice {
     size_t len = 0;        // tokens not read again
-    Source src = kLive;    // whose state: the live state (nothing to restore), the session's turn checkpoint, the pin
+    Source src = kLive;    // whose state: the live state (nothing to restore), one of the session's turn checkpoints, the pin
+    int idx = -1;          // for kTurn: which of the session's checkpoints
 };
 
 /// The longest reusable start of `ids`: the live state first (it keeps the speculative drafts, and is the fast path when the
-/// re-rendered reply happens to be identical), the turn checkpoint, the pin; the first of equal lengths wins.
-inline Choice choose(const std::vector<int32_t>& live, const std::vector<ImgKey>& live_imgs, const Held& turn, const Held& pin,
-                     const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) {
-    Choice c{match(live, live_imgs, ids, imgs), kLive};
-    if (turn.valid && turn.ids) {
-        const size_t l = match(*turn.ids, *turn.imgs, ids, imgs);
-        if (l > c.len) c = {l, kTurn};
+/// re-rendered reply happens to be identical), then the session's turn checkpoints (a series), then the pin; the first of equal
+/// lengths wins.
+inline Choice choose(const std::vector<int32_t>& live, const std::vector<ImgKey>& live_imgs, const std::vector<Held>& turns,
+                     const Held& pin, const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) {
+    Choice c{match(live, live_imgs, ids, imgs), kLive, -1};
+    for (size_t i = 0; i < turns.size(); ++i) {
+        const Held& h = turns[i];
+        if (!h.valid || !h.ids) continue;
+        const size_t l = match(*h.ids, *h.imgs, ids, imgs);
+        if (l > c.len) c = {l, kTurn, (int) i};
     }
     if (pin.valid && pin.ids) {
         const size_t l = match(*pin.ids, *pin.imgs, ids, imgs);
-        if (l > c.len) c = {l, kPin};
+        if (l > c.len) c = {l, kPin, -1};
     }
     return c;
 }
@@ -84,20 +88,33 @@ struct Cut {
 };
 
 /// The cuts of a read from `reuse`: the last turn token of the prompt after `reuse` (the start of the new assistant turn, so the
-/// header and the reply's thinking stay out of the checkpoint), and `pin` tokens when asked (pin > reuse: a pin at or before
-/// `reuse` was not passed through, so it cannot be taken).  Ascending, merged when equal, never at 0, never at or past the end,
-/// never inside a picture.  `turn_on` / `pin_on`: the kinds wanted.
+/// header and the reply's thinking stay out of the checkpoint), more turn tokens before it when the read is long (`every` > 0:
+/// each turn token at least `every` tokens after the previous cut, at most `max_extra` of them - the message boundaries a later
+/// request may share a start up to, when it re-renders what follows), and `pin` tokens when asked (pin > reuse: a pin at or
+/// before `reuse` was not passed through, so it cannot be taken).  Ascending, merged when equal, never at 0, never at or past
+/// the end, never inside a picture.  `turn_on` / `pin_on`: the kinds wanted.
 inline std::vector<Cut> cuts(const std::vector<int32_t>& ids, int64_t reuse, int32_t turn_token, bool turn_on, int64_t pin,
-                             bool pin_on, const std::vector<ImgKey>& imgs) {
+                             bool pin_on, const std::vector<ImgKey>& imgs, int64_t every = 0, int max_extra = 0) {
     const int64_t n = (int64_t) ids.size();
     std::vector<Cut> out;
     auto usable = [&](int64_t at) { return at > reuse && at > 0 && at < n && !inside_picture(at, imgs); };
     if (turn_on && turn_token >= 0) {
+        int64_t last = -1;
         for (int64_t i = n - 1; i > reuse; --i)
             if (ids[(size_t) i] == turn_token) {
-                if (usable(i)) out.push_back({i, true, false});
+                if (usable(i)) { out.push_back({i, true, false}); last = i; }
                 break;
             }
+        if (every > 0 && last > 0) {   // the earlier turn boundaries of a long read, spaced
+            int64_t prev = reuse;
+            int added = 0;
+            for (int64_t i = reuse + 1; i < last && added < max_extra; ++i)
+                if (ids[(size_t) i] == turn_token && i - prev >= every && usable(i)) {
+                    out.push_back({i, true, false});
+                    prev = i;
+                    ++added;
+                }
+        }
     }
     if (pin_on && pin > 0 && usable(pin)) {
         bool merged = false;
@@ -113,6 +130,21 @@ inline std::vector<Cut> cuts(const std::vector<int32_t>& ids, int64_t reuse, int
 /// after a read that starts at cell `reuse` the checkpoint at `pos` tokens still has its cells iff pos <= reuse.  (The pin keeps a
 /// copy of its cells, so it survives anything.)
 inline bool survives(int64_t pos, int64_t reuse) { return pos <= reuse; }
+
+/// A session keeps at most `cap` turn checkpoints (positions ascending).  When another has to be added: the index of the one to
+/// drop - never the oldest (the start every chat of a client shares) unless cap is 1, the one whose removal leaves the smallest gap
+/// between its neighbours (so the kept points thin out geometrically back from the newest, and the newest stay close together).
+inline int evict(const std::vector<int64_t>& pos, size_t cap) {
+    if (pos.size() < cap || pos.empty()) return -1;   // room: nothing to drop
+    if (pos.size() == 1 || cap <= 1) return 0;
+    int best = -1;
+    int64_t gap = 0;
+    for (size_t i = 1; i + 1 < pos.size(); ++i) {
+        const int64_t g = pos[i + 1] - pos[i - 1];
+        if (best < 0 || g < gap) { best = (int) i; gap = g; }
+    }
+    return best >= 0 ? best : (int) pos.size() - 1;   // two entries: the newer one (the oldest stays)
+}
 
 /// The pictures of `imgs` that lie entirely in the first `p` cells (what a checkpoint at p holds).
 inline std::vector<ImgKey> imgs_before(const std::vector<ImgKey>& imgs, int64_t p) {

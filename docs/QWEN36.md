@@ -136,10 +136,13 @@ new prompt. A chat client sends the previous reply again as its chat template re
 written out again), so one token of difference anywhere and the whole prompt was read again. Two more reuse points fix
 that, as in the Flash-Next engine:
 
-- **The turn checkpoint.** A prompt is read in two parts, up to its last turn token (`<|im_start|>`, the start of the new
-  assistant turn) and then on. At that point the engine keeps the recurrent state. The next request of the same chat renders
-  the conversation so far the same way (the header and the reply's thinking are what may differ, and they come after the
-  checkpoint), so it starts there. One per conversation slot.
+- **The turn checkpoints.** A prompt is read in parts: up to its last turn token (`<|im_start|>`, the start of the new
+  assistant turn), and, when the read is long, up to earlier turn tokens at least `--prompt-cache-every` tokens apart (the
+  message boundaries). At each cut the engine keeps the recurrent state. The next request of the same chat renders the
+  conversation so far the same way (the header and the reply's thinking come after the last checkpoint), so it starts
+  there. Another call that shares only a long start with the chat (a skill started again, an earlier item dropped from the
+  history) starts at the **latest checkpoint that is still a start of its prompt**: a conversation slot keeps up to
+  `--prompt-cache N` of them, and when it is full drops the one whose removal leaves the smallest gap (never the oldest).
 - **The pin.** A request that carries `pin=N` (the server turns `"strata_prefix"` into it) is also cut and checkpointed after
   its first N tokens: a long shared start (a system prompt and a document) followed by something different each time. The
   pin is kept apart from the turn checkpoint and survives other requests. One pin for the engine; a new `pin` replaces it.
@@ -150,19 +153,20 @@ checkpoint, then the pin. `DONE` reports what was not read again, and the server
 
 | Option | Effect |
 | --- | --- |
-| `--prompt-cache N` | `0` off (the old behaviour, byte for byte), `1` or more the turn checkpoint, `3` or more also the pin. Default 6. `STRATA_Q36_CKPT=0` turns it off for an A/B run. |
+| `--prompt-cache N` | `0` off (the old behaviour, byte for byte), otherwise up to N turn checkpoints per conversation slot; `3` or more also the pin. Default 6. `STRATA_Q36_CKPT=0` turns it off for an A/B run. |
+| `--prompt-cache-every N` | In a long read, also a checkpoint at each turn token at least N tokens after the previous cut (at most 4 besides the last). Default 4096. `0`: only the last turn token. |
 | `--turn-token ID` | The token that opens a chat turn. Default 248045 (`<|im_start|>`). |
 | `"strata_checkpoint": false` (per request) | A one-shot request that no later one continues: it keeps no checkpoint. |
 | `"strata_prefix"` (per request) | See [DETAILS.md](DETAILS.md#conversation-cache). The server resolves it to `pin=N`. |
 
-`--prompt-cache-every`, `--prompt-cache-root` and `--prompt-cache-spread` belong to the other engine and are ignored here
-(one turn checkpoint and one pin per conversation slot, not a series).
+`--prompt-cache-root` (the other engine's system-prompt checkpoint) is ignored here; `--prompt-cache-spread` is how this
+series is thinned anyway.
 
-**What a checkpoint holds, and what it costs.** The recurrent state of the GDN layers, `hlast`, the position and the
+**What a checkpoint holds, and what it costs.** Each checkpoint takes its host buffer when first used: N checkpoints per slot at 64 MiB is the most (the start-up line gives it). The recurrent state of the GDN layers, `hlast`, the position and the
 tokens (about 64 MiB of pinned host RAM per checkpoint; the start-up line gives the exact figure). The attention K / V cache is
 positional: the cells before the checkpoint are not changed by what is decoded after it, so a turn checkpoint does not copy
 them. It is therefore valid only while its conversation slot keeps those cells: a request that reads from before it in the
-same slot (an unrelated prompt in a one-slot engine) drops it, and `--parallel 2` or more keeps a chat apart from side
+same slot (an unrelated prompt in a one-slot engine, or a call that restores an earlier checkpoint, which drops the later ones) drops it, and `--parallel 2` or more keeps a chat apart from side
 requests. The pin cannot rely on that, so it keeps its own copy of the K / V cells in host RAM (about 20 KB per token in
 f16, 11 KB in q8_0, 41 KB in f32; a 20K-token pin is 0.4 GB in f16), taken once when the pin is made and written back when it
 is used. Checkpoints are not copied with a session when the engine moves a conversation between slots.
