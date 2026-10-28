@@ -188,6 +188,13 @@ Un client de code renvoie à chaque requête tout l'historique, avec la réponse
 - **Une seule place de conversation (`--parallel 1`)** : le point de tour est perdu si une requête sans rapport (titre, sous-agent) passe entre deux tours, car elle écrase le cache K/V de la place. Avec `--parallel 2`, les requêtes annexes tombent dans l'autre place. Le pin, lui, garde sa propre copie du cache K/V en RAM (≈ 0,4 Go pour 20 000 tokens en f16) et survit.
 - Détails, limites : `docs/QWEN36.md`. **Pas exécuté sur une carte** : seule la logique de décision est testée sur CPU. À vérifier chez vous : deux requêtes qui se suivent, la seconde doit afficher `reused` ≈ la taille de la première.
 
+## DSH ne reconnaît pas Strata (`/props` sans `build_info`) : pas de `strata_prefix`
+
+Le harnais DSH n'envoie `strata_prefix` (le début partagé d'un skill, épinglé par le moteur) que s'il reconnaît Strata : `/props` doit répondre `build_info: "Strata <version>"`, et l'adresse du serveur doit compter comme locale pour DSH (localhost, IP privée 10.x / 172.16–31.x / 192.168.x, nom sans point ou en `.local`, `.lan`, `.internal`). Deux causes ici :
+
+- **Le moteur Qwen3.6 ne disait pas sa version** au serveur : `/props` n'avait pas de `build_info`, et DSH le prenait pour llama.cpp (il envoyait `cache_prompt`, pas `strata_prefix`). Corrigé (`git pull`, rebuild) : le moteur écrit `INFO engine=<version>`. Vérifiez : `curl -s http://HOTE:8080/props | grep -o '"build_info":"[^"]*"'` doit donner `Strata 0.1.52`.
+- **Adresse publique** (par exemple 152.x) : DSH ne sonde pas `/props` d'une adresse hors réseau local. Dans la configuration du fournisseur DSH, mettez `localRuntime: "llamacpp"` : cela force la sonde. (Ou passez par une adresse privée / un nom en `.lan`.) Attention : DSH proposera alors aussi les contrôles llama.cpp pour ce fournisseur.
+
 ## Décodage lent avec un long contexte (6 tk/s à 25 000 tokens contre 60 à petit contexte)
 
 Cause trouvée dans le code : l'attention du décode lisait la mémoire des clés (K) de façon non coalescée (chaque fil lisait sa propre ligne de 1 Ko) et relisait K et V pour chacune des 8 têtes d'un même groupe. Corrigé (`git pull`, puis recompiler, étape 3) : un bloc sert les 8 têtes et lit K par tranches en mémoire partagée. Les résultats sont **identiques bit à bit** à l'ancien noyau (test CPU `q36_attn_gqa_test`), seul l'ordre des lectures change.

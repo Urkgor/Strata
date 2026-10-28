@@ -4609,7 +4609,10 @@ struct Serve {
     }
 
     int run() {
-        if (E.n_sess > 1) std::printf("INFO batch_slots=%d slot_cache=1\n", E.n_sess);
+        // the server reads `engine=` as the engine's version (its /props build_info, which a client uses to know it talks to Strata)
+        std::printf("INFO engine=" STRATA_VERSION);
+        if (E.n_sess > 1) std::printf(" batch_slots=%d slot_cache=1", E.n_sess);
+        std::printf("\n");
         std::printf("READY %d stop\n", E.ctx);
         std::fflush(stdout);
         std::thread reader([&] {
