@@ -88,7 +88,7 @@ class Pre(unittest.TestCase):
     """The pre-tokenizer is llama.cpp's DEEPSEEK3_LLM list: a sequence of splits, not one pattern."""
 
     def split(self, text):
-        return ST._sequence_findall([ST.regex.compile(p) for p in ST.DEEPSEEK3_PATTERNS], text)
+        return ST._sequence_findall([ST.compile_pattern(p) for p in ST.DEEPSEEK3_PATTERNS], text)
 
     def test_digits_in_runs_of_three(self):
         self.assertEqual(self.split("a12345678b"), ["a", "123", "456", "78", "b"])
