@@ -201,6 +201,10 @@ Le harnais DSH n'envoie `strata_prefix` (le début partagé d'un skill, épingl�
 - **Le moteur Qwen3.6 ne disait pas sa version** au serveur : `/props` n'avait pas de `build_info`, et DSH le prenait pour llama.cpp (il envoyait `cache_prompt`, pas `strata_prefix`). Corrigé (`git pull`, rebuild) : le moteur écrit `INFO engine=<version>`. Vérifiez : `curl -s http://HOTE:8080/props | grep -o '"build_info":"[^"]*"'` doit donner `Strata 0.1.52`.
 - **Adresse publique** (par exemple 152.x) : DSH ne sonde pas `/props` d'une adresse hors réseau local. Dans la configuration du fournisseur DSH, mettez `localRuntime: "llamacpp"` : cela force la sonde. (Ou passez par une adresse privée / un nom en `.lan`.) Attention : DSH proposera alors aussi les contrôles llama.cpp pour ce fournisseur.
 
+## Un modèle qui boucle pendant son « thinking »
+
+Le serveur surveille la réflexion : tous les 512 tokens il regarde si les mêmes passages reviennent. Pour Qwen3.6 le garde-fou est **actif par défaut** (`"reasoning_loop_recovery": "wrap"`) : la réflexion est fermée (une courte phrase « je tourne en rond » puis `</think>`) et le modèle répond, sans relire le prompt. Le journal Strata dit alors « the thinking repeated the same passages … closing it ». Le `"stop"` termine la réponse à la place, `false` coupe le garde-fou. Une boucle sur un seul token est déjà coupée par `repeat_stop_tokens`. Pour borner la réflexion dès le départ : `reasoning_budget_tokens`.
+
 ## Décodage lent avec un long contexte (6 tk/s à 25 000 tokens contre 60 à petit contexte)
 
 Cause trouvée dans le code : l'attention du décode lisait la mémoire des clés (K) de façon non coalescée (chaque fil lisait sa propre ligne de 1 Ko) et relisait K et V pour chacune des 8 têtes d'un même groupe. Corrigé (`git pull`, puis recompiler, étape 3) : un bloc sert les 8 têtes et lit K par tranches en mémoire partagée. Les résultats sont **identiques bit à bit** à l'ancien noyau (test CPU `q36_attn_gqa_test`), seul l'ordre des lectures change.

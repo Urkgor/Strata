@@ -223,9 +223,13 @@ ANSWER_RESERVE_MIN = 512     # #984: the tokens kept for the answer when a think
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
 REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+# "reasoning_loop_recovery": "wrap" - the thinking that repeats itself is closed the way a budget closes it, with this wrap-up, and the model answers
+REASONING_LOOP_WRAP_UP = "\n\nI am going around in circles and repeating myself; time to stop thinking and give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
-# low-effort instruction in place of the xhigh one.  Both off by default.
+# low-effort instruction in place of the xhigh one ("recover" needs that instruction in the system prompt: the DeepSeek-V4.1 chat template has it,
+# Qwen3.6's has none).  "wrap" closes the thinking and lets the model answer: the guard for a family without the effort instruction, on by
+# default for Qwen3.6 (qwen35moe); false turns it off.  The others are off by default.
 HIGH_EFFORT = EFFORT_TEXT["xhigh"]
 LOW_EFFORT = EFFORT_TEXT["low"]
 LOOP_CHECK_EVERY = 512           # output tokens between two looks at the reasoning (at a clean parser boundary)
@@ -260,6 +264,18 @@ def reasoning_repeat_coverage(text):
         if counts[grams[i]] >= 3:
             covered.update(range(i, i + width))
     return len(covered) / (len(words) - start)
+
+
+def loop_recovery_setting(cfg):
+    """#728: the config's "reasoning_loop_recovery": false | "stop" | "recover" (true) | "wrap".  Unset: "wrap" for Qwen3.6 (qwen35moe, a model
+    that can think in loops, whose chat template has no effort instruction for "recover" to lower), false for the others."""
+    recovery = cfg.get("reasoning_loop_recovery", "wrap" if cfg.get("arch") == "qwen35moe" else False)
+    if recovery is True:
+        recovery = "recover"
+    if recovery is not False and recovery not in ("stop", "recover", "wrap"):
+        raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\", \"recover\" or \"wrap\", "
+                         f"not {recovery!r}")
+    return recovery
 
 
 def focused_recovery_prompt(tok, ids, generated):
@@ -5346,6 +5362,7 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
+        loop_wrap = False                               # "wrap": the thinking is being closed because it repeated itself
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
@@ -5461,7 +5478,7 @@ class Service:
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
-                        seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
+                        seg, wrap, leaving, loop_wrap = [], False, False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
@@ -5529,6 +5546,16 @@ class Service:
                                     if repeat_coverage >= LOOP_COVERAGE:
                                         if self.reasoning_loop_recovery == "stop":
                                             looped = True        # #728: end the reply here, as for a repeated token
+                                            break
+                                        if self.reasoning_loop_recovery == "wrap":
+                                            # close the thinking like a budget does (below) and let the model answer; once per request
+                                            recovery_count += 1
+                                            wrap = loop_wrap = True
+                                            with self.status_lock:
+                                                st["reasoning_recoveries"] = recovery_count
+                                            if trace is not None:
+                                                trace["reasoning_recoveries"] = recovery_count
+                                                trace["reasoning_repeat_coverage"] = round(repeat_coverage, 3)
                                             break
                                         if not emb:              # "recover": not for a request with pictures
                                             recover_prompt = focused_recovery_prompt(self.tok, ids, raw_ids)
@@ -5649,14 +5676,18 @@ class Service:
                         # thinking ended, after the blank line the template puts before a call.
                         if wrap:
                             budget = st["thinking_budget"] = None
-                            text = REASONING_WRAP_UP + (force or "")
+                            text = (REASONING_LOOP_WRAP_UP if loop_wrap else REASONING_WRAP_UP) + (force or "")
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
                         force = None
                         extra = self.tok.encode(text, parse_special=True)
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
-                        if wrap:
+                        if wrap and loop_wrap:
+                            print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at {n} tokens: "
+                                  "closing it and letting the model answer (reasoning_loop_recovery: \"wrap\"; false turns this off)",
+                                  flush=True)
+                        elif wrap:
                             print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
                         for t in extra:
@@ -9185,13 +9216,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if budget:
             print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
-    recovery = cfg.get("reasoning_loop_recovery", False)   # #728: false (default) | "stop" | "recover" (true)
-    if recovery is True:
-        recovery = "recover"
-    if recovery is not False and recovery not in ("stop", "recover"):
-        raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
-                         f"not {recovery!r}")
-    svc.reasoning_loop_recovery = recovery
+    svc.reasoning_loop_recovery = loop_recovery_setting(cfg)
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     if a.engine == "strata" and groups:                 # replicas: every card of every group

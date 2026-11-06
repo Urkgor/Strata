@@ -1,8 +1,8 @@
 """CPU-only regression for opt-in reasoning recovery: python -m unittest serve.test_reasoning_loop_recovery."""
 import threading
 import unittest
-from serve.server import (Service, ByteTokenizer, MockEngine, HIGH_EFFORT,
-                          reasoning_repeat_coverage, focused_recovery_prompt)
+from serve.server import (Service, ByteTokenizer, MockEngine, HIGH_EFFORT, REASONING_LOOP_WRAP_UP,
+                          reasoning_repeat_coverage, focused_recovery_prompt, loop_recovery_setting)
 
 
 class Tokenizer(ByteTokenizer):
@@ -219,6 +219,58 @@ class ReasoningLoopRecovery(unittest.TestCase):
         self.assertEqual(retained, self.tok.encode(self.loop)[:len(retained)])
         self.assertEqual(engine.calls[1][1], 40000 - len(retained))
         self.assertNotIn('</think>', self.tok.decode(engine.calls[1][0]))
+
+
+class ReasoningLoopWrap(unittest.TestCase):
+    """"wrap": the thinking that repeats itself is closed (the budget's way) and the model answers - for a family without the effort instruction."""
+
+    def setUp(self):
+        self.tok = Tokenizer()
+        self.ids = self.tok.encode('<|im_start|>system\nYou are an assistant.<|im_end|>\n<|im_start|>user\nSolve this task<|im_end|>\n'
+                                   '<|im_start|>assistant\n<think>\n', parse_special=True)
+        self.loop = 'Need maybe Agent support agent seven b. ' * 700
+
+    def wrapped(self, enabled="wrap", scripts=None):
+        engine = RecordingEngine(self.tok, scripts or [self.loop, 'Complete solution.'])
+        service = Service(engine, self.tok, None)
+        service.answer_room = False
+        service.reasoning_loop_recovery = enabled
+        events = list(service.run(self.ids, True, [], 40000, {}, threading.Event()))
+        return engine, service, events
+
+    def test_wrap_closes_the_thinking_and_the_model_answers(self):
+        engine, service, events = self.wrapped()
+        self.assertEqual(len(engine.calls), 2)
+        closing = self.tok.encode(REASONING_LOOP_WRAP_UP, parse_special=True)
+        self.assertEqual(engine.calls[1][0][-len(closing):], closing)        # the prompt goes on from what the engine holds, then the wrap-up
+        self.assertEqual(engine.calls[1][0][:len(self.ids)], self.ids)       # the system prompt is not rewritten (unlike "recover")
+        self.assertEqual(events[-1][1]['finish'], 'stop')
+        self.assertEqual(events[-1][1]['reasoning_recoveries'], 1)
+        content = ''.join(e.text or '' for kind, e in events if kind == 'event' and e.kind == 'content')
+        self.assertEqual(content, 'Complete solution.')
+        self.assertGreaterEqual(service.history[-1]['reasoning_repeat_coverage'], .25)
+        self.assertFalse(service.status['busy'])
+
+    def test_wrap_leaves_novel_reasoning_alone(self):
+        novel = ' '.join(str(i) for i in range(4000)) + '\n</think>\nComplete solution.'
+        engine, service, events = self.wrapped(scripts=[novel])
+        self.assertEqual(len(engine.calls), 1)
+        self.assertEqual(events[-1][1]['reasoning_recoveries'], 0)
+
+    def test_off_means_the_loop_is_not_touched(self):
+        engine, service, events = self.wrapped(enabled=False, scripts=[self.loop + '\n</think>\nComplete solution.'])
+        self.assertEqual(len(engine.calls), 1)
+        self.assertEqual(events[-1][1]['reasoning_recoveries'], 0)
+
+    def test_the_setting_defaults_to_wrap_for_qwen36_only(self):
+        self.assertEqual(loop_recovery_setting({'arch': 'qwen35moe'}), 'wrap')
+        self.assertIs(loop_recovery_setting({'arch': 'qwen35moe', 'reasoning_loop_recovery': False}), False)
+        self.assertIs(loop_recovery_setting({'arch': 'deepseek41'}), False)
+        self.assertIs(loop_recovery_setting({}), False)
+        self.assertEqual(loop_recovery_setting({'reasoning_loop_recovery': True}), 'recover')
+        self.assertEqual(loop_recovery_setting({'arch': 'deepseek41', 'reasoning_loop_recovery': 'wrap'}), 'wrap')
+        with self.assertRaises(SystemExit):
+            loop_recovery_setting({'reasoning_loop_recovery': 'maybe'})
 
 
 if __name__ == '__main__':
