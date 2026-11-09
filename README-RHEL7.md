@@ -55,7 +55,7 @@ tools/build_rhel7.sh --cmake ~/cmake-3.20.2-linux-x86_64/bin/cmake --arch 61 --g
 ```
 
 - Sans `--ggml`, CMake télécharge lui-même le bon llama.cpp (il faut GitHub).
-- **Seulement Qwen3.6** : `--q36-only` ne compile que `build-rhel7/strata-q36` (le moteur du modèle, le même point d'entrée que `strata` pour un `qwen35moe`) et laisse de côté le programme `strata` (`generate.cpp`, les autres moteurs). Dans `strata-<modèle>.json` : `"exe": "/chemin/build-rhel7/strata-q36"` ; le serveur le lance comme `strata-q36 --serve …`, avec les mêmes arguments. `libstrata_kq.so` reste à côté de lui. Gain de compilation modeste (la bibliothèque du moteur commun reste compilée) ; pas de changement à l'exécution.
+- **Seulement Qwen3.6** : `--q36-only` ne compile que `build-rhel7/strata-q36` (le moteur du modèle, le même point d'entrée que `strata` pour un `qwen35moe`) et laisse de côté le programme `strata` (`generate.cpp`, les autres moteurs). Dans `strata-<modèle>.json` : `"exe": "/chemin/build-rhel7/strata-q36"` ; le serveur le lance comme `strata-q36 --serve …`, avec les mêmes arguments. `libstrata_kq.so` reste à côté de lui. Avec `-DSTRATA_Q36_ONLY=ON` (CMake ; `--q36-only` le passe) les bibliothèques ne compilent que les sources que `strata-q36` lie réellement (5 des 51 noyaux, 1 des 4 sources de prefill, ni `strata_engine` ni `strata_core`, 6 des fichiers MMQ en moins) : compilation −37 % (512 s → 322 s pour `--arch 61`, 3 jobs, CUDA 12.4), mêmes symboles, pas de changement à l'exécution. Le programme `strata` ne se lie plus dans ce mode. Si un lien échoue (`undefined reference`) sur une autre architecture ou option : `tools/q36_link_closure.py` sur la carte d'un lien complet (`-Wl,-Map=`) redonne la liste, ou `-DSTRATA_Q36_ONLY=OFF`.
 - **Autre version de llama.cpp.** Le moteur se compile contre le commit épinglé, contre **v0.6.0** (même interface) et contre **v0.8.0** :
   ```sh
   tools/build_rhel7.sh --arch 61 --ggml-tag v0.8.0                 # CMake télécharge v0.8.0
@@ -204,7 +204,7 @@ Le harnais DSH n'envoie `strata_prefix` (le début partagé d'un skill, épingl�
 
 ## La branche « Qwen3.6 seul » (`feature/q36-only`)
 
-Le dépôt contient plusieurs moteurs (Flash-Next, DeepSeek, Mac, Intel, AMD), leurs installeurs, l'application et 480 000 lignes de mesures. Pour un seul modèle sur CUDA / Linux, la branche `feature/q36-only` en retire **81 % des lignes** (4 463 fichiers sur 5 252) : `bench/`, `sycl/`, `metal/`, `apps/`, le moteur DeepSeek, l'installeur et le lanceur, les tests des autres moteurs, la plupart des docs. Elle garde tout ce que le moteur Qwen3.6, le serveur et la compilation utilisent (les modules Python importés par `serve/` sont trouvés en lisant les imports, pas par une liste). Ce qui est vérifié : CMake se configure (sans CUDA), les 818 tests Python restants, les tests CPU du moteur. **Non vérifié ici** : la compilation CUDA.
+Le dépôt contient plusieurs moteurs (Flash-Next, DeepSeek, Mac, Intel, AMD), leurs installeurs, l'application et 480 000 lignes de mesures. Pour un seul modèle sur CUDA / Linux, la branche `feature/q36-only` en retire **81 % des lignes** (4 463 fichiers sur 5 252) : `bench/`, `sycl/`, `metal/`, `apps/`, le moteur DeepSeek, l'installeur et le lanceur, les tests des autres moteurs, la plupart des docs. Elle garde tout ce que le moteur Qwen3.6, le serveur et la compilation utilisent (les modules Python importés par `serve/` sont trouvés en lisant les imports, pas par une liste). Ce qui est vérifié : CMake se configure, les 818 tests Python restants, les tests CPU du moteur, et la **compilation CUDA 12.4** dans un conteneur AlmaLinux 8 (glibc 2.28) pour `--arch 61` et `--arch "61;75"` : `strata-q36` et `libstrata_kq.so` se lient, la vérification glibc (limites RHEL 8) passe. Dans cette branche `STRATA_Q36_ONLY` et `--q36-only` sont **actifs par défaut**. **Non vérifié ici** : l'exécution sur un GPU.
 
 Elle est **dérivée** de `feature/RHEL7_compatibility` par un script, pas maintenue à la main. Après avoir fusionné `main` dans `feature/RHEL7_compatibility` :
 ```sh
@@ -214,7 +214,14 @@ python3 tools/make_q36_only.py            # simulation : ce qui sera retiré, av
 python3 tools/make_q36_only.py --apply    # git rm + un commit
 git push --force-with-lease origin feature/q36-only
 ```
-(Fusionner la branche source dans la dérivée créerait un conflit par fichier que `main` a modifié dans un dossier retiré : on la refait donc à chaque fois.) Avec elle : `tools/build_rhel7.sh --q36-only --arch 61` puis `"exe": ".../build-rhel7/strata-q36"`.
+(Fusionner la branche source dans la dérivée créerait un conflit par fichier que `main` a modifié dans un dossier retiré : on la refait donc à chaque fois.) Compiler cette branche (RHEL 8, CUDA 12.4, GTX 1080 Ti + T1000) :
+```sh
+sudo dnf install -y gcc-toolset-12-gcc-c++ cmake git
+git clone -b feature/q36-only https://github.com/Urkgor/Strata.git ~/Strata-q36 && cd ~/Strata-q36
+git clone https://github.com/ggml-org/llama.cpp.git ~/llama.cpp && git -C ~/llama.cpp checkout 3cf03257f219afbe7334045ff7c6a06ac68c627d
+tools/build_rhel7.sh --arch "61;75" --cuda-home /usr/local/cuda-12.4 --ggml ~/llama.cpp
+```
+Résultat : `build-rhel7/strata-q36` et `libstrata_kq.so`, puis `"exe": ".../build-rhel7/strata-q36"` dans `strata-<modèle>.json`. Mesuré dans le conteneur : 622 s pour `61;75` avec 3 jobs (`--jobs N` pour changer).
 
 ## Un modèle qui boucle pendant son « thinking »
 
