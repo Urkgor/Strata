@@ -232,7 +232,16 @@ REASONING_LOOP_WRAP_UP = "\n\nI am going around in circles and repeating myself;
 # default for Qwen3.6 (qwen35moe); false turns it off.  The others are off by default.
 HIGH_EFFORT = EFFORT_TEXT["xhigh"]
 LOW_EFFORT = EFFORT_TEXT["low"]
-LOOP_CHECK_EVERY = 512           # output tokens between two looks at the reasoning (at a clean parser boundary)
+LOOP_CHECK_EVERY = 256           # output tokens between two looks at the reasoning (at a clean parser boundary)
+LOOP_MIN_WORDS = 400             # the shortest reasoning the passage count judges (a window of up to 2,000 words: a tight loop shows early)
+# A loop that is not word for word (the model rewords its plan each round) escapes the passage count, but the model often SAYS it is looping
+# ("ok, I am going to stop going in circles..."), and rewrites the same sentence.  Both read as a loop here:
+LOOP_PHRASES = re.compile(r"going (?:around |round )?in circles|go(?:ing)? around in circles|stuck in a (?:loop|cycle)|in an? (?:infinite )?loop\b|"
+                          r"repeating myself|keep (?:repeating|looping|going back)|(?:same|this) (?:thing|thought|point|check) (?:again )?over and over|"
+                          r"stop (?:going|looping|repeating)|loop(?:ing)? (?:again|forever)", re.I)
+LOOP_PHRASE_COUNT = 3            # that many such remarks in one reasoning
+LOOP_SENTENCE_REPEATS = 4        # one sentence (6+ words) this many times among the last LOOP_SENTENCES
+LOOP_SENTENCES = 60
 LOOP_COVERAGE = 0.25             # the share of the last 2,000 words inside 12-word passages seen three times
 LOOP_HISTORY_WORDS = 30000       # how far back the passages are counted (bounds the cost of a look)
 LOOP_TAIL_CHARS = 2048           # chars at the end of the reasoning also checked for a short period (#1753)
@@ -253,8 +262,8 @@ def reasoning_repeat_coverage(text):
     if len(tail) == LOOP_TAIL_CHARS and any(tail[p:] == tail[:-p] for p in range(1, LOOP_TAIL_PERIOD + 1)):
         return 1.0
     words = re.findall(r"\w+|[^\w\s]", text.lower())[-LOOP_HISTORY_WORDS:]
-    width, window = 12, 2000
-    if len(words) < window:
+    width, window = 12, min(2000, len(words))
+    if window < LOOP_MIN_WORDS:
         return 0.0
     grams = [tuple(words[i:i + width]) for i in range(len(words) - width + 1)]
     counts = collections.Counter(grams)
@@ -264,6 +273,19 @@ def reasoning_repeat_coverage(text):
         if counts[grams[i]] >= 3:
             covered.update(range(i, i + width))
     return len(covered) / (len(words) - start)
+
+
+def reasoning_loop_signal(text):
+    """1.0 when the reasoning says it is going in circles LOOP_PHRASE_COUNT times, or writes one sentence over and over; else 0.0.
+    The passage count above needs the same twelve words again and again; a model that rewords each round (and says "I am going to
+    stop going in circles" while it does) never gives it that."""
+    if len(LOOP_PHRASES.findall(text[-30000:])) >= LOOP_PHRASE_COUNT:
+        return 1.0
+    sentences = [re.sub(r"\W+", " ", s).strip().lower() for s in re.split(r"(?<=[.!?])\s+|\n+", text[-20000:])]
+    last = [s for s in sentences if len(s.split()) >= 6][-LOOP_SENTENCES:]
+    if last and collections.Counter(last).most_common(1)[0][1] >= LOOP_SENTENCE_REPEATS:
+        return 1.0
+    return 0.0
 
 
 def loop_recovery_setting(cfg):
@@ -5542,7 +5564,7 @@ class Service:
                                         and n >= next_loop_check and not parser.buf and not parser.pending
                                         and not detok.pending()):
                                     next_loop_check = n + LOOP_CHECK_EVERY
-                                    repeat_coverage = reasoning_repeat_coverage(reasoning_text)
+                                    repeat_coverage = max(reasoning_repeat_coverage(reasoning_text), reasoning_loop_signal(reasoning_text))
                                     if repeat_coverage >= LOOP_COVERAGE:
                                         if self.reasoning_loop_recovery == "stop":
                                             looped = True        # #728: end the reply here, as for a repeated token
@@ -9217,6 +9239,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
     svc.reasoning_loop_recovery = loop_recovery_setting(cfg)
+    print(f"[strata] reasoning loop guard: {svc.reasoning_loop_recovery or 'off'} (config \"reasoning_loop_recovery\": false | \"wrap\" | \"stop\" | \"recover\"; "
+          f"default \"wrap\" for \"arch\": \"qwen35moe\", off otherwise)", flush=True)
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     if a.engine == "strata" and groups:                 # replicas: every card of every group

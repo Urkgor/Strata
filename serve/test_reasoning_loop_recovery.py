@@ -2,7 +2,7 @@
 import threading
 import unittest
 from serve.server import (Service, ByteTokenizer, MockEngine, HIGH_EFFORT, REASONING_LOOP_WRAP_UP,
-                          reasoning_repeat_coverage, focused_recovery_prompt, loop_recovery_setting)
+                          reasoning_repeat_coverage, reasoning_loop_signal, focused_recovery_prompt, loop_recovery_setting)
 
 
 class Tokenizer(ByteTokenizer):
@@ -261,6 +261,42 @@ class ReasoningLoopWrap(unittest.TestCase):
         engine, service, events = self.wrapped(enabled=False, scripts=[self.loop + '\n</think>\nComplete solution.'])
         self.assertEqual(len(engine.calls), 1)
         self.assertEqual(events[-1][1]['reasoning_recoveries'], 0)
+
+    def reworded_loop(self, rounds):
+        """Every round words its plan differently (no twelve words come back) and remarks that the model is going in circles."""
+        out = []
+        for i in range(rounds):
+            out.append(f"Round {i}: let me check option {i * 7 % 5} for file number {i * 13} again, in case the value {i * 31} changes anything. "
+                       "Ok, I'm going to stop going in circles and just decide now. "
+                       f"Hmm, but wait, what about case {i * 17}, which I have not looked at; maybe the answer is {i * 3 + 1}?")
+        return ' '.join(out)
+
+    def test_a_loop_that_rewords_itself_is_found_by_what_the_model_says(self):
+        text = self.reworded_loop(6)
+        self.assertLess(reasoning_repeat_coverage(text), .25)        # the passage count alone does not see it
+        self.assertEqual(reasoning_loop_signal(text), 1.0)
+        self.assertEqual(reasoning_loop_signal(self.reworded_loop(2)), 0.0)    # a couple of remarks is not a loop
+
+    def test_one_sentence_written_again_and_again(self):
+        text = ' '.join(f"Step {i} gives {i * 7}. The user wants the function to return the sum of the two arguments plainly." for i in range(8))
+        self.assertEqual(reasoning_loop_signal(text), 1.0)
+        self.assertEqual(reasoning_loop_signal(' '.join(f"Step {i} gives {i * 7} for the case number {i * 11} here." for i in range(40))), 0.0)
+
+    def test_a_reasoning_that_works_is_not_a_loop(self):
+        text = ('First read the file. The parser splits the input at commas, then trims each field. A quoted field may hold a comma, so the split '
+                'must respect quotes. The tests cover that case. Next the writer: it joins the fields back with commas and quotes any field that '
+                'holds one. Edge case: an empty line yields one empty field. Check the code path for it. Done, now answer.')
+        self.assertEqual(reasoning_loop_signal(text), 0.0)
+
+    def test_wrap_ends_a_loop_that_rewords_itself(self):
+        engine, service, events = self.wrapped(scripts=[self.reworded_loop(400), 'Complete solution.'])
+        self.assertEqual(len(engine.calls), 2)
+        self.assertEqual(events[-1][1]['reasoning_recoveries'], 1)
+        content = ''.join(e.text or '' for kind, e in events if kind == 'event' and e.kind == 'content')
+        self.assertEqual(content, 'Complete solution.')
+
+    def test_a_tight_loop_is_found_in_a_short_reasoning(self):
+        self.assertGreater(reasoning_repeat_coverage('Need maybe Agent support agent seven b. ' * 80), .9)    # 560 words, under the old 2,000
 
     def test_the_setting_defaults_to_wrap_for_qwen36_only(self):
         self.assertEqual(loop_recovery_setting({'arch': 'qwen35moe'}), 'wrap')
