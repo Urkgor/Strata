@@ -50,7 +50,8 @@ REMOVE_FILES = [
     "flake.nix", "flake.lock", "CONTRIBUTING.md", "data/expert-profile-sycl.bin", "data/expert-profile-coder.bin",
     "README.de.md", "README.es.md", "README.fr.md", "README.ja.md", "README.pl.md", "README.pt-BR.md", "README.zh-CN.md",
 ]
-KEEP_TESTS = ["tests/core/q36_*"]
+# tests/core/dma_batch_parity.cu: CMake builds that test executable whether or not STRATA_BUILD_TESTS is on (found by configuring the CUDA build)
+KEEP_TESTS = ["tests/core/q36_*", "tests/core/dma_batch_parity.cu"]
 KEEP_DOCS = ["docs/QWEN36.md", "docs/RHEL7.md", "docs/DETAILS.md", "docs/BATCHING.md", "docs/OLDER_GPUS.md", "docs/QUANTS.md",
              "docs/INSTALL.md", "docs/TROUBLESHOOTING.md", "docs/HOW_IT_WORKS.md", "docs/LOGIT_BIAS.md", "docs/README.md"]
 # tools/: only these (and what the server imports, found below) stay.
