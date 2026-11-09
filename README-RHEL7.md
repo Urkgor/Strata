@@ -202,6 +202,20 @@ Le harnais DSH n'envoie `strata_prefix` (le début partagé d'un skill, épingl�
 - **Le moteur Qwen3.6 ne disait pas sa version** au serveur : `/props` n'avait pas de `build_info`, et DSH le prenait pour llama.cpp (il envoyait `cache_prompt`, pas `strata_prefix`). Corrigé (`git pull`, rebuild) : le moteur écrit `INFO engine=<version>`. Vérifiez : `curl -s http://HOTE:8080/props | grep -o '"build_info":"[^"]*"'` doit donner `Strata 0.1.52`.
 - **Adresse publique** (par exemple 152.x) : DSH ne sonde pas `/props` d'une adresse hors réseau local. Dans la configuration du fournisseur DSH, mettez `localRuntime: "llamacpp"` : cela force la sonde. (Ou passez par une adresse privée / un nom en `.lan`.) Attention : DSH proposera alors aussi les contrôles llama.cpp pour ce fournisseur.
 
+## La branche « Qwen3.6 seul » (`feature/q36-only`)
+
+Le dépôt contient plusieurs moteurs (Flash-Next, DeepSeek, Mac, Intel, AMD), leurs installeurs, l'application et 480 000 lignes de mesures. Pour un seul modèle sur CUDA / Linux, la branche `feature/q36-only` en retire **81 % des lignes** (4 463 fichiers sur 5 252) : `bench/`, `sycl/`, `metal/`, `apps/`, le moteur DeepSeek, l'installeur et le lanceur, les tests des autres moteurs, la plupart des docs. Elle garde tout ce que le moteur Qwen3.6, le serveur et la compilation utilisent (les modules Python importés par `serve/` sont trouvés en lisant les imports, pas par une liste). Ce qui est vérifié : CMake se configure (sans CUDA), les 818 tests Python restants, les tests CPU du moteur. **Non vérifié ici** : la compilation CUDA.
+
+Elle est **dérivée** de `feature/RHEL7_compatibility` par un script, pas maintenue à la main. Après avoir fusionné `main` dans `feature/RHEL7_compatibility` :
+```sh
+git branch -D feature/q36-only
+git checkout -B feature/q36-only feature/RHEL7_compatibility
+python3 tools/make_q36_only.py            # simulation : ce qui sera retiré, avec les lignes
+python3 tools/make_q36_only.py --apply    # git rm + un commit
+git push --force-with-lease origin feature/q36-only
+```
+(Fusionner la branche source dans la dérivée créerait un conflit par fichier que `main` a modifié dans un dossier retiré : on la refait donc à chaque fois.) Avec elle : `tools/build_rhel7.sh --q36-only --arch 61` puis `"exe": ".../build-rhel7/strata-q36"`.
+
 ## Un modèle qui boucle pendant son « thinking »
 
 Le serveur surveille la réflexion : tous les 256 tokens il regarde si les mêmes passages reviennent, si une même phrase est réécrite 4 fois, ou si le modèle dit lui-même 3 fois qu'il « tourne en rond » (une boucle reformulée à chaque tour échappe au simple comptage de passages). Pour Qwen3.6 le garde-fou est **actif par défaut** (`"reasoning_loop_recovery": "wrap"`) : la réflexion est fermée (une courte phrase « je tourne en rond » puis `</think>`) et le modèle répond, sans relire le prompt. Le journal Strata dit alors « the thinking repeated the same passages … closing it », et au démarrage « reasoning loop guard: wrap » (s'il dit `off`, mettez `"arch": "qwen35moe"` ou `"reasoning_loop_recovery": "wrap"` dans `strata-<modèle>.json`). Le `"stop"` termine la réponse à la place, `false` coupe le garde-fou. Une boucle sur un seul token est déjà coupée par `repeat_stop_tokens`. Pour borner la réflexion dès le départ : `reasoning_budget_tokens`.
