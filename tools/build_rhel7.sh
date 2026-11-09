@@ -13,13 +13,13 @@
 #   * CUDA: NVIDIA's RHEL 7 repository stops at 12.4.  Cards older than RTX 20 (GTX 10, Tesla P100/P40) need CUDA 12.x
 #     anyway (CUDA 13 dropped them), so this is the "CUDA 12 engine" of docs/OLDER_GPUS.md.
 #   * the prebuilt engines: they ask for glibc 2.35, RHEL 7 has 2.17.  An engine built here asks for nothing above it.
-# The result is $BUILD_DIR/strata (and libstrata_kq.so beside it); the last step checks them with
+# The result is $BUILD_DIR/strata, or $BUILD_DIR/strata-q36 with --q36-only (and libstrata_kq.so beside it); the last step checks them with
 # tools/check_glibc_symbols.sh.
 set -eu
 ORIG_PWD=$(pwd)
 cd "$(dirname "$0")/.."
 
-ARCH=""; CMAKE_ARG=""; CUDA_DIR=""; BUILD_DIR="build-rhel7"; JOBS=""; PORTABLE=""; GGML_DIR=""; GGML_TAG=""; FLOOR="${STRATA_ISA_FLOOR:-}"; TARGETS="strata"
+ARCH=""; CMAKE_ARG=""; CUDA_DIR=""; BUILD_DIR="build-rhel7"; JOBS=""; PORTABLE=""; GGML_DIR=""; GGML_TAG=""; FLOOR="${STRATA_ISA_FLOOR:-}"; TARGETS="strata"; Q36ONLY=""; ENGINE_BIN="strata"
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; cat <<'EOF'
 
 options:
@@ -35,6 +35,9 @@ options:
                      with git).  The pinned commit, v0.6.0 and v0.8.0 are built and checked; another one works if its
                      ggml-cuda/mmq.cuh has the interface of the pin or of v0.8.0 (probed below, and again by CMake)
   --ggml-tag TAG     fetch llama.cpp at this tag or commit instead of the pinned one, e.g. --ggml-tag v0.8.0 (needs git and network)
+  --q36-only         build only strata-q36, the Qwen3.6-35B-A3B engine on its own (the entry `strata` switches to for that model), not the
+                     `strata` program (generate.cpp, the other engines).  Run it with "exe": ".../strata-q36" in strata-<model>.json: the
+                     server starts it as `strata-q36 --serve ...`, the same arguments
   --no-kq            leave out libstrata_kq.so, the prompt kernels for Unsloth's UD-Q4/Q5/Q6_K_XL files (default: built)
 EOF
 }
@@ -51,6 +54,7 @@ while [ $# -gt 0 ]; do
     --ggml) GGML_DIR="$2"; shift 2 ;;
     --ggml-tag) GGML_TAG="$2"; shift 2 ;;
     --no-kq) KQ=0; shift ;;
+    --q36-only) Q36ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "build_rhel7: unknown option $1 (--help lists them)" >&2; exit 2 ;;
   esac
@@ -199,6 +203,10 @@ set -- -S . -B "$BUILD_DIR" -G "$GEN" -DCMAKE_BUILD_TYPE=Release \
 [ -z "$GGML_DIR" ] || set -- "$@" "-DSTRATA_GGML_DIR=$GGML_DIR"
 [ -z "$GGML_TAG" ] || set -- "$@" "-DSTRATA_GGML_TAG=$GGML_TAG"
 [ "$KQ" = 1 ] && TARGETS="strata strata_kq"
+if [ -n "$Q36ONLY" ]; then
+  ENGINE_BIN="strata-q36"; TARGETS="strata-q36"
+  [ "$KQ" = 1 ] && TARGETS="strata-q36 strata_kq"
+fi
 note "configuring $BUILD_DIR (sm_$(printf '%s' "$ARCH" | sed 's/;/, sm_/g'))"
 "$CMAKE_BIN" "$@"
 note "building $TARGETS with $JOBS jobs (a few minutes for one architecture, 10-30 for several)"
@@ -220,9 +228,9 @@ fi
 
 # ---- 7. will it run on RHEL 7?
 OUT=""
-for f in "$BUILD_DIR/strata" "$BUILD_DIR/libstrata_kq.so"; do [ -f "$f" ] && OUT="$OUT $f"; done
-[ -n "$OUT" ] || die "the build finished without $BUILD_DIR/strata"
+for f in "$BUILD_DIR/$ENGINE_BIN" "$BUILD_DIR/libstrata_kq.so"; do [ -f "$f" ] && OUT="$OUT $f"; done
+[ -n "$OUT" ] || die "the build finished without $BUILD_DIR/$ENGINE_BIN"
 # shellcheck disable=SC2086
 sh tools/check_glibc_symbols.sh $OUT || die "the engine asks for a newer C library than RHEL 7 has (above); build it on RHEL 7 or in docker/rhel7"
-note "done: $BUILD_DIR/strata  (CUDA libraries it loads: $CUDA_ROOT/lib64 or targets/x86_64-linux/lib; the NVIDIA driver provides libcuda.so.1)"
-note "check: $BUILD_DIR/strata --help; the driver needs to be R525 or newer for a CUDA 12 engine"
+note "done: $BUILD_DIR/$ENGINE_BIN  (CUDA libraries it loads: $CUDA_ROOT/lib64 or targets/x86_64-linux/lib; the NVIDIA driver provides libcuda.so.1)"
+note "check: $BUILD_DIR/$ENGINE_BIN --help; the driver needs to be R525 or newer for a CUDA 12 engine"

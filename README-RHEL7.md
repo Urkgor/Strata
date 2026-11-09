@@ -55,6 +55,7 @@ tools/build_rhel7.sh --cmake ~/cmake-3.20.2-linux-x86_64/bin/cmake --arch 61 --g
 ```
 
 - Sans `--ggml`, CMake télécharge lui-même le bon llama.cpp (il faut GitHub).
+- **Seulement Qwen3.6** : `--q36-only` ne compile que `build-rhel7/strata-q36` (le moteur du modèle, le même point d'entrée que `strata` pour un `qwen35moe`) et laisse de côté le programme `strata` (`generate.cpp`, les autres moteurs). Dans `strata-<modèle>.json` : `"exe": "/chemin/build-rhel7/strata-q36"` ; le serveur le lance comme `strata-q36 --serve …`, avec les mêmes arguments. `libstrata_kq.so` reste à côté de lui. Gain de compilation modeste (la bibliothèque du moteur commun reste compilée) ; pas de changement à l'exécution.
 - **Autre version de llama.cpp.** Le moteur se compile contre le commit épinglé, contre **v0.6.0** (même interface) et contre **v0.8.0** :
   ```sh
   tools/build_rhel7.sh --arch 61 --ggml-tag v0.8.0                 # CMake télécharge v0.8.0
