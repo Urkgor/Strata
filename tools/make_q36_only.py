@@ -189,6 +189,14 @@ def main():
     for path, _, files in os.walk(ROOT, topdown=False):      # git leaves no empty folders, but a __pycache__ may remain
         if path != ROOT and not files and not os.listdir(path):
             os.rmdir(path)
+    # B (CMakeLists.txt, STRATA_Q36_ONLY): in this tree it is on by default - the engines it leaves uncompiled are not here to link anyway
+    cmake = os.path.join(ROOT, "CMakeLists.txt")
+    text = open(cmake, encoding="utf8").read()
+    anchor = 'the target strata no longer links" OFF)'
+    if anchor not in text:
+        sys.exit("CMakeLists.txt has no STRATA_Q36_ONLY option to turn on: the option moved, update make_q36_only.py")
+    open(cmake, "w", encoding="utf8").write(text.replace(anchor, 'the target strata no longer links" ON)'))
+    subprocess.run(["git", "add", "CMakeLists.txt"], cwd=ROOT, check=True)
     missing = checks()
     subprocess.run(["git", "commit", "-q", "-m", f"q36-only: remove what Qwen3.6-35B-A3B on CUDA does not use ({len(remove)} files, {gone} lines); "
                     "derived by tools/make_q36_only.py"], cwd=ROOT, check=True)

@@ -2848,3 +2848,50 @@ if(STRATA_BUILD_DSV41 AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND N
     target_compile_definitions(ds4_gg_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
   endif()
 endif()
+
+# ---- STRATA_Q36_ONLY: compile only what strata-q36 links --------------------------------------------------------------------
+# A full build compiles every kernel of every engine into static libraries, but a static link takes only the objects a program refers
+# to.  strata-q36 (the Qwen3.6-35B-A3B engine) pulls 5 of strata_kernels' 51 objects, 1 of strata_prefill's 4 and nothing of strata_engine
+# or strata_core (the Flash-Next engine); strata_mmq's moe_fused* / moe_ws* are not referenced either.  The lists below are that set,
+# read from the linker's map of a full build (tools/q36_link_closure.py makes them again: after a merge of `main`, a new option or another
+# CUDA architecture, link the full build with -Wl,-Map=FILE and run it on FILE).  A source missing from a list is a link error that names
+# the symbol - never a silent change: add its file here.  The target `strata` (generate.cpp) cannot link with this on: it needs the engines
+# that are no longer compiled.  Validated on CUDA 12.4 for sm_61 and sm_61;75.  CUDA only.
+option(STRATA_Q36_ONLY "Compile only the sources the Qwen3.6 engine (strata-q36) links (CUDA); the target strata no longer links" OFF)
+if(STRATA_Q36_ONLY AND NOT STRATA_ENABLE_CUDA)
+  message(WARNING "STRATA_Q36_ONLY is for the CUDA build: ignored")
+elseif(STRATA_Q36_ONLY)
+  # keep the sources of `target` whose file name is in the list; a library cannot be empty, so `fallback` (a file small enough to be
+  # free to compile) stays in the two the program does not use at all
+  function(strata_q36_keep target fallback)
+    get_target_property(_all ${target} SOURCES)
+    set(_kept "")
+    foreach(_s IN LISTS _all)
+      get_filename_component(_n "${_s}" NAME)
+      if(_n IN_LIST ARGN)
+        list(APPEND _kept "${_s}")
+      endif()
+    endforeach()
+    if(NOT _kept)
+      foreach(_s IN LISTS _all)
+        if(_s MATCHES "${fallback}$")
+          list(APPEND _kept "${_s}")
+        endif()
+      endforeach()
+    endif()
+    if(NOT _kept)
+      message(FATAL_ERROR "STRATA_Q36_ONLY: nothing left of ${target}: check the lists at the end of CMakeLists.txt")
+    endif()
+    set_property(TARGET ${target} PROPERTY SOURCES ${_kept})
+  endfunction()
+  strata_q36_keep(strata_kernels src/kernels/cuda/dequant_bf16.cu dequant_bf16.cu iq_kernels.cu native_mmvq.cu native_router.cu verify_kernels.cu)
+  strata_q36_keep(strata_prefill src/prefill/gemm.cu gemm.cu)
+  strata_q36_keep(strata_engine src/core/nv_defaults.cpp)      # nothing of it is linked
+  strata_q36_keep(strata_core src/core/layout.cpp)             # nor of this
+  if(TARGET strata_mmq)
+    get_target_property(_mmq_all strata_mmq SOURCES)
+    list(FILTER _mmq_all EXCLUDE REGEX "(^|/)(moe_fused|moe_fused_iq|moe_ws|moe_ws_down|moe_ws_gu_iq2|moe_ws_gu_iq3)\\.cu$")
+    set_property(TARGET strata_mmq PROPERTY SOURCES ${_mmq_all})
+  endif()
+  message(STATUS "STRATA_Q36_ONLY: strata_kernels, strata_prefill, strata_engine, strata_core and strata_mmq cut to what strata-q36 links")
+endif()

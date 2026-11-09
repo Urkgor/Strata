@@ -202,6 +202,7 @@ set -- -S . -B "$BUILD_DIR" -G "$GEN" -DCMAKE_BUILD_TYPE=Release \
 [ -z "$FLOOR" ] || set -- "$@" "-DSTRATA_ISA_FLOOR=$FLOOR"
 [ -z "$GGML_DIR" ] || set -- "$@" "-DSTRATA_GGML_DIR=$GGML_DIR"
 [ -z "$GGML_TAG" ] || set -- "$@" "-DSTRATA_GGML_TAG=$GGML_TAG"
+[ -z "$Q36ONLY" ] || set -- "$@" -DSTRATA_Q36_ONLY=ON    # compile only the sources strata-q36 links (CMakeLists.txt, STRATA_Q36_ONLY)
 [ "$KQ" = 1 ] && TARGETS="strata strata_kq"
 if [ -n "$Q36ONLY" ]; then
   ENGINE_BIN="strata-q36"; TARGETS="strata-q36"
@@ -230,7 +231,14 @@ fi
 OUT=""
 for f in "$BUILD_DIR/$ENGINE_BIN" "$BUILD_DIR/libstrata_kq.so"; do [ -f "$f" ] && OUT="$OUT $f"; done
 [ -n "$OUT" ] || die "the build finished without $BUILD_DIR/$ENGINE_BIN"
+# the limits are those of the system this was built on: RHEL / CentOS 7 (glibc 2.17, the script's defaults), or RHEL 8 and its clones (2.28)
+HOST_GLIBC=$(ldd --version 2>/dev/null | sed -n '1s/.* //p')
+LIMITS=""; OS_NAME="RHEL 7"
+if [ -n "$HOST_GLIBC" ] && ver_ge "$HOST_GLIBC" 2.28; then
+  LIMITS="--max-glibc 2.28 --max-glibcxx 3.4.25 --max-cxxabi 1.3.11"; OS_NAME="RHEL 8"
+  note "built on glibc $HOST_GLIBC: the check is against RHEL 8 (glibc 2.28), not RHEL 7"
+fi
 # shellcheck disable=SC2086
-sh tools/check_glibc_symbols.sh $OUT || die "the engine asks for a newer C library than RHEL 7 has (above); build it on RHEL 7 or in docker/rhel7"
+sh tools/check_glibc_symbols.sh $OUT $LIMITS || die "the engine asks for a newer C library than $OS_NAME has (above); build it on $OS_NAME or an older system"
 note "done: $BUILD_DIR/$ENGINE_BIN  (CUDA libraries it loads: $CUDA_ROOT/lib64 or targets/x86_64-linux/lib; the NVIDIA driver provides libcuda.so.1)"
 note "check: $BUILD_DIR/$ENGINE_BIN --help; the driver needs to be R525 or newer for a CUDA 12 engine"
