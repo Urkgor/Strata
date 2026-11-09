@@ -196,7 +196,12 @@ def main():
     if anchor not in text:
         sys.exit("CMakeLists.txt has no STRATA_Q36_ONLY option to turn on: the option moved, update make_q36_only.py")
     open(cmake, "w", encoding="utf8").write(text.replace(anchor, 'the target strata no longer links" ON)'))
-    subprocess.run(["git", "add", "CMakeLists.txt"], cwd=ROOT, check=True)
+    build = os.path.join(ROOT, "tools", "build_rhel7.sh")        # ... and so is --q36-only of the build script (the target `strata` cannot link here)
+    script = open(build, encoding="utf8").read()
+    if 'Q36ONLY=""' not in script:
+        sys.exit("tools/build_rhel7.sh has no Q36ONLY default to turn on: update make_q36_only.py")
+    open(build, "w", encoding="utf8").write(script.replace('Q36ONLY=""', 'Q36ONLY="1"', 1))
+    subprocess.run(["git", "add", "CMakeLists.txt", "tools/build_rhel7.sh"], cwd=ROOT, check=True)
     missing = checks()
     subprocess.run(["git", "commit", "-q", "-m", f"q36-only: remove what Qwen3.6-35B-A3B on CUDA does not use ({len(remove)} files, {gone} lines); "
                     "derived by tools/make_q36_only.py"], cwd=ROOT, check=True)
