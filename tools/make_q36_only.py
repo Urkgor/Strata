@@ -28,6 +28,7 @@ import ast
 import fnmatch
 import glob
 import os
+import re
 import subprocess
 import sys
 
@@ -153,11 +154,9 @@ def plan():
     return tracked, sorted(remove)
 
 
-def checks(remaining):
+def checks():
     """What to look at after the removal: CMake source paths that no longer exist, outside the options that are off."""
     problems = []
-    import re
-    gone = [p for p in remaining if False]
     text = open(os.path.join(ROOT, "CMakeLists.txt"), encoding="utf8").read()
     for ref in sorted(set(re.findall(r"\b((?:src|include|tests|bench|tools|third_party)/[A-Za-z0-9_./-]+\.(?:cu|cuh|cpp|hpp|h|cmake|py|json|bin))", text))):
         if not os.path.exists(os.path.join(ROOT, ref)):
@@ -189,7 +188,7 @@ def main():
     for path, _, files in os.walk(ROOT, topdown=False):      # git leaves no empty folders, but a __pycache__ may remain
         if path != ROOT and not files and not os.listdir(path):
             os.rmdir(path)
-    missing = checks(None)
+    missing = checks()
     subprocess.run(["git", "commit", "-q", "-m", f"q36-only: remove what Qwen3.6-35B-A3B on CUDA does not use ({len(remove)} files, {gone} lines); "
                     "derived by tools/make_q36_only.py"], cwd=ROOT, check=True)
     print("committed.")
