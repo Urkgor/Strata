@@ -2857,7 +2857,7 @@ endif()
 # CUDA architecture, link the full build with -Wl,-Map=FILE and run it on FILE).  A source missing from a list is a link error that names
 # the symbol - never a silent change: add its file here.  The target `strata` (generate.cpp) cannot link with this on: it needs the engines
 # that are no longer compiled.  Validated on CUDA 12.4 for sm_61 and sm_61;75.  CUDA only.
-option(STRATA_Q36_ONLY "Compile only the sources the Qwen3.6 engine (strata-q36) links (CUDA); the target strata no longer links" OFF)
+option(STRATA_Q36_ONLY "Compile only the sources the Qwen3.6 engine (strata-q36) links (CUDA); the target strata no longer links" ON)
 if(STRATA_Q36_ONLY AND NOT STRATA_ENABLE_CUDA)
   message(WARNING "STRATA_Q36_ONLY is for the CUDA build: ignored")
 elseif(STRATA_Q36_ONLY)

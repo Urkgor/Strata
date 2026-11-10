@@ -19,7 +19,7 @@ set -eu
 ORIG_PWD=$(pwd)
 cd "$(dirname "$0")/.."
 
-ARCH=""; CMAKE_ARG=""; CUDA_DIR=""; BUILD_DIR="build-rhel7"; JOBS=""; PORTABLE=""; GGML_DIR=""; GGML_TAG=""; FLOOR="${STRATA_ISA_FLOOR:-}"; TARGETS="strata"; Q36ONLY=""; ENGINE_BIN="strata"
+ARCH=""; CMAKE_ARG=""; CUDA_DIR=""; BUILD_DIR="build-rhel7"; JOBS=""; PORTABLE=""; GGML_DIR=""; GGML_TAG=""; FLOOR="${STRATA_ISA_FLOOR:-}"; TARGETS="strata"; Q36ONLY="1"; ENGINE_BIN="strata"
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; cat <<'EOF'
 
 options:
