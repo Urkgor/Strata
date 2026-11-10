@@ -16,6 +16,7 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
 from __future__ import annotations
 
 import bisect
+import heapq
 import json
 import pathlib
 import re
@@ -235,8 +236,14 @@ class Tokenizer:
         if missing:
             raise ValueError("GGUF is missing %s; it does not carry a tokenizer" % ", ".join(missing))
         model = md.get("tokenizer.ggml.model")
+        if model == "gemma4":
+            return Gemma4Tokenizer(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.merges"]),
+                                   list(md.get("tokenizer.ggml.token_type") or []) or None,
+                                   special_ids={k: int(md[k]) for k in md
+                                                if k.startswith("tokenizer.ggml.") and k.endswith("_token_id")},
+                                   add_bos=bool(md.get("tokenizer.ggml.add_bos_token", False)))
         if model != "gpt2":
-            raise ValueError("expected a byte-level BPE tokenizer (model 'gpt2'), got %r" % model)
+            raise ValueError("expected a byte-level BPE tokenizer (model 'gpt2' or 'gemma4'), got %r" % model)
         special = {k: int(md[k]) for k in md
                    if k.startswith("tokenizer.ggml.") and k.endswith("_token_id")}
         return cls(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.merges"]),
@@ -420,6 +427,206 @@ class Tokenizer:
         return b"".join(self.token_bytes(i) for i in ids).decode("utf-8", errors=errors)
 
 
+class Gemma4Tokenizer:
+    """Gemma 4's tokenizer (`tokenizer.ggml.model` = `gemma4`), as llama.cpp's LLAMA_VOCAB_PRE_TYPE_GEMMA4 does it.
+
+    It is a BPE over raw UTF-8, SentencePiece style, not the GPT-2 byte alphabet: every space becomes U+2581 (`▁`),
+    the text is split only at newlines (a run of non-newlines, a run of newlines: `[^\\n]+|[\\n]+`), and each piece is
+    merged by lowest rank over its characters.  A symbol that is not a token falls back to its bytes as `<0xXX>`.  Special
+    tokens (GGUF token types 2 unknown, 3 control, 4 user defined) are cut out of the text first, the longest literal first,
+    as llama.cpp's tokenizer_st_partition does: type 4 is matched always, types 2 and 3 only with `parse_special`.  A run
+    of newlines that is itself a token is that token (ref: llama.cpp PR 21343).
+
+    The same public surface as Tokenizer (encode, encode_marked, decode, token_bytes, special_tokens, control_tokens,
+    max_special_len), so the server and PromptEncoder take either.  `add_bos` (the GGUF's `add_bos_token`) only matters for
+    `encode(..., add_special=True)`; the chat template already starts with `<bos>`.
+    """
+    SPACE = "\u2581"
+    PIECE_CACHE_MAX = 200_000
+    model = "gemma4"
+    pre = "gemma4"
+    EOG_TEXTS = ("<eos>", "<turn|>", "<|tool_response>")      # the tokens that end a reply (llama.cpp's special_eog_ids for gemma4)
+
+    def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
+                 special_ids: dict[str, int] | None = None, add_bos: bool = False):
+        self.tokens = tokens
+        self.token_types = token_types
+        self.special_ids = special_ids or {}
+        self.add_bos = add_bos
+        self.ids = {}
+        for i, tok in enumerate(tokens):
+            self.ids.setdefault(tok, i)          # llama.cpp's text_to_token: the first id of a text
+        self.ranks: dict[tuple[str, str], int] = {}
+        for i, m in enumerate(merges):
+            k = m.find(" ", 1) if m else -1      # llama.cpp: the first space after the first character
+            if k < 0:
+                continue                          # (it skips a merge with no separator, but keeps its rank number)
+            self.ranks.setdefault((m[:k], m[k + 1:]), i)
+        types = list(token_types or [])
+        # llama.cpp marks the end-of-generation tokens as control ones whatever the file says (a warning in its log): <eos>, the
+        # end of a turn, and `<|tool_response>` (the model writes it where the tool's answer goes, so a reply stops there)
+        for eog in self.EOG_TEXTS:
+            i = self.ids.get(eog)
+            if i is not None and i < len(types) and types[i] not in (3,):
+                types[i] = 3
+        self._types = types
+        # the special-token cache: type 2 (unknown), 3 (control) and 4 (user defined), longest text first
+        specials = [i for i, ty in enumerate(types) if ty in (2, 3, 4) and tokens[i]]
+        specials.sort(key=lambda i: -len(tokens[i]))      # (a stable sort: llama.cpp's std::sort leaves ties unspecified)
+        self._special_list = [(tokens[i], i, types[i] != 4) for i in specials]    # (text, id, needs parse_special)
+        self.special_tokens: dict[str, int] = {tokens[i]: i for i in specials if types[i] in (3, 4)}
+        self.control_tokens = [tokens[i] for i in specials if types[i] == 3]
+        self.max_special_len = max((len(s[0]) for s in self._special_list), default=1)
+        self._byte_ids = {}
+        for b in range(256):
+            self._byte_ids[b] = self.ids.get("<0x%02X>" % b)
+        self._piece_ids: dict[str, list[int]] = {}
+        self._bytes_cache: dict[int, bytes] = {}
+        self._split = re.compile(r"[^\n]+|\n+").findall
+
+    # -------------------------------------------------------------- the algorithm
+    def _bpe(self, word: str) -> list[str]:
+        """llama.cpp's llm_tokenizer_bpe_session: the characters of `word` merged by lowest rank, the leftmost on a tie."""
+        syms = list(word)
+        n = len(syms)
+        if n < 2:
+            return syms
+        prev = list(range(-1, n - 1))
+        nxt = list(range(1, n)) + [-1]
+        ranks = self.ranks
+        heap: list[tuple[int, int, int, str]] = []
+        for i in range(1, n):
+            text = syms[i - 1] + syms[i]
+            r = ranks.get((syms[i - 1], syms[i]))
+            if r is not None:
+                heap.append((r, i - 1, i, text))
+        heapq.heapify(heap)
+        while heap:
+            r, left, right, text = heapq.heappop(heap)
+            if not syms[left] or not syms[right] or syms[left] + syms[right] != text:
+                continue                                                   # an outdated bigram
+            syms[left] = text
+            syms[right] = ""
+            nxt[left] = nxt[right]
+            if nxt[right] >= 0:
+                prev[nxt[right]] = left
+            for a, b in ((prev[left], left), (left, nxt[left])):
+                if a >= 0 and b >= 0:
+                    rr = ranks.get((syms[a], syms[b]))
+                    if rr is not None:
+                        heapq.heappush(heap, (rr, a, b, syms[a] + syms[b]))
+        return [s for s in syms if s]
+
+    def _encode_piece(self, word: str) -> list[int]:
+        """One run of non-newlines (or of newlines) with its spaces already escaped."""
+        got = self._piece_ids.get(word)
+        if got is not None:
+            return got
+        ids = self.ids
+        out: list[int] = []
+        if word.strip("\n") == "" and word in ids:                        # a run of newlines that is a token (PR 21343)
+            out = [ids[word]]
+        else:
+            for s in self._bpe(word):
+                i = ids.get(s)
+                if i is not None:
+                    out.append(i)
+                else:
+                    for b in s.encode("utf-8"):
+                        bi = self._byte_ids[b]
+                        if bi is not None:
+                            out.append(bi)
+        if len(self._piece_ids) < self.PIECE_CACHE_MAX:
+            self._piece_ids[word] = out
+        return out
+
+    def _encode_plain(self, text: str) -> list[int]:
+        out: list[int] = []
+        if not text:
+            return out
+        for word in self._split(text.replace(" ", self.SPACE)):
+            out.extend(self._encode_piece(word))
+        return out
+
+    def _partition(self, text: str, parse_special: bool, plain=()) -> list:
+        """llama.cpp's tokenizer_st_partition: [(start, end)] raw stretches and [(id, start, end)] special matches, in order.
+
+        Each special literal in turn (the longest first) cuts every raw stretch still left, so a longer literal that
+        starts later wins over a shorter one that overlaps it.  A match that starts inside a `plain` span (#537) is not
+        taken."""
+        frags: list = [(0, len(text))]
+        plain = sorted(plain)
+        for lit, sid, needs_parse in self._special_list:
+            if needs_parse and not parse_special:
+                continue
+            if lit not in text:
+                continue
+            nxt: list = []
+            for fr in frags:
+                if len(fr) == 3:
+                    nxt.append(fr)
+                    continue
+                a, b = fr
+                pos = a
+                while True:
+                    m = text.find(lit, pos, b)
+                    while m >= 0 and plain and any(x <= m < y for x, y in plain):
+                        m = text.find(lit, m + 1, b)
+                    if m < 0:
+                        if pos < b:
+                            nxt.append((pos, b))
+                        break
+                    if m > pos:
+                        nxt.append((pos, m))
+                    nxt.append((sid, m, m + len(lit)))
+                    pos = m + len(lit)
+            frags = nxt
+        return frags
+
+    def _encode_frags(self, text: str, parse_special: bool, plain, marks: list | None, add_special: bool) -> list[int]:
+        out: list[int] = []
+        if add_special and self.add_bos:
+            bos = self.special_ids.get("tokenizer.ggml.bos_token_id")
+            if bos is not None:
+                out.append(bos)
+        for fr in self._partition(text, parse_special, plain):
+            if len(fr) == 3:
+                out.append(fr[0])
+                if marks is not None:
+                    marks.append((fr[2], len(out)))
+            else:
+                out.extend(self._encode_plain(text[fr[0]:fr[1]]))
+        return out
+
+    def encode(self, text: str, parse_special: bool = False, plain=(), add_special: bool = False) -> list[int]:
+        return self._encode_frags(text, parse_special, plain, None, add_special)
+
+    def encode_marked(self, text: str, parse_special: bool = False, plain=()) -> tuple[list[int], list[tuple[int, int]]]:
+        marks: list[tuple[int, int]] = []
+        return self._encode_frags(text, parse_special, plain, marks, False), marks
+
+    # -------------------------------------------------------------- decoding
+    def token_bytes(self, i: int) -> bytes:
+        cache = self._bytes_cache
+        b = cache.get(i)
+        if b is None:
+            if i < 0 or i >= len(self.tokens):
+                raise IndexError("token id %d is outside the vocabulary (%d)" % (i, len(self.tokens)))
+            tok = self.tokens[i]
+            ty = self._types[i] if i < len(self._types) else 1
+            if ty == 6 and len(tok) == 6 and tok.startswith("<0x") and tok.endswith(">"):
+                b = bytes([int(tok[3:5], 16)])                 # a byte token
+            elif ty in (3, 4):
+                b = tok.encode("utf-8")                        # a special token is its literal text
+            else:
+                b = tok.replace(self.SPACE, " ").encode("utf-8")
+            cache[i] = b
+        return b
+
+    def decode(self, ids: list[int], errors: str = "replace") -> str:
+        return b"".join(self.token_bytes(i) for i in ids).decode("utf-8", errors=errors)
+
+
 # ------------------------------------------------------------------ incremental prompts (#567)
 def common_prefix_len(a: str, b: str) -> int:
     """Length of the longest common prefix, by slices (C speed) rather than a loop over characters."""
@@ -525,27 +732,40 @@ class PromptEncoder:
             self.entries = [e for e in self.entries if e[2] != ids]
 
 
+def from_pack(tokens: list[str], merges: list[str], token_types: list[int] | None, cfg: dict):
+    """The tokenizer of a pack's tokenizer/ files (vocab.json, merges.txt, token_type.json read into lists; `cfg` the
+    tokenizer.json): the byte-level one for model `gpt2` (the default), Gemma 4's for `gemma4`."""
+    if cfg.get("model") == "gemma4" or cfg.get("pre") == "gemma4":
+        return Gemma4Tokenizer(tokens, merges, token_types, cfg.get("special_ids") or None, bool(cfg.get("add_bos_token")))
+    return Tokenizer(tokens, merges, token_types, cfg.get("pre") or "qwen35", cfg.get("special_ids") or None)
+
+
 # ------------------------------------------------------------------ the pack's tokenizer/ directory
 def extract(gguf_path, out_dir) -> dict:
     """Write the tokenizer into `<out_dir>/tokenizer/` so the engine never opens the weight shards for it."""
     out = pathlib.Path(out_dir) / "tokenizer"
     out.mkdir(parents=True, exist_ok=True)
     tk = Tokenizer.from_gguf(gguf_path)
-    cfg = {
-        "model": "gpt2",
-        "pre": tk.pre,
-        "vocab_size": len(tk.tokens),
-        "n_merges": len(tk.ranks),
-        "special_ids": tk.special_ids,
-        "add_bos_token": False,
-        # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
-        # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
-    }
+    if isinstance(tk, Gemma4Tokenizer):
+        cfg = {"model": "gemma4", "pre": "gemma4", "vocab_size": len(tk.tokens), "n_merges": len(tk.ranks),
+               "special_ids": tk.special_ids, "add_bos_token": tk.add_bos}
+    else:
+        cfg = {
+            "model": "gpt2",
+            "pre": tk.pre,
+            "vocab_size": len(tk.tokens),
+            "n_merges": len(tk.ranks),
+            "special_ids": tk.special_ids,
+            "add_bos_token": False,
+            # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
+            # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
+            "pre_pattern": QWEN35_PATTERN,
+            "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
                                               sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8")
+
     (out / "token_type.json").write_text(json.dumps(tk.token_types), encoding="utf-8")
     (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
     # the model's own chat template: fine-tunes change it (Swift 1.5 differs from Qwen3.8-Flash-Next's)
