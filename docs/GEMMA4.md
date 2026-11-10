@@ -95,6 +95,15 @@ Checked, without a GPU (`tools/gemma4/README.md` says how to repeat each):
 Not checked: any run on a GPU (there was none), so no speed figure and no check of the arithmetic on a real card. `--check` is there for that. Nothing was run
 with the real 26B weights (the headers of the real files were read; the arithmetic was checked on a model of the same layout).
 
+## The conversation cache
+
+A request that begins with the tokens the cache holds reads only what follows. It may also step back: the next prompt of a chat re-renders the previous
+answer (the template drops its empty thinking channel), so the cache must return to the first token that differs. A global layer keeps every cell, a
+sliding-window layer a ring of `window + chunk + slack` cells (1024 + 512 + 1024 by default), so the way back is at most `chunk + slack` = 1536 tokens: beyond
+that the whole prompt is read again (about 300 to 500 tokens a second on a card of that class, a guess: not measured). An agent whose answers or tool results are
+longer than that should raise `--swa-slack` with the VRAM it has left: 25 sliding-window layers at 8 KB a cell make 0.2 GiB per 1024 cells (`--swa-slack 4096`:
++0.6 GiB).
+
 ## Limits
 
 One conversation at a time (no batch, no slots), K/V as f16 (no q8 / q4 cache), no CUDA graphs, no vision or audio, no draft model, no CPU experts. The
