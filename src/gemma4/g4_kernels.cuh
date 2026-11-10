@@ -42,6 +42,31 @@ G4_DEV float gelu(float x) {                      // gelu_pytorch_tanh, as ggml_
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------
+/// One tile of the row's sum: the units of columns [k0, k0 + kMmTile) against the staged activations, UF units at a time so that the loads of the
+/// weights are independent of each other (a lane waits for memory once per UF units, not once per unit).  A unit past the end of the row is read as
+/// the last one and multiplied by the zeros the staging left in xs: the same sum, in the same order.
+template <int T, int NT>
+__device__ __forceinline__ void mm_tile(const uint8_t* rp, int k0, int n_in, float (*xs)[kMmTile], int lane, float* acc) {
+    constexpr int UF = NT >= 8 ? 4 : 8;
+    const long long last = n_in / 32 - 1;
+    const long long u0 = k0 / 32;
+    for (int uu = 0; uu < kMmTile / 32; uu += UF) {
+        if (u0 + uu > last) break;
+        float wv[UF];
+#pragma unroll
+        for (int k = 0; k < UF; ++k) {
+            const long long u = u0 + uu + k;
+            wv[k] = g4::dequant_elem<T>(rp, u < last ? u : last, lane);
+        }
+#pragma unroll
+        for (int k = 0; k < UF; ++k) {
+#pragma unroll
+            for (int t = 0; t < NT; ++t) acc[t] += wv[k] * xs[t][(uu + k) * 32 + lane];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------
 // y[t][y_off + row] = row of W . x[t], for the tokens t0 .. t0 + NT of a tile (blockIdx.y), W of type T.  A warp takes a row, its 32 lanes
 // the 32 values of a block, so the weights and the activations are read coalesced; the activations are staged through shared memory (they
 // are shared by the 8 rows of the block); the sum over the row is made once, at the end.
@@ -66,14 +91,7 @@ k_mm(const uint8_t* __restrict__ w, long long row_bytes, int n_in, int n_out, co
             xs[t][c] = (t < nt && c < cols) ? x[(size_t) (t0 + t) * (size_t) ldx + (size_t) (k0 + c)] : 0.f;
         }
         __syncthreads();
-        if (valid) {
-            const long long u0 = k0 / 32;
-            for (int uu = 0; uu < cols / 32; ++uu) {
-                const float wv = g4::dequant_elem<T>(rp, u0 + uu, lane);
-#pragma unroll
-                for (int t = 0; t < NT; ++t) acc[t] += wv * xs[t][uu * 32 + lane];
-            }
-        }
+        if (valid) mm_tile<T, NT>(rp, k0, n_in, xs, lane, acc);
         __syncthreads();
     }
 #pragma unroll
@@ -107,14 +125,7 @@ k_mm_exp(const uint8_t* __restrict__ w, long long expert_bytes, long long row_by
             xs[t][c] = (t < nt && c < cols) ? x[(size_t) ent_in[first + t] * (size_t) ldx + (size_t) (k0 + c)] : 0.f;
         }
         __syncthreads();
-        if (valid) {
-            const long long u0 = k0 / 32;
-            for (int uu = 0; uu < cols / 32; ++uu) {
-                const float wv = g4::dequant_elem<T>(rp, u0 + uu, lane);
-#pragma unroll
-                for (int t = 0; t < NT; ++t) acc[t] += wv * xs[t][uu * 32 + lane];
-            }
-        }
+        if (valid) mm_tile<T, NT>(rp, k0, n_in, xs, lane, acc);
         __syncthreads();
     }
 #pragma unroll
