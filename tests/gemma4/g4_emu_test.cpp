@@ -136,6 +136,12 @@ int main(int argc, char** argv) {
             worst = std::max(worst, rel_rms(lg, row(t)));
         }
         EXPECT(worst < 2e-4, "3 layers' experts in host memory, 4 staging slots, prompt then 3 single tokens: worst %.2e", worst);
+        e->profile(true);                                    // the timed pass changes nothing in the result, and reports the copies
+        e->process(&ids[(size_t) n - 1], 1, noop, &done);
+        const std::string rep = e->profile_report();
+        e->logits(lg);
+        EXPECT(rep.find("expert copies") != std::string::npos && rep.find(std::to_string(3 * m.hp.n_used) + " copies") != std::string::npos && rep.find("1 steps") != std::string::npos,
+               "profile: one step, 3 streaming layers x %d experts = %d copies", m.hp.n_used, 3 * m.hp.n_used);
     }
     {   // 8. every layer streamed, one chunk, the whole prompt at once (the largest batches)
         auto e = make(32, 1024, {0}, 1000, 32);

@@ -36,6 +36,9 @@ public:
     bool can_keep(int64_t p) const;
     /// the number of layers whose experts stay in host memory (valid after init())
     int streamed_layers() const;
+    /// decode profile: while on, every phase of a step ends with a sync of the card's stream (slower), and the time of each is added up
+    void profile(bool on);
+    std::string profile_report();
     /// Append n tokens; the logits of the last one are made at the end.  on_piece(done) after each chunk (false: stop reading).
     bool process(const int32_t* ids, int64_t n, const std::function<bool(int64_t)>& on_piece, int64_t* done);
     void logits(std::vector<float>& out);

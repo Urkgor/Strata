@@ -57,7 +57,8 @@ back, 1024), `--vram-reserve-mib N` (left free on each device, 700), `--host-exp
 
 Checks you can run on your machine: `strata-gemma4 --model F.gguf --tokens 2,9259,236764 --check` runs the prompt on the GPU and on the CPU reference and says
 how far apart the logits are (the engine's own gate: a difference above 2e-3 or another best token is reported as FAILED); `--bench-pp 512` and `--bench-tg 64`
-time the prompt and the generation.
+time the prompt and the generation; `--bench-tg` then repeats 32 steps with every phase synced and prints where a token's time goes (attention, dense MLP,
+router, expert copies with their MiB and GiB/s, experts, hops between cards, head).
 
 ## Which GGUF
 

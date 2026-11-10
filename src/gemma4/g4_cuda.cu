@@ -136,6 +136,22 @@ struct GpuEngine::Impl {
     std::vector<float> debug_h;                // test hook: hidden after each layer, last token
     bool debug = false;
     std::vector<char> is_streamed;             // layer -> its experts stay on the host
+    // profile (--bench-tg, second pass): wall time per phase of a decode step, each phase ended by a sync of the card's stream
+    struct Prof {
+        double attn = 0, dense = 0, route = 0, copy = 0, expert = 0, tail = 0, hop = 0, head = 0;      // ms
+        double copy_mib = 0;
+        long long copies = 0, steps = 0;
+    } prof;
+    bool profile = false;
+    double prof_t = 0;
+    static double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+    void tick(Dev& D, double Prof::*acc) {
+        if (!profile) return;
+        CK(cudaStreamSynchronize(D.st));
+        const double t = now_ms();
+        if (acc) prof.*acc += t - prof_t;
+        prof_t = t;
+    }
     std::vector<std::pair<void*, bool>> host_allocs;     // (pointer, pinned)
     size_t host_bytes = 0;
     int stage_slots = 32;
@@ -588,6 +604,7 @@ struct GpuEngine::Impl {
         G4_LAUNCH(g4k::k_router, dim3(T), b1, D.st, D.h1, dl.rscale, dl.router, E, hp.n_expert, nu, hp.eps, D.topk_idx, D.topk_w);
         G4_LAUNCH(g4k::k_rms, dim3(T), b1, D.st, D.h1, E, dl.pre2, D.ye, E, E, hp.eps);
         const int rows = T * nu;
+        tick(D, &Prof::route);
         if (dl.streamed) {
             experts_streamed(D, dl, T);
         } else if (T == 1) {                       // one token: the router's own choice is the group table, no round trip to the host
@@ -612,6 +629,7 @@ struct GpuEngine::Impl {
             exp_ffn(D, dl.gate_up, dl.gate_e, dl.up_e, dl.down_e, (int) gex.size(), false, D.grp_expert, D.grp_first, D.grp_n, D.ent_tok, D.ent_row, rows, nullptr);
         }
         G4_LAUNCH(g4k::k_expert_sum, dim3((unsigned) ((E + 127) / 128), (unsigned) T), b1, D.st, D.ed, D.topk_idx, D.topk_w, dl.dscale, nu, E, D.moe);
+        tick(D, &Prof::expert);
     }
 
     void upload_groups(Dev& D, const std::vector<int>& gex, const std::vector<int>& gfi, const std::vector<int>& gnn, const std::vector<int>& ent_t,
@@ -633,6 +651,7 @@ struct GpuEngine::Impl {
         const bool fused = dl.gate_up.type >= 0;
         const DevMat& A = fused ? dl.gate_up : dl.gate_e;
         auto copy_in = [&](int slot, int e) {
+            if (profile) { prof.copy_mib += (double) (A.expert_bytes + (fused ? 0 : dl.up_e.expert_bytes) + dl.down_e.expert_bytes) / (1 << 20); ++prof.copies; }
             CK(cudaMemcpyAsync(D.stgA + (size_t) slot * A.expert_bytes, (fused ? dl.h_gu : dl.h_ga) + (size_t) e * A.expert_bytes, A.expert_bytes, cudaMemcpyHostToDevice, D.st));
             if (!fused) CK(cudaMemcpyAsync(D.stgB + (size_t) slot * dl.up_e.expert_bytes, dl.h_up + (size_t) e * dl.up_e.expert_bytes, dl.up_e.expert_bytes, cudaMemcpyHostToDevice, D.st));
             CK(cudaMemcpyAsync(D.stgC + (size_t) slot * dl.down_e.expert_bytes, dl.h_dn + (size_t) e * dl.down_e.expert_bytes, dl.down_e.expert_bytes, cudaMemcpyHostToDevice, D.st));
@@ -642,6 +661,7 @@ struct GpuEngine::Impl {
                      vdn = view(dl.down_e, D.stgC);
         if (T == 1) {
             for (int k = 0; k < nu; ++k) copy_in(k, idx[(size_t) k]);
+            tick(D, &Prof::copy);
             exp_ffn(D, vgu, vga, vup, vdn, nu, true, D.dec_slots, D.dec_first, D.dec_n, D.dec_tok, D.dec_row, rows, nullptr);
             return;
         }
@@ -676,6 +696,7 @@ struct GpuEngine::Impl {
         const int E = hp.n_embd, hd = hp.head_dim(il), nkv = hp.kv_heads(il), q_dim = hp.q_dim(il), kv_dim = hp.kv_dim(il);
         const dim3 b1(g4k::kThreads);
         const bool swa = hp.swa[(size_t) il] != 0;
+        tick(D, nullptr);
         G4_LAUNCH(g4k::k_rms, dim3(T), b1, D.st, D.h, E, dl.attn_norm, D.xn, E, E, hp.eps);
         mm(D, dl.wq, D.xn, E, T, D.q, q_dim);
         mm(D, dl.wk, D.xn, E, T, D.kraw, kv_dim);
@@ -686,14 +707,17 @@ struct GpuEngine::Impl {
         attn(D, il, T, pos0);
         mm(D, dl.wo, D.ao, q_dim, T, D.proj, E);
         G4_LAUNCH(g4k::k_rms_add, dim3(T), b1, D.st, D.proj, dl.post_attn_norm, D.h, D.h1, E, hp.eps);
+        tick(D, &Prof::attn);
         G4_LAUNCH(g4k::k_rms, dim3(T), b1, D.st, D.h1, E, dl.ffn_norm, D.xn, E, E, hp.eps);
         mm(D, dl.gate, D.xn, E, T, D.g, hp.n_ff);
         mm(D, dl.up, D.xn, E, T, D.u, hp.n_ff);
         G4_LAUNCH(g4k::k_geglu, dim3((unsigned) ((hp.n_ff + 127) / 128), (unsigned) T), b1, D.st, D.g, hp.n_ff, D.u, hp.n_ff, D.act, hp.n_ff, hp.n_ff, (const int*) nullptr);
         mm(D, dl.down, D.act, hp.n_ff, T, D.mlp, E);
+        tick(D, &Prof::dense);
         if (w.has_moe) experts(D, dl, T);
         G4_LAUNCH(g4k::k_ffn_combine, dim3(T), b1, D.st, (const float*) D.mlp, w.has_moe ? (const float*) D.moe : (const float*) nullptr, (const float*) D.h1, dl.post1,
                   dl.post2, dl.post_ffw_norm, dl.out_scale, D.h, E, hp.eps);
+        tick(D, &Prof::tail);
     }
 
     // ------------------------------------------------------------------------------------------------------------------------ a chunk
@@ -711,6 +735,7 @@ struct GpuEngine::Impl {
         int cur = dev_of[0];
         CK(cudaSetDevice(devs[(size_t) cur].id));
         CK(cudaMemcpy(devs[(size_t) cur].h, hbuf.data(), (size_t) T * E * 4, cudaMemcpyHostToDevice));
+        tick(devs[(size_t) cur], nullptr);
         if (debug) { debug_h.assign((size_t) (hp.n_layer + 1) * E, 0.f); std::memcpy(debug_h.data(), hbuf.data() + (size_t) (T - 1) * E, (size_t) E * 4); }
         for (int il = 0; il < hp.n_layer; ++il) {
             const int d = dev_of[(size_t) il];
@@ -721,6 +746,7 @@ struct GpuEngine::Impl {
                 CK(cudaSetDevice(devs[(size_t) d].id));
                 CK(cudaMemcpy(devs[(size_t) d].h, hbuf.data(), (size_t) T * E * 4, cudaMemcpyHostToDevice));
                 cur = d;
+                tick(devs[(size_t) cur], &Prof::hop);
             }
             CK(cudaSetDevice(devs[(size_t) cur].id));
             layer(devs[(size_t) cur], il, T, (int) pos);
@@ -742,12 +768,14 @@ struct GpuEngine::Impl {
             G4_LAUNCH(g4k::k_rms, dim3(1), dim3(g4k::kThreads), H.st, (const float*) (H.h + (size_t) (T - 1) * E), E, (const float*) H.output_norm, H.xn, E, E, hp.eps);
             mm(H, H.head, H.xn, E, 1, H.logits, hp.n_vocab);
             if (hp.softcap > 0.f) G4_LAUNCH(g4k::k_softcap, dim3((unsigned) ((hp.n_vocab + 127) / 128)), dim3(g4k::kThreads), H.st, H.logits, hp.n_vocab, hp.softcap);
+            tick(H, &Prof::head);
             logits_ready = true;
         } else {
             logits_ready = false;
         }
         for (Dev& D : devs) { CK(cudaSetDevice(D.id)); CK(cudaStreamSynchronize(D.st)); }
         pos += T;
+        ++prof.steps;
     }
 };
 
@@ -760,6 +788,18 @@ int GpuEngine::n_vocab() const { return p_->hp.n_vocab; }
 int64_t GpuEngine::pos() const { return p_->pos; }
 void GpuEngine::reset() { p_->pos = 0; p_->logits_ready = false; }
 void GpuEngine::truncate(int64_t q) { p_->pos = std::min(p_->pos, std::max<int64_t>(0, q)); p_->logits_ready = false; }
+void GpuEngine::profile(bool on) { p_->profile = on; p_->prof = Impl::Prof(); }
+std::string GpuEngine::profile_report() {
+    const Impl::Prof& q = p_->prof;
+    const double n = (double) std::max<long long>(1, q.steps), total = q.attn + q.dense + q.route + q.copy + q.expert + q.tail + q.hop + q.head;
+    char buf[900];
+    std::snprintf(buf, sizeof buf,
+                  "profile, ms per token over %lld steps (every phase synced: slower than the run above): attention %.2f, dense MLP %.2f, router %.2f, expert copies %.2f "
+                  "(%.1f MiB a token in %.0f copies, %.1f GiB/s), experts %.2f, rest of the layer %.2f, hops between cards %.2f, head %.2f: total %.2f",
+                  q.steps, q.attn / n, q.dense / n, q.route / n, q.copy / n, q.copy_mib / n, (double) q.copies / n, q.copy > 0 ? q.copy_mib / 1024.0 / (q.copy / 1000.0) : 0.0,
+                  q.expert / n, q.tail / n, q.hop / n, q.head / n, total / n);
+    return buf;
+}
 int GpuEngine::streamed_layers() const { return (int) std::count(p_->is_streamed.begin(), p_->is_streamed.end(), (char) 1); }
 bool GpuEngine::can_keep(int64_t q) const {
     // Going back to q: the next token (position q) needs the keys of the sliding-window layers from q - window + 1 on.  A ring of `ring` cells
@@ -875,6 +915,16 @@ int run(const g4::Model& m, int ctx, bool serve, const std::string& tokens, int 
             }
             const double ms = ms_now() - t0;
             std::printf("generation: %d tokens in %.0f ms: %.1f tok/s\n", n, ms, 1000.0 * n / ms);
+            eng.reset();                                     // the same again with every phase timed
+            eng.process(ids.data(), 16, noop, &done);
+            eng.profile(true);
+            for (int k = 0; k < std::min(bench_tg, 32) && eng.pos() < ctx; ++k) {
+                const int32_t nx = eng.greedy();
+                int64_t d = 0;
+                eng.process(&nx, 1, noop, &d);
+            }
+            std::printf("%s\n", eng.profile_report().c_str());
+            eng.profile(false);
         }
         return 0;
     }

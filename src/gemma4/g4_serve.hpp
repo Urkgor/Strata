@@ -38,10 +38,18 @@ inline int sample_token(std::vector<float>& lg, const Sampling& s, const std::ve
     strata::qwen35::apply_penalties(lg, s, hist);
     if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
     const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
-    std::vector<int> idx(lg.size());
-    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
-    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[(size_t) a] > lg[(size_t) b]; });
-    idx.resize((size_t) kk);
+    // the kk largest logits, best first: one pass over the vocabulary with a min-heap of kk (a partial sort of 262,144 indices costs several ms a token)
+    std::vector<std::pair<float, int>> top;
+    top.reserve((size_t) kk);
+    auto better = [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); };
+    for (size_t i = 0; i < lg.size(); ++i) {
+        const std::pair<float, int> c{lg[i], (int) i};
+        if ((int) top.size() < kk) { top.push_back(c); std::push_heap(top.begin(), top.end(), better); }
+        else if (better(c, top.front())) { std::pop_heap(top.begin(), top.end(), better); top.back() = c; std::push_heap(top.begin(), top.end(), better); }
+    }
+    std::sort_heap(top.begin(), top.end(), better);
+    std::vector<int> idx(top.size());
+    for (size_t i = 0; i < top.size(); ++i) idx[i] = top[i].second;
     std::vector<double> p(idx.size());
     const double mx = lg[(size_t) idx[0]];
     double sum = 0;
