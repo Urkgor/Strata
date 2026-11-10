@@ -224,6 +224,29 @@ tools/build_rhel7.sh --arch "61;75" --cuda-home /usr/local/cuda-12.4 --ggml ~/ll
 ```
 Résultat : `build-rhel7/strata-q36` et `libstrata_kq.so`, puis `"exe": ".../build-rhel7/strata-q36"` dans `strata-<modèle>.json`. Mesuré dans le conteneur : 622 s pour `61;75` avec 3 jobs (`--jobs N` pour changer).
 
+## Gemma 4 26B-A4B (branche `feature/gemma4`)
+
+La branche `feature/gemma4` (dérivée de `feature/q36-only`) ajoute `strata-gemma4`, un moteur à part pour ce modèle (`src/gemma4/`, `docs/GEMMA4.md`). Il se compile **sans llama.cpp** :
+
+```sh
+git clone -b feature/gemma4 https://github.com/Urkgor/Strata.git ~/Strata-g4 && cd ~/Strata-g4
+tools/build_rhel7.sh --gemma4 --arch "61;75" --cuda-home /usr/local/cuda-12.4        # -> build-rhel7/strata-gemma4 (≈ 2 min)
+G=/data/gemma-4-26B-A4B-it-UD-IQ4_XS.gguf ; P=$HOME/strata-data/packs/gemma4
+python3 tools/strata_tokenizer.py --gguf $G --out $P                                  # tokenizer + modèle de conversation
+build-rhel7/strata-gemma4 --model $G --tokens 2,9259,236764 --check --gpu 0,1         # contrôle sur vos cartes (voir plus bas)
+cat > $HOME/strata-gemma4.json <<EOF
+{ "exe": "$HOME/Strata-g4/build-rhel7/strata-gemma4",
+  "args": ["--model", "$G", "--max-context", "32768"],
+  "tokenizer": "$P/tokenizer", "arch": "gemma4", "lib_dirs": ["/usr/local/cuda-12.4/lib64"], "port": 8080 }
+EOF
+python3 serve/server.py --engine strata --config $HOME/strata-gemma4.json --port 8080
+```
+
+- **Quel fichier** : le moteur lit tous les GGUF Unsloth de ce modèle (Q2_K à Q8_0, IQ2/IQ3/IQ4, MXFP4). Avec une 1080 Ti (11 Go) + une T1000 (8 Go), `UD-IQ4_XS` (13,6 Go) tient avec 32K de contexte ; `UD-Q4_K_M` (16,9 Go) juste (contexte 8K et `--vram-reserve-mib 300` dans `args`). Les couches se répartissent sur les cartes dans l'ordre (`--gpu 0,1`), la tête de sortie (0,7 Gio) sur la dernière ; **rien n'est déchargé sur le CPU** : si ça ne tient pas, le moteur dit combien de VRAM manque.
+- **Le raisonnement** est désactivé par défaut (comme le modèle de conversation de Gemma 4) ; `"reasoning_effort": "high"` (ou `chat_template_kwargs.enable_thinking: true`) l'active, et il sort dans `reasoning_content`. Les appels d'outils (`<|tool_call>call:nom{clé:valeur}`) sont traduits vers les `tool_calls` OpenAI / Anthropic, y compris en flux.
+- **Ce qui est vérifié, ce qui ne l'est pas** : aucun GPU n'était disponible. Vérifiés : le tokenizer contre llama.cpp (0 écart sur le vrai vocabulaire), les 21 quantifications contre ggml, la référence CPU contre llama.cpp (sur un petit modèle de même architecture), les noyaux CUDA exécutés sur une émulation CPU contre cette référence (écart 2e-5), la compilation nvcc 12.4 pour sm_61 et sm_75, 32 tests serveur. **Pas vérifié : l'exécution sur une carte.** Lancez d'abord `--check` : il passe le même prompt sur le GPU et sur la référence CPU et affiche l'écart des logits (OK en dessous de 2e-3), puis `--bench-pp 512 --bench-tg 64` pour les débits. Envoyez-moi ces sorties si quelque chose diffère.
+- Limites : une conversation à la fois, K/V en f16, pas d'images ni d'audio, pas de brouillons (MTP).
+
 ## Un modèle qui boucle pendant son « thinking »
 
 Le serveur surveille la réflexion : tous les 256 tokens il regarde si les mêmes passages reviennent, si une même phrase est réécrite 4 fois, ou si le modèle dit lui-même 3 fois qu'il « tourne en rond » (une boucle reformulée à chaque tour échappe au simple comptage de passages). Pour Qwen3.6 le garde-fou est **actif par défaut** (`"reasoning_loop_recovery": "wrap"`) : la réflexion est fermée (une courte phrase « je tourne en rond » puis `</think>`) et le modèle répond, sans relire le prompt. Le journal Strata dit alors « the thinking repeated the same passages … closing it », et au démarrage « reasoning loop guard: wrap » (s'il dit `off`, mettez `"arch": "qwen35moe"` ou `"reasoning_loop_recovery": "wrap"` dans `strata-<modèle>.json`). Le `"stop"` termine la réponse à la place, `false` coupe le garde-fou. Une boucle sur un seul token est déjà coupée par `repeat_stop_tokens`. Pour borner la réflexion dès le départ : `reasoning_budget_tokens`.
