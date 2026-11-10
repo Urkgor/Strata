@@ -80,6 +80,9 @@ struct DevLayer {
     int ring = 0;
     float out_scale = 1.f;
     int dev = 0;
+    // streamed experts: the experts stay in host memory (pinned) and the ones a token needs are copied to the card's staging slots
+    bool streamed = false;
+    uint8_t *h_gu = nullptr, *h_ga = nullptr, *h_up = nullptr, *h_dn = nullptr;
 };
 
 struct Dev {
@@ -92,6 +95,11 @@ struct Dev {
     int *topk_idx = nullptr, *grp_expert = nullptr, *grp_first = nullptr, *grp_n = nullptr, *ent_tok = nullptr, *ent_row = nullptr;
     int *dec_first = nullptr, *dec_n = nullptr, *dec_tok = nullptr, *dec_row = nullptr;     // the decode step's constant group tables
     float* rope_freqs = nullptr;
+    // staging slots for streamed experts (a device that holds a layer whose experts stay on the host): slot k holds one expert's gate+up (A, or gate in A
+    // and up in B) and its down (C)
+    uint8_t *stgA = nullptr, *stgB = nullptr, *stgC = nullptr;
+    int stg_slots = 0;
+    int* dec_slots = nullptr;                                                                // 0 .. n_used - 1
     // the head (the last device): the tied output matrix, the logits, the arg-max partials
     DevMat head;
     float *logits = nullptr, *pv = nullptr;
@@ -127,8 +135,15 @@ struct GpuEngine::Impl {
     std::vector<float> hbuf;                   // host staging for the embeddings and the hops between devices
     std::vector<float> debug_h;                // test hook: hidden after each layer, last token
     bool debug = false;
+    std::vector<char> is_streamed;             // layer -> its experts stay on the host
+    std::vector<std::pair<void*, bool>> host_allocs;     // (pointer, pinned)
+    size_t host_bytes = 0;
+    int stage_slots = 32;
 
-    Impl(const g4::Model& mm, int c, GpuOptions o) : m(mm), hp(mm.hp), ctx(c), opt(std::move(o)) { chunk = std::max(1, opt.chunk); }
+    Impl(const g4::Model& mm, int c, GpuOptions o) : m(mm), hp(mm.hp), ctx(c), opt(std::move(o)) {
+        chunk = std::max(1, opt.chunk);
+        stage_slots = std::max(1, std::min(hp.n_expert > 0 ? hp.n_expert : 1, std::max(opt.stage_slots, 1)));
+    }
 
     ~Impl() {
         for (Dev& d : devs) {
@@ -136,16 +151,33 @@ struct GpuEngine::Impl {
             for (void* p : d.allocs) cudaFree(p);
             if (d.st) cudaStreamDestroy(d.st);
         }
+        for (auto& h : host_allocs) {
+            if (h.second) cudaFreeHost(h.first);
+            else std::free(h.first);
+        }
     }
 
     // ------------------------------------------------------------------------------------------------------------------------ placement
     size_t mat_bytes(const g4::Mat& a) const { return a ? a.bytes : 0; }
-    size_t layer_weight_bytes(int il) const {
+    /// the bytes of a layer's experts, and of everything else it holds (the other matrices and the float vectors)
+    size_t layer_expert_bytes(int il) const {
         const g4::LayerW& w = m.L[(size_t) il];
-        size_t b = mat_bytes(w.wq) + mat_bytes(w.wk) + mat_bytes(w.wv) + mat_bytes(w.wo) + mat_bytes(w.ffn_gate) + mat_bytes(w.ffn_up) +
-                   mat_bytes(w.ffn_down) + mat_bytes(w.gate_up_exps) + mat_bytes(w.gate_exps) + mat_bytes(w.up_exps) + mat_bytes(w.down_exps);
+        return mat_bytes(w.gate_up_exps) + mat_bytes(w.gate_exps) + mat_bytes(w.up_exps) + mat_bytes(w.down_exps);
+    }
+    size_t layer_core_bytes(int il) const {
+        const g4::LayerW& w = m.L[(size_t) il];
+        size_t b = mat_bytes(w.wq) + mat_bytes(w.wk) + mat_bytes(w.wv) + mat_bytes(w.wo) + mat_bytes(w.ffn_gate) + mat_bytes(w.ffn_up) + mat_bytes(w.ffn_down);
         b += 4 * ((size_t) 4 * hp.n_embd + 2 * hp.head_dim(il) + (w.has_moe ? ((size_t) 4 * hp.n_embd + hp.n_expert + (size_t) hp.n_expert * hp.n_embd) : 0));
         return b;
+    }
+    size_t layer_weight_bytes(int il) const { return layer_core_bytes(il) + layer_expert_bytes(il); }
+    /// one expert's bytes (gate, up, down) in a layer
+    size_t per_expert_bytes(int il) const { return hp.n_expert > 0 ? layer_expert_bytes(il) / (size_t) hp.n_expert : 0; }
+    /// the staging slots of a device that streams experts: stage_slots of the largest layer's expert
+    size_t stage_bytes() const {
+        size_t b = 0;
+        for (int il = 0; il < hp.n_layer; ++il) b = std::max(b, per_expert_bytes(il));
+        return b * (size_t) stage_slots + (1 << 20);
     }
     int ring_cells(int il) const {
         if (!hp.swa[(size_t) il]) return ctx;
@@ -190,40 +222,67 @@ struct GpuEngine::Impl {
             CK(cudaMemGetInfo(&f, &t));
             budget[i] = (long long) f - ((long long) opt.reserve_mib << 20) - (long long) activation_bytes();
         }
-        // The layers fill the devices in order; the output head (the tied embedding, 0.8 GiB for the 26B) goes on the last device that holds a
-        // layer, which must have room for it: when it has not, its share is reserved there and the layers are placed again (they move on).
+        // The layers fill the devices in order, each with its experts (a layer that does not fit goes to the next device).  On the last device, a layer
+        // whose experts do not fit keeps them in host memory (streamed to the card per token) and takes only the rest of it.  The output head (the tied
+        // embedding) goes on the last device that holds a layer, and a device that streams needs staging slots: when one has not the room, its share is
+        // reserved there and the layers are placed again.
         dev_of.assign((size_t) hp.n_layer, 0);
+        is_streamed.assign((size_t) hp.n_layer, 0);
         const std::vector<long long> free_budget = budget;
-        int reserve_on = -1;
-        for (size_t attempt = 0; attempt <= devs.size(); ++attempt) {
-            budget = free_budget;
-            if (reserve_on >= 0) budget[(size_t) reserve_on] -= (long long) head_bytes();
+        std::vector<long long> reserve(devs.size(), 0);
+        std::vector<char> head_reserved(devs.size(), 0), stage_reserved(devs.size(), 0);
+        const int force_host = hp.n_layer - std::min(hp.n_layer, std::max(0, opt.host_experts));
+        bool done = false;
+        for (size_t attempt = 0; attempt < 2 * devs.size() + 3 && !done; ++attempt) {
+            for (size_t i = 0; i < devs.size(); ++i) budget[i] = free_budget[i] - reserve[i];
             size_t cur = 0;
             bool placed = true;
+            std::vector<long long> rest((size_t) hp.n_layer + 1, 0);       // what the layers from il on need without their experts
+            for (int il = hp.n_layer - 1; il >= 0; --il) rest[(size_t) il] = rest[(size_t) il + 1] + (long long) (layer_core_bytes(il) + layer_kv_bytes(il));
             for (int il = 0; il < hp.n_layer && placed; ++il) {
-                const long long need = (long long) (layer_weight_bytes(il) + layer_kv_bytes(il));
-                while (cur < devs.size() && budget[cur] < need) ++cur;
-                if (cur >= devs.size()) { placed = false; break; }
-                budget[cur] -= need;
+                const bool moe = m.L[(size_t) il].has_moe;
+                const bool want_host = moe && il >= force_host;
+                const long long core = (long long) (layer_core_bytes(il) + layer_kv_bytes(il));
+                const long long full = core + (long long) layer_expert_bytes(il);
+                while (cur + 1 < devs.size() && budget[cur] < (want_host ? core : full)) ++cur;
+                // on the last device the experts of a layer are taken only if the layers after it still have the room for what they cannot do without
+                const long long keep = cur + 1 == devs.size() ? rest[(size_t) il + 1] : 0;
+                if (!want_host && budget[cur] - full >= keep) {
+                    budget[cur] -= full;
+                } else if (moe && budget[cur] >= core) {
+                    budget[cur] -= core;
+                    is_streamed[(size_t) il] = 1;
+                } else {
+                    placed = false;
+                    break;
+                }
                 dev_of[(size_t) il] = (int) cur;
             }
             if (!placed) {
-                size_t total = head_bytes(), kv = 0;
-                for (int k = 0; k < hp.n_layer; ++k) { total += layer_weight_bytes(k) + layer_kv_bytes(k); kv += layer_kv_bytes(k); }
+                size_t core = head_bytes(), kv = 0;
+                for (int k = 0; k < hp.n_layer; ++k) { core += layer_core_bytes(k) + layer_kv_bytes(k); kv += layer_kv_bytes(k); }
+                size_t experts = 0;
+                for (int k = 0; k < hp.n_layer; ++k) experts += layer_expert_bytes(k);
                 long long have = 0;
                 for (size_t i = 0; i < devs.size(); ++i) have += std::max<long long>(0, free_budget[i]);
-                char buf[420];
-                std::snprintf(buf, sizeof buf, "the model needs %.2f GiB of VRAM (weights %.2f GiB, K / V at a context of %d %.2f GiB, the output head %.2f GiB) and the %zu device(s) "
-                              "have %.2f GiB free after their reserve and buffers: use a smaller quantization, a shorter --max-context, --swa-slack 0, or another card",
-                              (double) total / (1 << 30), (double) (total - head_bytes() - kv) / (1 << 30), ctx, (double) kv / (1 << 30), (double) head_bytes() / (1 << 30),
-                              devs.size(), (double) have / (1 << 30));
+                char buf[520];
+                std::snprintf(buf, sizeof buf, "even with every expert in host memory the model needs %.2f GiB of VRAM (attention and dense weights + K / V at a context of %d %.2f GiB + the output "
+                              "head %.2f GiB; the experts are %.2f GiB more) and the %zu device(s) have %.2f GiB free after their reserve and buffers: use a shorter --max-context, "
+                              "--swa-slack 0, --vram-reserve-mib 300, or another card",
+                              (double) core / (1 << 30), ctx, (double) kv / (1 << 30), (double) head_bytes() / (1 << 30), (double) experts / (1 << 30), devs.size(), (double) have / (1 << 30));
                 return buf;
             }
-            const int last_used = dev_of[(size_t) hp.n_layer - 1];
-            if (reserve_on == last_used || budget[(size_t) last_used] >= (long long) head_bytes()) { head_dev = last_used; break; }
-            reserve_on = last_used;
-            head_dev = last_used;
+            bool changed = false;
+            const size_t last_used = (size_t) dev_of[(size_t) hp.n_layer - 1];
+            if (budget[last_used] < (long long) head_bytes() && !head_reserved[last_used]) { reserve[last_used] += (long long) head_bytes(); head_reserved[last_used] = 1; changed = true; }
+            for (size_t d = 0; d < devs.size(); ++d) {
+                bool streams = false;
+                for (int il = 0; il < hp.n_layer; ++il) streams |= dev_of[(size_t) il] == (int) d && is_streamed[(size_t) il];
+                if (streams && budget[d] < (long long) stage_bytes() && !stage_reserved[d]) { reserve[d] += (long long) stage_bytes(); stage_reserved[d] = 1; changed = true; }
+            }
+            if (!changed) { head_dev = (int) last_used; done = true; }
         }
+        if (!done) return "the layers cannot be placed on the devices with the room they have";
         if (hp.n_expert > kg::kMaxExperts) return "more experts than the router kernel handles (" + std::to_string(kg::kMaxExperts) + ")";
         return "";
     }
@@ -233,6 +292,36 @@ struct GpuEngine::Impl {
     };
 
     // ------------------------------------------------------------------------------------------------------------------------ upload
+    /// a matrix's description without its data (the experts that stay on the host)
+    DevMat meta_of(const g4::Mat& a) {
+        DevMat d;
+        if (!a) return d;
+        d.type = a.type;
+        d.n_in = a.n_in;
+        d.n_out = a.n_out;
+        d.n_expert = a.n_expert;
+        d.row_bytes = a.row_bytes;
+        d.expert_bytes = a.expert_bytes;
+        d.bytes = a.bytes;
+        return d;
+    }
+    /// a copy of a matrix in pinned host memory (pageable when pinning fails: slower, still right)
+    uint8_t* host_copy(const g4::Mat& a) {
+        if (!a) return nullptr;
+        void* p = nullptr;
+        bool pinned = true;
+        if (cudaHostAlloc(&p, a.bytes, cudaHostAllocPortable) != cudaSuccess) {
+            (void) cudaGetLastError();
+            p = std::malloc(a.bytes);
+            pinned = false;
+        }
+        if (!p) { std::fprintf(stderr, "strata-gemma4: no host memory for %.2f GiB of experts\n", (double) a.bytes / (1 << 30)); std::exit(1); }
+        std::memcpy(p, a.data, a.bytes);
+        host_allocs.push_back({p, pinned});
+        host_bytes += a.bytes;
+        return static_cast<uint8_t*>(p);
+    }
+
     DevMat upload(Dev& D, const g4::Mat& a) {
         DevMat d;
         if (!a) return d;
@@ -307,6 +396,24 @@ struct GpuEngine::Impl {
                 CK(cudaMemcpy(D.dec_n, one.data(), one.size() * 4, cudaMemcpyHostToDevice));
                 CK(cudaMemcpy(D.dec_tok, zero.data(), zero.size() * 4, cudaMemcpyHostToDevice));
                 CK(cudaMemcpy(D.dec_row, rows.data(), rows.size() * 4, cudaMemcpyHostToDevice));
+                D.dec_slots = D.alloc<int>((size_t) hp.n_used);
+                CK(cudaMemcpy(D.dec_slots, first.data(), first.size() * 4, cudaMemcpyHostToDevice));
+                bool streams = false;
+                size_t sa = 0, sb = 0, sc = 0;
+                for (int il = 0; il < hp.n_layer; ++il) {
+                    if (dev_of[(size_t) il] != (int) di || !is_streamed[(size_t) il]) continue;
+                    const g4::LayerW& lw = m.L[(size_t) il];
+                    streams = true;
+                    sa = std::max(sa, lw.gate_up_exps ? lw.gate_up_exps.expert_bytes : lw.gate_exps.expert_bytes);
+                    sb = std::max(sb, lw.up_exps ? lw.up_exps.expert_bytes : (size_t) 0);
+                    sc = std::max(sc, lw.down_exps.expert_bytes);
+                }
+                if (streams) {
+                    D.stg_slots = stage_slots;
+                    D.stgA = D.alloc<uint8_t>(sa * (size_t) stage_slots);
+                    if (sb) D.stgB = D.alloc<uint8_t>(sb * (size_t) stage_slots);
+                    D.stgC = D.alloc<uint8_t>(sc * (size_t) stage_slots);
+                }
             }
             if (m.rope_freqs) {
                 D.rope_freqs = D.alloc<float>((size_t) m.rope_freqs_n);
@@ -326,10 +433,22 @@ struct GpuEngine::Impl {
             dl.gate = upload(D, w.ffn_gate);
             dl.up = upload(D, w.ffn_up);
             dl.down = upload(D, w.ffn_down);
-            dl.gate_up = upload(D, w.gate_up_exps);
-            dl.gate_e = upload(D, w.gate_exps);
-            dl.up_e = upload(D, w.up_exps);
-            dl.down_e = upload(D, w.down_exps);
+            dl.streamed = is_streamed[(size_t) il] != 0;
+            if (dl.streamed) {                      // the experts stay in host memory: their description, and a pinned copy
+                dl.gate_up = meta_of(w.gate_up_exps);
+                dl.gate_e = meta_of(w.gate_exps);
+                dl.up_e = meta_of(w.up_exps);
+                dl.down_e = meta_of(w.down_exps);
+                dl.h_gu = host_copy(w.gate_up_exps);
+                dl.h_ga = host_copy(w.gate_exps);
+                dl.h_up = host_copy(w.up_exps);
+                dl.h_dn = host_copy(w.down_exps);
+            } else {
+                dl.gate_up = upload(D, w.gate_up_exps);
+                dl.gate_e = upload(D, w.gate_exps);
+                dl.up_e = upload(D, w.up_exps);
+                dl.down_e = upload(D, w.down_exps);
+            }
             // the float vectors in one allocation
             const size_t E = (size_t) hp.n_embd, hd = (size_t) hp.head_dim(il), NE = (size_t) hp.n_expert;
             size_t n = 4 * E + 2 * hd + (w.has_moe ? 4 * E + NE + NE * E : 0);
@@ -382,8 +501,21 @@ struct GpuEngine::Impl {
                              (int) i == head_dev ? " + the output head" : "", (double) devs[i].bytes / (1 << 30));
             }
             std::fprintf(stderr, "; context %d, chunk %d\n", ctx, chunk);
+            int ns = 0, first_s = -1;
+            for (int il = 0; il < hp.n_layer; ++il)
+                if (is_streamed[(size_t) il]) { ++ns; if (first_s < 0) first_s = il; }
+            if (ns)
+                std::fprintf(stderr, "strata-gemma4: the experts of %d layer(s) (%d..%d) do not fit the VRAM: they stay in host memory (%.2f GiB%s) and the ones a token needs are copied to "
+                             "the card (about %.0f MiB per layer per token); --host-experts N chooses how many layers do it\n", ns, first_s, hp.n_layer - 1,
+                             (double) host_bytes / (1 << 30), host_pinned() ? ", pinned" : ", pageable: pinning failed",
+                             (double) hp.n_used * (double) per_expert_bytes(first_s) / (1 << 20));
         }
         return "";
+    }
+
+    bool host_pinned() const {
+        for (const auto& h : host_allocs) if (!h.second) return false;
+        return true;
     }
 
     // ------------------------------------------------------------------------------------------------------------------------ launches
@@ -431,24 +563,35 @@ struct GpuEngine::Impl {
         }
     }
 
+    /// gate+up, the gated activation and down of the experts of a group table: the matrices are the layer's (resident) or views onto the staging slots
+    /// (streamed).  `rows`: the number of (token, expert) rows the activation runs over, `geglu_rows` their indices (null: 0 .. rows - 1).
+    void exp_ffn(Dev& D, const DevMat& gu, const DevMat& ga, const DevMat& upm, const DevMat& dn, int ng, bool decode, const int* ge, const int* gf, const int* gn,
+                 const int* et, const int* er, int rows, const int* geglu_rows) {
+        const int E = hp.n_embd, F = hp.n_ff_exp;
+        const dim3 b1(g4k::kThreads);
+        const dim3 gg((unsigned) ((F + 127) / 128), (unsigned) rows);
+        if (gu.type >= 0) {
+            mm_exp(D, gu, D.ye, E, ng, decode, ge, gf, gn, et, er, D.gu, 2 * F);
+        } else {
+            mm_exp(D, ga, D.ye, E, ng, decode, ge, gf, gn, et, er, D.gu, 2 * F, 0);
+            mm_exp(D, upm, D.ye, E, ng, decode, ge, gf, gn, et, er, D.gu, 2 * F, F);
+        }
+        G4_LAUNCH(g4k::k_geglu, gg, b1, D.st, D.gu, 2 * F, D.gu + F, 2 * F, D.eact, F, F, geglu_rows);
+        mm_exp(D, dn, D.eact, F, ng, decode, ge, gf, gn, er, er, D.ed, E);
+    }
+
     /// The experts of a mixture layer, after the router and the norm: the T tokens' (token, expert) pairs, gate+up, the gated activation, down,
     /// and the weighted sum into D.moe.
     void experts(Dev& D, const DevLayer& dl, int T) {
-        const int nu = hp.n_used, E = hp.n_embd, F = hp.n_ff_exp;
+        const int nu = hp.n_used, E = hp.n_embd;
         const dim3 b1(g4k::kThreads);
         G4_LAUNCH(g4k::k_router, dim3(T), b1, D.st, D.h1, dl.rscale, dl.router, E, hp.n_expert, nu, hp.eps, D.topk_idx, D.topk_w);
         G4_LAUNCH(g4k::k_rms, dim3(T), b1, D.st, D.h1, E, dl.pre2, D.ye, E, E, hp.eps);
         const int rows = T * nu;
-        int ng;
-        const int *ge, *gf, *gn, *et, *er;
-        bool decode = T == 1;
-        if (decode) {                              // one token: the router's own choice is the group table, no round trip to the host
-            ng = nu;
-            ge = D.topk_idx;
-            gf = D.dec_first;
-            gn = D.dec_n;
-            et = D.dec_tok;
-            er = D.dec_row;
+        if (dl.streamed) {
+            experts_streamed(D, dl, T);
+        } else if (T == 1) {                       // one token: the router's own choice is the group table, no round trip to the host
+            exp_ffn(D, dl.gate_up, dl.gate_e, dl.up_e, dl.down_e, nu, true, D.topk_idx, D.dec_first, D.dec_n, D.dec_tok, D.dec_row, rows, nullptr);
         } else {                                   // prompt reading: group the pairs by expert on the host (the weights are then read once per 16 pairs)
             std::vector<int> idx((size_t) rows);
             CK(cudaMemcpy(idx.data(), D.topk_idx, (size_t) rows * 4, cudaMemcpyDeviceToHost));
@@ -465,24 +608,66 @@ struct GpuEngine::Impl {
                     for (size_t j = 0; j < k; ++j) { ent_r.push_back(v[s + j]); ent_t.push_back(v[s + j] / nu); }
                 }
             }
-            ng = (int) gex.size();
-            CK(cudaMemcpy(D.grp_expert, gex.data(), gex.size() * 4, cudaMemcpyHostToDevice));
-            CK(cudaMemcpy(D.grp_first, gfi.data(), gfi.size() * 4, cudaMemcpyHostToDevice));
-            CK(cudaMemcpy(D.grp_n, gnn.data(), gnn.size() * 4, cudaMemcpyHostToDevice));
-            CK(cudaMemcpy(D.ent_tok, ent_t.data(), ent_t.size() * 4, cudaMemcpyHostToDevice));
-            CK(cudaMemcpy(D.ent_row, ent_r.data(), ent_r.size() * 4, cudaMemcpyHostToDevice));
-            ge = D.grp_expert; gf = D.grp_first; gn = D.grp_n; et = D.ent_tok; er = D.ent_row;
+            upload_groups(D, gex, gfi, gnn, ent_t, ent_r);
+            exp_ffn(D, dl.gate_up, dl.gate_e, dl.up_e, dl.down_e, (int) gex.size(), false, D.grp_expert, D.grp_first, D.grp_n, D.ent_tok, D.ent_row, rows, nullptr);
         }
-        if (dl.gate_up) {
-            mm_exp(D, dl.gate_up, D.ye, E, ng, decode, ge, gf, gn, et, er, D.gu, 2 * F);
-            G4_LAUNCH(g4k::k_geglu, dim3((unsigned) ((F + 127) / 128), (unsigned) rows), b1, D.st, D.gu, 2 * F, D.gu + F, 2 * F, D.eact, F, F);
-        } else {
-            mm_exp(D, dl.gate_e, D.ye, E, ng, decode, ge, gf, gn, et, er, D.gu, 2 * F, 0);
-            mm_exp(D, dl.up_e, D.ye, E, ng, decode, ge, gf, gn, et, er, D.gu, 2 * F, F);
-            G4_LAUNCH(g4k::k_geglu, dim3((unsigned) ((F + 127) / 128), (unsigned) rows), b1, D.st, D.gu, 2 * F, D.gu + F, 2 * F, D.eact, F, F);
-        }
-        mm_exp(D, dl.down_e, D.eact, F, ng, decode, ge, gf, gn, er, er, D.ed, E);
         G4_LAUNCH(g4k::k_expert_sum, dim3((unsigned) ((E + 127) / 128), (unsigned) T), b1, D.st, D.ed, D.topk_idx, D.topk_w, dl.dscale, nu, E, D.moe);
+    }
+
+    void upload_groups(Dev& D, const std::vector<int>& gex, const std::vector<int>& gfi, const std::vector<int>& gnn, const std::vector<int>& ent_t,
+                       const std::vector<int>& ent_r) {
+        CK(cudaMemcpy(D.grp_expert, gex.data(), gex.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(D.grp_first, gfi.data(), gfi.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(D.grp_n, gnn.data(), gnn.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(D.ent_tok, ent_t.data(), ent_t.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(D.ent_row, ent_r.data(), ent_r.size() * 4, cudaMemcpyHostToDevice));
+    }
+
+    /// The experts of a layer that lives in host memory.  The router's choice is read back, and the experts it names are copied into the staging slots:
+    /// the n_used of the one token of a decode step; for a prompt chunk, the experts in batches of stage_slots, each with the groups of pairs that use it.
+    void experts_streamed(Dev& D, const DevLayer& dl, int T) {
+        const int nu = hp.n_used;
+        const int rows = T * nu;
+        std::vector<int> idx((size_t) rows);
+        CK(cudaMemcpy(idx.data(), D.topk_idx, (size_t) rows * 4, cudaMemcpyDeviceToHost));       // (also the barrier: the router has run)
+        const bool fused = dl.gate_up.type >= 0;
+        const DevMat& A = fused ? dl.gate_up : dl.gate_e;
+        auto copy_in = [&](int slot, int e) {
+            CK(cudaMemcpyAsync(D.stgA + (size_t) slot * A.expert_bytes, (fused ? dl.h_gu : dl.h_ga) + (size_t) e * A.expert_bytes, A.expert_bytes, cudaMemcpyHostToDevice, D.st));
+            if (!fused) CK(cudaMemcpyAsync(D.stgB + (size_t) slot * dl.up_e.expert_bytes, dl.h_up + (size_t) e * dl.up_e.expert_bytes, dl.up_e.expert_bytes, cudaMemcpyHostToDevice, D.st));
+            CK(cudaMemcpyAsync(D.stgC + (size_t) slot * dl.down_e.expert_bytes, dl.h_dn + (size_t) e * dl.down_e.expert_bytes, dl.down_e.expert_bytes, cudaMemcpyHostToDevice, D.st));
+        };
+        auto view = [&](const DevMat& meta, uint8_t* stg) { DevMat v = meta; v.d = stg; return v; };
+        const DevMat vgu = fused ? view(dl.gate_up, D.stgA) : DevMat(), vga = fused ? DevMat() : view(dl.gate_e, D.stgA), vup = fused ? DevMat() : view(dl.up_e, D.stgB),
+                     vdn = view(dl.down_e, D.stgC);
+        if (T == 1) {
+            for (int k = 0; k < nu; ++k) copy_in(k, idx[(size_t) k]);
+            exp_ffn(D, vgu, vga, vup, vdn, nu, true, D.dec_slots, D.dec_first, D.dec_n, D.dec_tok, D.dec_row, rows, nullptr);
+            return;
+        }
+        std::vector<std::vector<int>> by((size_t) hp.n_expert);
+        for (int r = 0; r < rows; ++r) by[(size_t) idx[(size_t) r]].push_back(r);
+        std::vector<int> used;
+        for (int e = 0; e < hp.n_expert; ++e)
+            if (!by[(size_t) e].empty()) used.push_back(e);
+        for (size_t b0 = 0; b0 < used.size(); b0 += (size_t) D.stg_slots) {
+            const size_t nb = std::min<size_t>((size_t) D.stg_slots, used.size() - b0);
+            std::vector<int> gex, gfi, gnn, ent_t, ent_r;
+            for (size_t k = 0; k < nb; ++k) {
+                const int e = used[b0 + k];
+                copy_in((int) k, e);
+                const auto& v = by[(size_t) e];
+                for (size_t s = 0; s < v.size(); s += kExpertTile) {
+                    const size_t n = std::min<size_t>(kExpertTile, v.size() - s);
+                    gex.push_back((int) k);                                    // the slot, which is what the kernels index experts by here
+                    gfi.push_back((int) ent_t.size());
+                    gnn.push_back((int) n);
+                    for (size_t j = 0; j < n; ++j) { ent_r.push_back(v[s + j]); ent_t.push_back(v[s + j] / nu); }
+                }
+            }
+            upload_groups(D, gex, gfi, gnn, ent_t, ent_r);                      // (a copy on the legacy stream: it waits for the batch before, which reads these tables)
+            exp_ffn(D, vgu, vga, vup, vdn, (int) gex.size(), false, D.grp_expert, D.grp_first, D.grp_n, D.ent_tok, D.ent_row, (int) ent_r.size(), D.ent_row);
+        }
     }
 
     void layer(Dev& D, int il, int T, int pos0) {
@@ -504,7 +689,7 @@ struct GpuEngine::Impl {
         G4_LAUNCH(g4k::k_rms, dim3(T), b1, D.st, D.h1, E, dl.ffn_norm, D.xn, E, E, hp.eps);
         mm(D, dl.gate, D.xn, E, T, D.g, hp.n_ff);
         mm(D, dl.up, D.xn, E, T, D.u, hp.n_ff);
-        G4_LAUNCH(g4k::k_geglu, dim3((unsigned) ((hp.n_ff + 127) / 128), (unsigned) T), b1, D.st, D.g, hp.n_ff, D.u, hp.n_ff, D.act, hp.n_ff, hp.n_ff);
+        G4_LAUNCH(g4k::k_geglu, dim3((unsigned) ((hp.n_ff + 127) / 128), (unsigned) T), b1, D.st, D.g, hp.n_ff, D.u, hp.n_ff, D.act, hp.n_ff, hp.n_ff, (const int*) nullptr);
         mm(D, dl.down, D.act, hp.n_ff, T, D.mlp, E);
         if (w.has_moe) experts(D, dl, T);
         G4_LAUNCH(g4k::k_ffn_combine, dim3(T), b1, D.st, (const float*) D.mlp, w.has_moe ? (const float*) D.moe : (const float*) nullptr, (const float*) D.h1, dl.post1,
@@ -575,6 +760,7 @@ int GpuEngine::n_vocab() const { return p_->hp.n_vocab; }
 int64_t GpuEngine::pos() const { return p_->pos; }
 void GpuEngine::reset() { p_->pos = 0; p_->logits_ready = false; }
 void GpuEngine::truncate(int64_t q) { p_->pos = std::min(p_->pos, std::max<int64_t>(0, q)); p_->logits_ready = false; }
+int GpuEngine::streamed_layers() const { return (int) std::count(p_->is_streamed.begin(), p_->is_streamed.end(), (char) 1); }
 bool GpuEngine::can_keep(int64_t q) const {
     // Going back to q: the next token (position q) needs the keys of the sliding-window layers from q - window + 1 on.  A ring of `ring` cells
     // holds the last `ring` positions [pos - ring, pos - 1]; a global layer holds all of them.
@@ -646,6 +832,7 @@ int run(const g4::Model& m, int ctx, bool serve, const std::string& tokens, int 
         const std::string& a = extra[i];
         auto val = [&]() -> std::string { return i + 1 < extra.size() ? extra[++i] : std::string(); };
         if (a == "--prefill" || a == "--chunk") { const std::string v = val(); if (v != "auto") o.chunk = std::max(1, std::atoi(v.c_str())); }
+        else if (a == "--host-experts") o.host_experts = std::max(0, std::atoi(val().c_str()));
         else if (a == "--swa-slack") o.slack = std::max(0, std::atoi(val().c_str()));
         else if (a == "--vram-reserve-mib") o.reserve_mib = std::max(0, std::atoi(val().c_str()));
         else if (a == "--check") check = true;

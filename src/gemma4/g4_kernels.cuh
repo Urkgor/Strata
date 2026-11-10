@@ -190,12 +190,13 @@ k_ffn_combine(const float* mlp, const float* moe, const float* h1, const float* 
     for (int i = (int) threadIdx.x; i < n; i += (int) blockDim.x) h[o + i] = (cur[i] * sc3 * w3[i] + h1[o + i]) * out_scale;
 }
 
-/// out[r][i] = gelu(gate[r][i]) * up[r][i]
+/// out[r][i] = gelu(gate[r][i]) * up[r][i], for the rows r = rows[blockIdx.y] (or blockIdx.y when rows is null)
 __global__ void __launch_bounds__(kThreads)
-k_geglu(const float* gate, int ldg, const float* up, int ldu, float* out, int ldo, int n) {
-    const float* g = gate + (size_t) blockIdx.y * (size_t) ldg;
-    const float* u = up + (size_t) blockIdx.y * (size_t) ldu;
-    float* o = out + (size_t) blockIdx.y * (size_t) ldo;
+k_geglu(const float* gate, int ldg, const float* up, int ldu, float* out, int ldo, int n, const int* rows) {
+    const size_t r = rows ? (size_t) rows[blockIdx.y] : (size_t) blockIdx.y;
+    const float* g = gate + r * (size_t) ldg;
+    const float* u = up + r * (size_t) ldu;
+    float* o = out + r * (size_t) ldo;
     const int i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
     if (i < n) o[i] = gelu(g[i]) * u[i];
 }

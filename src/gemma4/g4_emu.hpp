@@ -268,6 +268,7 @@ inline cudaError_t cudaGetLastError() { return cudaSuccess; }
 inline const char* cudaGetErrorString(cudaError_t) { return "no error (emulated)"; }
 inline cudaError_t cudaMalloc(void** p, size_t n) { *p = std::calloc(1, n ? n : 1); return *p ? cudaSuccess : cudaErrorInvalidValue; }
 inline cudaError_t cudaFree(void* p) { std::free(p); return cudaSuccess; }
+enum { cudaHostAllocPortable = 1 };
 inline cudaError_t cudaHostAlloc(void** p, size_t n, unsigned) { *p = std::calloc(1, n ? n : 1); return *p ? cudaSuccess : cudaErrorInvalidValue; }
 inline cudaError_t cudaFreeHost(void* p) { std::free(p); return cudaSuccess; }
 inline cudaError_t cudaMemset(void* p, int v, size_t n) { std::memset(p, v, n); return cudaSuccess; }
@@ -283,10 +284,10 @@ inline cudaError_t cudaGetDevice(int* d) { *d = g4emu_device(); return cudaSucce
 inline cudaError_t cudaGetDeviceCount(int* n) { const char* e = std::getenv("STRATA_G4_EMU_DEVICES"); *n = e ? std::atoi(e) : 2; return cudaSuccess; }
 inline cudaError_t cudaMemGetInfo(size_t* fr, size_t* tot) {
     const char* e = std::getenv("STRATA_G4_EMU_FREE_MB");      // per device: a comma list, else every device has 8 GiB
-    size_t mb = 8192;
-    if (e) { int d = g4emu_device(); const char* q = e; for (; d > 0 && std::strchr(q, ','); --d) q = std::strchr(q, ',') + 1; mb = (size_t) std::atoll(q); }
-    *fr = mb << 20;
-    *tot = (mb + 512) << 20;
+    double mb = 8192;
+    if (e) { int d = g4emu_device(); const char* q = e; for (; d > 0 && std::strchr(q, ','); --d) q = std::strchr(q, ',') + 1; mb = std::atof(q); }
+    *fr = (size_t) (mb * 1048576.0);
+    *tot = (size_t) ((mb + 512) * 1048576.0);
     return cudaSuccess;
 }
 struct cudaDeviceProp { char name[256]; int major = 6, minor = 1; size_t totalGlobalMem = 0; };

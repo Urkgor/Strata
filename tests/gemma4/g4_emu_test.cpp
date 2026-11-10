@@ -42,8 +42,10 @@ int main(int argc, char** argv) {
     ref.forward(ids.data(), n, nullptr, &all);
     auto row = [&](int t) { return all.data() + (size_t) t * (size_t) nv; };
 
-    auto make = [&](int chunk, int slack, std::vector<int> devs) {
+    auto make = [&](int chunk, int slack, std::vector<int> devs, int host_experts = 0, int stage_slots = 32) {
         g4cuda::GpuOptions o;
+        o.host_experts = host_experts;
+        o.stage_slots = stage_slots;
         o.chunk = chunk;
         o.slack = slack;
         o.reserve_mib = 0;
@@ -120,6 +122,54 @@ int main(int argc, char** argv) {
         e->logits(lg);
         const double r = rel_rms(lg, row(n - 1));
         EXPECT(r < 2e-4, "truncate to 11 (the farthest back) after a wrap and re-read: within %.2e", r);
+    }
+    {   // 7. experts kept in host memory (the last 3 layers) and copied to the card per token: prompt in chunks (batches of 4 staging slots over 8 experts
+        // or more per layer) then one token at a time
+        auto e = make(8, 1024, {0}, 3, 4);
+        EXPECT(e->streamed_layers() == 3, "3 layers streamed (%d)", e->streamed_layers());
+        int64_t done = 0;
+        e->process(ids.data(), n - 3, noop, &done);
+        double worst = 0;
+        for (int t = n - 3; t < n; ++t) {
+            e->process(&ids[(size_t) t], 1, noop, &done);
+            e->logits(lg);
+            worst = std::max(worst, rel_rms(lg, row(t)));
+        }
+        EXPECT(worst < 2e-4, "3 layers' experts in host memory, 4 staging slots, prompt then 3 single tokens: worst %.2e", worst);
+    }
+    {   // 8. every layer streamed, one chunk, the whole prompt at once (the largest batches)
+        auto e = make(32, 1024, {0}, 1000, 32);
+        EXPECT(e->streamed_layers() == m.hp.n_layer, "all %d layers streamed (%d)", m.hp.n_layer, e->streamed_layers());
+        int64_t done = 0;
+        e->process(ids.data(), n, noop, &done);
+        e->logits(lg);
+        const double r = rel_rms(lg, row(n - 1));
+        EXPECT(r < 2e-4, "every layer's experts in host memory, one chunk: within %.2e", r);
+    }
+    {   // 9. two devices with streamed layers on the last one
+        setenv("STRATA_G4_EMU_FREE_MB", "6,8", 1);
+        auto e = make(8, 1024, {0, 1}, 2, 8);
+        EXPECT(e->streamed_layers() == 2, "2 layers streamed (%d)", e->streamed_layers());
+        int64_t done = 0;
+        e->process(ids.data(), n, noop, &done);
+        e->logits(lg);
+        const double r = rel_rms(lg, row(n - 1));
+        EXPECT(r < 2e-4, "two devices, the last 2 layers' experts in host memory: within %.2e", r);
+    }
+    {   // 10. the placement itself: a card with just too little room for the experts of every layer (5.9 MiB: the first layer keeps its experts, the others
+        // stream, 2 staging slots): reading and then decoding give the reference's logits
+        setenv("STRATA_G4_EMU_FREE_MB", "5.9", 1);
+        auto e = make(8, 1024, {0}, 0, 2);
+        EXPECT(e->streamed_layers() > 0 && e->streamed_layers() < m.hp.n_layer, "a short card streams some layers, not all of them (%d of %d)", e->streamed_layers(), m.hp.n_layer);
+        int64_t done = 0;
+        e->process(ids.data(), n - 2, noop, &done);
+        double worst = 0;
+        for (int t = n - 2; t < n; ++t) {
+            e->process(&ids[(size_t) t], 1, noop, &done);
+            e->logits(lg);
+            worst = std::max(worst, rel_rms(lg, row(t)));
+        }
+        EXPECT(worst < 2e-4, "placement by free memory with streamed layers: worst %.2e", worst);
     }
     std::printf(fails ? "%d FAILED\n" : "g4_emu_test: all scenarios pass\n", fails);
     return fails ? 1 : 0;

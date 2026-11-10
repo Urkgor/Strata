@@ -52,7 +52,7 @@ python3 tools/strata_tokenizer.py --gguf gemma-4-26B-A4B-it-UD-IQ4_XS.gguf --out
 
 Engine options (`strata-gemma4 --help`): `--max-context N` (default 8192), `--gpu 0,1` (devices in layer order; default: every device, the one with the
 most free memory first), `--prefill N` (tokens read per chunk, 512), `--swa-slack N` (extra cells the sliding-window layers keep so a conversation can step
-back, 1024), `--vram-reserve-mib N` (left free on each device, 700), `--cpu` (the CPU reference), `--eos ID,...` (default 1, 50, 106: `<eos>`,
+back, 1024), `--vram-reserve-mib N` (left free on each device, 700), `--host-experts N` (keep the experts of the last N layers in host memory even if they fit), `--cpu` (the CPU reference), `--eos ID,...` (default 1, 50, 106: `<eos>`,
 `<|tool_response>`, `<turn|>`).
 
 Checks you can run on your machine: `strata-gemma4 --model F.gguf --tokens 2,9259,236764 --check` runs the prompt on the GPU and on the CPU reference and says
@@ -63,7 +63,7 @@ time the prompt and the generation.
 
 The engine reads F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4: every
 file Unsloth publishes for this model (headers read, not the files). Not IQ1_S, IQ1_M or the ternary types. The layers are spread over the cards in order (the
-output head, 0.7 GiB, on the last one); nothing is offloaded to the CPU, so the file, the K/V cache and about 1 GiB of buffers must fit the VRAM of all cards.
+output head, 0.7 GiB, on the last one). What does not fit the VRAM is not refused: see "Experts in host memory" below.
 
 Measured on the real file headers (weights of the layers + the output head; the K/V cache is 0.64 GiB at a context of 8192, 1.1 GiB at 32 768, 3.0 GiB at
 131 072, with the defaults):
@@ -87,13 +87,31 @@ Checked, without a GPU (`tools/gemma4/README.md` says how to repeat each):
   once ggml's half-precision GELU table is imitated; 7e-5 with the code-book types), the same best token and top five at every position; against the same
   model quantized the difference is 1 to 2 %, what llama.cpp's 8-bit quantization of the activations costs;
 - the CUDA engine's kernels and host code (`g4_cuda.cu`, unchanged) on the CPU emulation of CUDA, against the reference: logits within 2e-5 for one chunk,
-  chunks with a wrapping ring, one token at a time (6e-5), two devices, a step back; under AddressSanitizer and UBSan;
+  chunks with a wrapping ring, one token at a time (6e-5), two devices, a step back, experts streamed from host memory (every layer, the last ones, with fewer slots than experts, placement by free memory); under AddressSanitizer and UBSan;
 - the server: 32 tests (`serve/test_gemma4.py`: tool calls and thinking over both APIs, forced tools, the chat template against Jinja2), and a real
   server + engine process on the small model.
 - it builds with nvcc 12.4 for sm_61 and sm_75 (`tools/build_rhel7.sh --gemma4`, no spills, 32 KB of shared memory at most per block).
 
 Not checked: any run on a GPU (there was none), so no speed figure and no check of the arithmetic on a real card. `--check` is there for that. Nothing was run
 with the real 26B weights (the headers of the real files were read; the arithmetic was checked on a model of the same layout).
+
+## Experts in host memory
+
+The layers fill the cards in order, each with its 128 experts. When the last card cannot take the experts of the next layers, those layers keep their experts in
+host memory (pinned, a second copy next to the file's page cache: count the size of those experts in RAM twice) and take only the rest of the card (attention,
+dense MLP, K/V). Nothing else changes: the same kernels run on the same data, the experts are only brought to the card first. The first layers stay fully resident,
+the last ones stream, and the engine says which ones at start (`the experts of N layer(s) ... stay in host memory`). It is automatic; `--host-experts N` forces
+it for the last N layers (to try the path, or to leave VRAM for a longer context).
+
+- **Decode**: for each streaming layer the router's 8 experts are copied to 8 staging slots on the card (about 4 MB each at Q4_K_M, so some 30 MB a layer), then
+  the layer runs as usual: the cost is the PCIe transfer, about 3 ms a layer at 12 GB/s, so a layer that streams costs a few milliseconds more a token. A guess
+  from the sizes: **not measured**.
+- **Prompt reading**: a chunk of 512 tokens uses almost every expert, so each streaming layer copies them all, in batches of 32 slots (`--prefill` bigger makes
+  each copy serve more tokens). Reading a prompt is slower in proportion to the number of streaming layers.
+- The staging slots (32 experts of the largest layer) and the head are reserved first, so a model that needs a lot of host memory still needs the attention, dense
+  weights, K/V and head to fit the cards: the engine reports the VRAM that is missing when even that does not fit.
+- Checked on the emulation (see below): layers streamed one after another, decode and prompt in chunks with fewer slots than experts, two cards, and the
+  placement by free memory. Not checked on a real card: speed and the pinned copy.
 
 ## The conversation cache
 
@@ -106,5 +124,5 @@ longer than that should raise `--swa-slack` with the VRAM it has left: 25 slidin
 
 ## Limits
 
-One conversation at a time (no batch, no slots), K/V as f16 (no q8 / q4 cache), no CUDA graphs, no vision or audio, no draft model, no CPU experts. The
+One conversation at a time (no batch, no slots), K/V as f16 (no q8 / q4 cache), no CUDA graphs, no vision or audio, no draft model. The
 E2B and E4B sizes (per-layer embeddings, K/V shared between layers) are refused with a message; the dense 31B is read by the same code but was not tried.
