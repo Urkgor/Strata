@@ -168,7 +168,7 @@ positional: the cells before the checkpoint are not changed by what is decoded a
 them. It is therefore valid only while its conversation slot keeps those cells: a request that reads from before it in the
 same slot (an unrelated prompt in a one-slot engine, or a call that restores an earlier checkpoint, which drops the later ones) drops it, and `--parallel 2` or more keeps a chat apart from side
 requests. The pin cannot rely on that, so it keeps its own copy of the K / V cells in host RAM (about 20 KB per token in
-f16, 11 KB in q8_0, 41 KB in f32; a 20K-token pin is 0.4 GB in f16), taken once when the pin is made and written back when it
+f16, 11 KB in q8_0, 6 KB in q4_0, 41 KB in f32; a 20K-token pin is 0.4 GB in f16), taken once when the pin is made and written back when it
 is used. Checkpoints are not copied with a session when the engine moves a conversation between slots.
 
 **Side requests.** A request that shares only a start with what a conversation slot holds (a title, a summary, another item
@@ -179,7 +179,7 @@ the first slot keeps its conversation. The journal says it (`… is read in sess
 slot nothing can be kept: the side request wins. A request that matches nothing also goes to the idle slot that holds
 the least, not to the one used longest ago.
 
-**Not measured on a card.** The decision (what is reused, where the read is cut, the pin's K / V layout for f32, f16 and q8_0)
+**Not measured on a card.** The decision (what is reused, where the read is cut, the pin's K / V layout for f32, f16, q8_0 and q4_0)
 is tested on the CPU (`tests/core/q36_ckpt_test.cpp`). The restore itself, and that a request after a restore gives the same
 tokens as on a fresh engine, have not been run: there was no GPU. A read is cut at the turn token, so the chunk boundaries of
 a prompt differ from a one-piece read, which can change the last bits of a float result; the same prompt read twice is cut the

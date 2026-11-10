@@ -272,7 +272,51 @@ static void test_q8_store() {
     check(ok, "q8_store: quants and scales equal the Q8_0 reference (zeros, ties, small, large)");
 }
 
-static bool compare_q8(int T, int pos0v, int ctx, bool per_row, unsigned seed, const char* what) {
+// ---- --kv q4_0: the Q4_0 store (q4_store) against ggml's quantize_row_q4_0_ref, and the Q4 kernel against the float kernel on the dequantized
+// values ((q - 8) * d, d a half).
+struct Q4Ref {   // one block of 32: ggml's reference (quants unpacked, 0..15)
+    int q[32];
+    __half d;
+};
+static Q4Ref q4_ref(const float* x) {
+    float amax = 0.f, mx = 0.f;
+    for (int k = 0; k < 32; ++k)
+        if (amax < std::fabs(x[k])) { amax = std::fabs(x[k]); mx = x[k]; }
+    const float d = mx / -8.f, id = d != 0.f ? 1.0f / d : 0.f;
+    Q4Ref r;
+    for (int k = 0; k < 32; ++k) r.q[k] = std::min(15, (int) (int8_t) (x[k] * id + 8.5f));
+    r.d = __float2half(d);
+    return r;
+}
+void k_test_q4_store(const float* x, float* qb, uint8_t* qn, __half* sc) { q36k::q4_store(x[threadIdx.x], qb, qn, sc); }
+
+static void test_q4_store() {
+    std::mt19937 rng(12);
+    std::normal_distribution<float> g(0.f, 1.f);
+    constexpr int HD = 256;
+    std::vector<float> x(HD), qb(HD);
+    bool ok = true;
+    for (int round = 0; round < 15; ++round) {
+        for (int i = 0; i < HD; ++i) x[i] = g(rng) * (round % 3 == 0 ? 0.01f : round % 3 == 1 ? 1.f : 300.f);
+        if (round == 3) for (int i = 0; i < 32; ++i) x[i] = 0.f;                              // a block of zeros: d = 0, no division
+        if (round == 4) for (int i = 32; i < 64; ++i) x[i] = (i % 2 ? 1.f : -1.f) * 8.f;     // |x| = 8 d: ties on the largest magnitude, the first one wins
+        if (round == 5) for (int i = 64; i < 96; ++i) x[i] = (float) (i - 63) * 0.5f;        // all positive: the largest gives q = 0 (d < 0)
+        if (round == 6) for (int i = 96; i < 128; ++i) x[i] = -(float) (i - 95) * 0.25f;     // all negative: the largest gives q = 0 as well (d > 0)
+        if (round == 7) for (int i = 128; i < 160; ++i) x[i] = i == 130 ? 5.f : 0.f;         // one value, the others zero
+        std::vector<uint8_t> qn(HD / 2, 0x55);
+        std::vector<__half> sc(HD / 32);
+        launch(1, 1, HD, k_test_q4_store, (const float*) x.data(), qb.data(), qn.data(), sc.data());
+        for (int b = 0; b < HD / 32; ++b) {
+            const Q4Ref r = q4_ref(&x[b * 32]);
+            if (sc[b].bits != r.d.bits) ok = false;
+            for (int k = 0; k < 16; ++k)
+                if (qn[b * 16 + k] != (uint8_t) (r.q[k] | (r.q[k + 16] << 4))) ok = false;   // ggml's packing: value k low, value k + 16 high
+        }
+    }
+    check(ok, "q4_store: nibbles (ggml's packing) and scales equal the Q4_0 reference (zeros, ties, signs, small, large)");
+}
+
+static bool compare_q8(int T, int pos0v, int ctx, bool per_row, unsigned seed, const char* what, bool four = false) {
     constexpr int H = 16, HKV = 2, HD = 256;
     const int n_chunk = (ctx + 255) / 256;
     std::mt19937 rng(seed);
@@ -285,6 +329,18 @@ static bool compare_q8(int T, int pos0v, int ctx, bool per_row, unsigned seed, c
     auto build = [&](std::vector<uint8_t>& q, std::vector<float>& d, float amp) {
         std::vector<float> x(n_kv);
         for (auto& v : x) v = g(rng) * amp;
+        if (four) {   // Q4_0: HKV * ctx * HD / 2 bytes of nibbles, then the scales
+            q.assign(n_kv / 2 + n_sc * 2, 0);
+            d.assign(n_kv, 0.f);
+            __half* sc4 = reinterpret_cast<__half*>(q.data() + n_kv / 2);
+            for (size_t b = 0; b < n_sc; ++b) {
+                const Q4Ref r = q4_ref(&x[b * 32]);
+                sc4[b] = r.d;
+                for (int k = 0; k < 16; ++k) q[b * 16 + k] = (uint8_t) (r.q[k] | (r.q[k + 16] << 4));
+                for (int k = 0; k < 32; ++k) d[b * 32 + k] = (float) (r.q[k] - 8) * __half2float(r.d);
+            }
+            return;
+        }
         q.assign(n_kv + n_sc * 2, 0);
         d.assign(n_kv, 0.f);
         __half* sc = reinterpret_cast<__half*>(q.data() + n_kv);
@@ -317,7 +373,8 @@ static bool compare_q8(int T, int pos0v, int ctx, bool per_row, unsigned seed, c
         if (per_row) { rs.cell = cell.data(); rs.slot = slot.data(); rs.kc = kcs.data(); rs.vc = vcs.data(); }
         const float* kc = per_row ? nullptr : kcs[0];
         const float* vc = per_row ? nullptr : vcs[0];
-        if (q8) launch(n_chunk, T * HKV, 256, q36k::k_attn_part_gqa<q36k::KvQ8>, (const float*) q.data(), kc, vc, (const int32_t*) &pos0, 0, H, HKV, ctx, scale, n_chunk, o.acc.data(), o.m.data(), o.l.data(), rs.cell, rs.slot, rs.kc, rs.vc);
+        if (q8 && four) launch(n_chunk, T * HKV, 256, q36k::k_attn_part_gqa<q36k::KvQ4>, (const float*) q.data(), kc, vc, (const int32_t*) &pos0, 0, H, HKV, ctx, scale, n_chunk, o.acc.data(), o.m.data(), o.l.data(), rs.cell, rs.slot, rs.kc, rs.vc);
+        else if (q8) launch(n_chunk, T * HKV, 256, q36k::k_attn_part_gqa<q36k::KvQ8>, (const float*) q.data(), kc, vc, (const int32_t*) &pos0, 0, H, HKV, ctx, scale, n_chunk, o.acc.data(), o.m.data(), o.l.data(), rs.cell, rs.slot, rs.kc, rs.vc);
         else launch(n_chunk, T * H, 256, k_attn_part<float>, (const float*) q.data(), kc, vc, (const int32_t*) &pos0, 0, H, HKV, ctx, scale, n_chunk, o.acc.data(), o.m.data(), o.l.data(), rs);
         return o;
     };
@@ -331,6 +388,18 @@ static bool compare_q8(int T, int pos0v, int ctx, bool per_row, unsigned seed, c
 int main() {
     std::printf("k_attn_part_gqa against k_attn_part, bit for bit (CPU threads)\n");
     test_q8_store();
+    test_q4_store();
+    {
+        const char* kind = "[q4_0 cache] ";
+        char buf[160];
+        auto name = [&](const char* s) { std::snprintf(buf, sizeof buf, "%s%s", kind, s); return buf; };
+        compare_q8(1, 600, 700, false, 31, name("decode, 1 token at cell 600, context 700 (2 full chunks + a partial one)"), true);
+        compare_q8(1, 255, 512, false, 32, name("decode at cell 255: the last cell of chunk 0, context 512"), true);
+        compare_q8(1, 0, 300, false, 33, name("the first token: one cell"), true);
+        compare_q8(4, 300, 777, false, 34, name("a verify window of 4 tokens"), true);
+        compare_q8(3, 50, 900, true, 35, name("3 rows on 3 sessions, per-row cells (RowSel)"), true);
+        compare_q8(1, 699, 700, false, 36, name("the last cell of a 700-cell cache: the K read of the partial chunk is guarded"), true);
+    }
     {
         const char* kind = "[q8_0 cache] ";
         char buf[160];

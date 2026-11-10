@@ -160,16 +160,17 @@ struct Copy2D {
     size_t host_off = 0, dev_off = 0, dev_pitch = 0, width = 0, height = 0;
 };
 
-/// The copies that move the first `n` cells of every KV head of one K or V array of a layer (layout [HKV][ctx][HD] elements of `el`
-/// bytes; q8_0: [HKV][ctx][HD] int8 quants then [HKV][ctx][HD / 32] half scales), appended to `out` with the host side starting at
-/// `host_base`.  Returns the host bytes they fill: HKV * n * (one cell's bytes).
-inline size_t kv_prefix_copies(size_t host_base, int64_t n, int64_t ctx, int HD, int HKV, size_t el, bool q8, std::vector<Copy2D>& out) {
-    const size_t w = (size_t) n * (size_t) HD * el, row = (size_t) ctx * (size_t) HD * el;
+/// The copies that move the first `n` cells of every KV head of one K or V array of a layer (layout [HKV][ctx][cell_bytes] bytes: HD
+/// elements of 4 / 2 bytes, or the quants of q8_0 (HD bytes) / q4_0 (HD / 2); with `scales` (q8_0, q4_0) a second array [HKV][ctx][HD / 32]
+/// half scales follows), appended to `out` with the host side starting at `host_base`.  Returns the host bytes they fill: HKV * n * (one
+/// cell's bytes, the scales included).
+inline size_t kv_prefix_copies(size_t host_base, int64_t n, int64_t ctx, int HD, int HKV, size_t cell_bytes, bool scales, std::vector<Copy2D>& out) {
+    const size_t w = (size_t) n * cell_bytes, row = (size_t) ctx * cell_bytes;
     out.push_back({host_base, 0, row, w, (size_t) HKV});
     size_t used = w * (size_t) HKV;
-    if (q8) {
+    if (scales) {
         const size_t sw = (size_t) n * (size_t) (HD / 32) * 2, srow = (size_t) ctx * (size_t) (HD / 32) * 2;
-        out.push_back({host_base + used, (size_t) HKV * (size_t) ctx * (size_t) HD, srow, sw, (size_t) HKV});
+        out.push_back({host_base + used, (size_t) HKV * (size_t) ctx * cell_bytes, srow, sw, (size_t) HKV});
         used += sw * (size_t) HKV;
     }
     return used;

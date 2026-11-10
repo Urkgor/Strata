@@ -14,7 +14,8 @@
 // that the K / V of a cell are fetched once for the 8 heads.  tests/core/q36_attn_gqa_test.cpp runs this file's kernel and a
 // copy of the old one on the CPU (one thread per CUDA thread) and compares every output bit.
 //
-// Layout contract (the same as k_attn_part): K / V of a layer [kv head][ctx cells][256] elements (floats, or halves with --kv f16); q [T][H][256]; pacc / pm / pl
+// Layout contract (the same as k_attn_part): K / V of a layer [kv head][ctx cells][256] elements (floats, or halves with --kv f16; Q8_0 / Q4_0 blocks
+// with --kv q8_0 / q4_0, see KvQ8 / KvQ4 below); q [T][H][256]; pacc / pm / pl
 // indexed by (row = (t - t0) * H + head) * n_chunk + chunk.  Only H / HKV == 8 and head dimension 256, chunks of 256 cells.
 #pragma once
 
@@ -56,6 +57,44 @@ __device__ inline void q8_store(float v, float* qb, int8_t* qs, __half* sc) {
     const float id = d != 0.f ? 1.0f / d : 0.f;
     qs[i] = (int8_t) roundf(v * id);
     if ((i & (kQ8Block - 1)) == 0) sc[i / kQ8Block] = __float2half(d);
+    __syncthreads();   // qb is free again
+}
+
+// --kv q4_0: the cache holds Q4_0 blocks as ggml's (32 values: a half scale d = max / -8 where max is the value of largest magnitude,
+// signed, and 4-bit quants q = min(15, trunc(x / d + 8.5)), x ~ (q - 8) * d; byte k of a block holds value k in its low nibble and value
+// k + 16 in its high one), in two arrays of one allocation like Q8_0: [HKV][ctx][HD / 2] bytes of nibbles, then [HKV][ctx][HD / 32] half.
+// No rotation of K / V (llama.cpp's --cache-type-k q4_0 does none either).  Only the head dimension 256 / block 32 case exists.
+struct KvQ4 {};
+constexpr int kQ4Block = 32;
+/// bytes of one (KV head, cell): HD / 2 bytes of quants and HD / 32 half scales
+constexpr size_t q4_cell_bytes(int HD) { return (size_t) HD / 2 + (size_t) (HD / kQ4Block) * 2; }
+
+/// The Q4_0 store of one value per thread, as q8_store (block of HD threads, HD a multiple of 32 and equal to blockDim.x; `qb` a shared
+/// float[HD] scratch): `qn` is the destination row's quants (HD / 2 bytes), `sc` its scales (HD / 32 half).  ggml's quantize_row_q4_0
+/// (the first value of the largest magnitude, d = max / -8, the scale stored as a half but the quants taken with the float d).  Barriers.
+__device__ inline void q4_store(float v, float* qb, uint8_t* qn, __half* sc) {
+    const int i = threadIdx.x;
+    qb[i] = v;
+    __syncthreads();
+    const int b0 = i & ~(kQ4Block - 1);
+    float amax = 0.f, mx = 0.f;
+    for (int k = 0; k < kQ4Block; ++k) {
+        const float x = qb[b0 + k];
+        if (amax < fabsf(x)) {
+            amax = fabsf(x);
+            mx = x;
+        }
+    }
+    const float d = mx / -8.0f;
+    const float id = d != 0.f ? 1.0f / d : 0.f;
+    int q = (int) (v * id + 8.5f);
+    q = q < 15 ? q : 15;
+    __syncthreads();   // qb is read by everyone: now it carries the quants
+    qb[i] = (float) q;
+    __syncthreads();
+    const int l = i & (kQ4Block - 1);
+    if (l < kQ4Block / 2) qn[(b0 >> 1) + l] = (uint8_t) ((int) qb[i] | ((int) qb[i + kQ4Block / 2] << 4));
+    if (l == 0) sc[i / kQ4Block] = __float2half(d);
     __syncthreads();   // qb is free again
 }
 
@@ -109,8 +148,8 @@ k_attn_part_gqa(const float* q, const float* kc_, const float* vc_, const int32_
         kc_ = rs_kc[rs_slot[t]];
         vc_ = rs_vc[rs_slot[t]];
     }
-    constexpr bool Q8 = std::is_same_v<KT, KvQ8>;
-    using KE = std::conditional_t<Q8, float, KT>;   // (the element type of the float / half caches; a stand-in for Q8)
+    constexpr bool Q8 = std::is_same_v<KT, KvQ8>, Q4 = std::is_same_v<KT, KvQ4>;
+    using KE = std::conditional_t<Q8 || Q4, float, KT>;   // (the element type of the float / half caches; a stand-in for Q8 / Q4)
     const KE* kc = reinterpret_cast<const KE*>(kc_);
     const KE* vc = reinterpret_cast<const KE*>(vc_);
     const int p0 = c * NC;
@@ -139,6 +178,22 @@ k_attn_part_gqa(const float* q, const float* kc_, const float* vc_, const int32_
             const int8_t* b = reinterpret_cast<const int8_t*>(&u);
 #pragma unroll
             for (int k = 0; k < KS; ++k) ks[j][k] = (float) b[k] * dk;
+        } else if constexpr (Q4) {
+            // cell j's 16 values of this slice are the low (d0 % 32 == 0) or the high (== 16) nibbles of the block's 16 bytes: one 16-byte
+            // load; dequantized as (q - 8) * d
+            const uint8_t* qk = reinterpret_cast<const uint8_t*>(kc_);
+            const __half* sk = reinterpret_cast<const __half*>(qk + (size_t) HKV * ctx * (HD / 2));
+            const size_t row = (size_t) kvh * ctx + p0 + j;
+            uint4 u = make_uint4(0u, 0u, 0u, 0u);
+            float dk = 0.f;
+            if (p0 + j < npos) {
+                u = *reinterpret_cast<const uint4*>(qk + row * (HD / 2) + (d0 / kQ4Block) * (kQ4Block / 2));
+                dk = __half2float(sk[row * (HD / kQ4Block) + d0 / kQ4Block]);
+            }
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(&u);
+            const int sh = (d0 & (kQ4Block / 2)) ? 4 : 0;
+#pragma unroll
+            for (int k = 0; k < KS; ++k) ks[j][k] = (float) (((int) b[k] >> sh & 15) - 8) * dk;
         } else if constexpr (sizeof(KT) == 4) {
 #pragma unroll
             for (int rr = 0; rr < NC * KS / 4 / kAttnThreads; ++rr) {   // the slice: 256 cells x 16 floats, 4 float4 per thread
@@ -193,6 +248,12 @@ k_attn_part_gqa(const float* q, const float* kc_, const float* vc_, const int32_
             const __half* sv = reinterpret_cast<const __half*>(qv + (size_t) HKV * ctx * HD);
             const size_t row = (size_t) kvh * ctx + p0 + k;
             v = (float) qv[row * HD + j] * __half2float(sv[row * (HD / kQ8Block) + (j >> 5)]);
+        } else if constexpr (Q4) {
+            const uint8_t* qv = reinterpret_cast<const uint8_t*>(vc_);
+            const __half* sv = reinterpret_cast<const __half*>(qv + (size_t) HKV * ctx * (HD / 2));
+            const size_t row = (size_t) kvh * ctx + p0 + k;
+            const int byte = qv[row * (HD / 2) + (j >> 5) * (kQ4Block / 2) + (j & (kQ4Block / 2 - 1))];
+            v = (float) (((j & (kQ4Block / 2)) ? byte >> 4 : byte & 15) - 8) * __half2float(sv[row * (HD / kQ4Block) + (j >> 5)]);
         } else {
             v = kv_to_float(vp[(size_t) k * HD]);
         }

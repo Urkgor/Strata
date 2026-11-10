@@ -176,21 +176,21 @@ int main() {
         EXPECT(evict({100, 200}, 2) == 1, "two: the newer goes, the oldest stays");
         EXPECT(evict({100}, 1) == 0, "one: replaced");
     }
-    // ---- the pin's K / V copies: a pitched device array <-> a dense host buffer, f32 / f16 / q8_0, exact and nothing past the prefix touched
+    // ---- the pin's K / V copies: a pitched device array <-> a dense host buffer, f32 / f16 / q8_0 / q4_0, exact and nothing past the prefix touched
     {
         const int HD = 256, HKV = 2;
         const int64_t ctx = 300;
-        for (int kind = 0; kind < 3; ++kind) {   // f32, f16, q8_0
-            const bool q8 = kind == 2;
-            const size_t el = kind == 0 ? 4 : kind == 1 ? 2 : 1;
-            const size_t cell_bytes = q8 ? (size_t) HD + (size_t) (HD / 32) * 2 : (size_t) HD * el;
+        for (int kind = 0; kind < 4; ++kind) {   // f32, f16, q8_0, q4_0
+            const bool q8 = kind >= 2;   // (a second array of scales)
+            const size_t first = kind == 0 ? (size_t) HD * 4 : kind == 1 ? (size_t) HD * 2 : kind == 2 ? (size_t) HD : (size_t) HD / 2;   // bytes a cell in the first array
+            const size_t cell_bytes = q8 ? first + (size_t) (HD / 32) * 2 : first;
             const size_t dev_bytes = (size_t) HKV * (size_t) ctx * cell_bytes;
             for (int64_t n : {1, 17, 256, 299, 300}) {
                 std::vector<uint8_t> dev(dev_bytes), back(dev_bytes, 0xEE);
                 uint32_t s = 12345u + (uint32_t) n;
                 for (uint8_t& b : dev) { s = s * 1664525u + 1013904223u; b = (uint8_t) (s >> 24); }
                 std::vector<Copy2D> cp;
-                const size_t used = kv_prefix_copies(0, n, ctx, HD, HKV, el, q8, cp);
+                const size_t used = kv_prefix_copies(0, n, ctx, HD, HKV, first, q8, cp);
                 EXPECT(used == (size_t) HKV * (size_t) n * cell_bytes, "kind %d n %lld: %zu host bytes, wanted %zu", kind, (long long) n, used, (size_t) HKV * (size_t) n * cell_bytes);
                 EXPECT(cp.size() == (q8 ? 2u : 1u), "copies");
                 std::vector<uint8_t> host(used, 0);
@@ -210,13 +210,13 @@ int main() {
                 bool same = true, untouched = true;
                 for (int h = 0; h < HKV; ++h)
                     for (int64_t c = 0; c < ctx; ++c) {
-                        const size_t qoff = ((size_t) h * (size_t) ctx + (size_t) c) * (size_t) HD * el;
-                        const size_t qn = (size_t) HD * el;
+                        const size_t qoff = ((size_t) h * (size_t) ctx + (size_t) c) * first;
+                        const size_t qn = first;
                         for (size_t b = 0; b < qn; ++b) {
                             (c < n ? same : untouched) &= c < n ? dev2[qoff + b] == dev[qoff + b] : dev2[qoff + b] == 0xEE;
                         }
                         if (q8) {
-                            const size_t soff = (size_t) HKV * (size_t) ctx * (size_t) HD + ((size_t) h * (size_t) ctx + (size_t) c) * (size_t) (HD / 32) * 2;
+                            const size_t soff = (size_t) HKV * (size_t) ctx * first + ((size_t) h * (size_t) ctx + (size_t) c) * (size_t) (HD / 32) * 2;
                             for (size_t b = 0; b < (size_t) (HD / 32) * 2; ++b)
                                 (c < n ? same : untouched) &= c < n ? dev2[soff + b] == dev[soff + b] : dev2[soff + b] == 0xEE;
                         }
