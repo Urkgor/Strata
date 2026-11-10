@@ -359,6 +359,12 @@ if(STRATA_BUILD_TESTS)
   target_compile_options(q36_attn_gqa_test PRIVATE -ffp-contract=off -fno-strict-aliasing)
   target_link_libraries(q36_attn_gqa_test PRIVATE Threads::Threads)
   add_test(NAME q36_attn_gqa_test COMMAND q36_attn_gqa_test)
+  # the Qwen3.6 sampler's device half (the penalties from a list, the top k of a row) on the CPU emulation of CUDA, against the host reference
+  add_executable(q36_sample_test tests/core/q36_sample_test.cpp)
+  target_include_directories(q36_sample_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${CMAKE_CURRENT_SOURCE_DIR}/tests/core ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_options(q36_sample_test PRIVATE -ffp-contract=off)
+  target_link_libraries(q36_sample_test PRIVATE Threads::Threads)
+  add_test(NAME q36_sample_test COMMAND q36_sample_test)
   # the check of the prompt attention's cuBLAS GEMMs on the cache's card (--kv-gpu): its index arithmetic against a CPU model of the GEMM
   add_executable(q36_blas_check_test tests/core/q36_blas_check_test.cpp)
   target_include_directories(q36_blas_check_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)

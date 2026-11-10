@@ -28,6 +28,7 @@
 #include "strata/qwen35/engine.hpp"
 #include "strata/qwen35/sampling.hpp"
 #include "q36_kernels.cuh"
+#include "q36_sample.cuh"
 #include "q36_attn.cuh"
 #include "q36_blas_check.hpp"
 #include "q36_ckpt.hpp"
@@ -1577,6 +1578,23 @@ struct Engine {
         amv = dalloc((size_t) kArgBlocks * kVerify);
         ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
         CK(cudaHostAlloc((void**) &hpin, 64 * sizeof(int32_t), cudaHostAllocDefault));
+        {   // the sampler's device half (q36_sample.cuh): the penalty lists (every token of the vocabulary at most, then the
+            // rows' deltas), the top-k scratch and results, and their pinned copies
+            using strata::qwen35::PenEntry;
+            pen_cap = (size_t) g.n_vocab + (size_t) kVerify * q36s::kMaxDelta;
+            smp_b.base = dalloc_t<PenEntry>(pen_cap);
+            smp_b.deltas = smp_b.base + g.n_vocab;
+            smp_b.row_off = dalloc_t<int32_t>((size_t) kVerify + 1);
+            const size_t nc = (size_t) kVerify * (size_t) q36s::part_blocks((int) g.n_vocab) * q36s::kMaxK;
+            smp_b.cv = dalloc(nc);
+            smp_b.ci = dalloc_t<int32_t>(nc);
+            smp_b.ov = dalloc((size_t) kVerify * q36s::kMaxK);
+            smp_b.oi = dalloc_t<int32_t>((size_t) kVerify * q36s::kMaxK);
+            CK(cudaHostAlloc((void**) &h_pen, pen_cap * sizeof(PenEntry), cudaHostAllocDefault));
+            CK(cudaHostAlloc((void**) &h_rowoff, ((size_t) kVerify + 1) * sizeof(int32_t), cudaHostAllocDefault));
+            CK(cudaHostAlloc((void**) &h_topv, (size_t) kVerify * q36s::kMaxK * sizeof(float), cudaHostAllocDefault));
+            CK(cudaHostAlloc((void**) &h_topi, (size_t) kVerify * q36s::kMaxK * sizeof(int32_t), cudaHostAllocDefault));
+        }
         n_chunk = (ctx + kChunkCells - 1) / kChunkCells;
         // The split-K partials: att_rows query rows x every chunk of the context x 256 floats (0.54 GiB at 128K cells for 64 rows).  On
         // this device the split-K kernels only see decode rows and verify windows (<= kGemmT; a prompt chunk is GEMMs), so 8 rows
@@ -3544,8 +3562,13 @@ struct Engine {
     /// `cancel`: a stop asked for before the state moves keeps only x (the caller then emits no draft), so that a request
     /// stopped mid-answer leaves the state at the tokens it has shown: a conversation that continues from them (the server's
     /// hand-over of a stopped request to a batch slot) reuses it instead of reading them again.
+    /// `pw` / `rng`: a sampled request.  The drafts are the block's greedy picks, so the exact acceptance is one draw per row of the
+    /// verify window: row r is sampled from its own logits (the model's distribution after x, d1 .. dr: the rows compute what a
+    /// decode step computes), and draft d_{r+1} is kept when that draw is it, else the draw is the token after the kept ones.  Every
+    /// emitted token is a draw from the model's distribution, as without drafts; the text differs from the plain path at equal seed.
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
-                  const std::atomic<bool>* cancel = nullptr) {
+                  const std::atomic<bool>* cancel = nullptr, const strata::qwen35::PenaltyWindow* pw = nullptr,
+                  std::mt19937_64* rng = nullptr) {
         const int N = (int) m->g.n_embd;
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
@@ -3595,9 +3618,19 @@ struct Engine {
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
         int a = 0;
-        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+        if (pw != nullptr) {
+            const int k = host_sample ? 0 : topk_rows(*pw, drafts.data(), T);
+            for (int r = 0; r <= D; ++r) {
+                const int y = host_sample ? host_draw_row(r, *pw, drafts.data(), *rng) : draw_row(r, k, pw->settings(), *rng);
+                picks[r] = y;
+                if (r < D && y == drafts[(size_t) r]) { a = r + 1; continue; }
+                break;
+            }
+        } else {
+            while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+            for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        }
         if (cancel != nullptr && cancel->load()) a = 0;
-        for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
         commit(a + 1);
         CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         pos += a + 1;
@@ -3631,6 +3664,69 @@ struct Engine {
         reset();
         std::fprintf(stderr, "strata-q36: warmed up in %.1f s (one prompt chunk, a decode step%s)\n",
                      ms_since(t0) / 1000.0, mtp_d > 0 ? ", a speculative step" : "");
+    }
+
+    // ---- the sampler's device half (q36_sample.cuh).  A sampled request used to copy the whole logit row (248,320 floats) to the host
+    // and partially sort it there; now the penalties run on the card from a (token, count) list and only the top k candidates come
+    // back (sampling.hpp: PenaltyWindow keeps the list, sample_from_topk draws).  The same arithmetic and the same draws, so the same
+    // token, except where two logits are exactly equal (the card orders those by id, std::partial_sort as it likes).
+    // STRATA_Q36_HOST_SAMPLE=1: the old path (the A/B).
+    q36s::Bufs smp_b;
+    strata::qwen35::PenEntry* h_pen = nullptr;   // pinned: the base list, then the rows' deltas at n_vocab
+    int32_t* h_rowoff = nullptr;                 // pinned [kVerify + 1]
+    float* h_topv = nullptr;                     // pinned [rows][k]: the candidates, best first
+    int32_t* h_topi = nullptr;
+    size_t pen_cap = 0;
+    const bool host_sample = std::getenv("STRATA_Q36_HOST_SAMPLE") != nullptr;
+    /// The penalties and the top candidates of the first `rows` logits rows for the window `pw`: row r's history is the window's
+    /// then extra[0 .. r - 1] (a verify window's drafts).  The candidates land in h_topv / h_topi [row][k]; returns k.
+    int topk_rows(const strata::qwen35::PenaltyWindow& pw, const int32_t* extra, int rows) {
+        using strata::qwen35::PenEntry;
+        const strata::qwen35::Sampling& s = pw.settings();
+        const int k = s.candidates(), V = (int) m->g.n_vocab;
+        int nb = 0, off = 0;
+        if (s.penalises()) {
+            const std::vector<PenEntry>& base = pw.base();
+            nb = (int) base.size();
+            if (nb > 0) std::memcpy(h_pen, base.data(), (size_t) nb * sizeof(PenEntry));
+            std::vector<PenEntry> d;
+            for (int r = 0; r < rows; ++r) {
+                h_rowoff[r] = off;
+                pw.row_deltas(extra, r, d);
+                if ((int) d.size() > q36s::kMaxDelta) { std::fprintf(stderr, "strata-q36: %zu penalty deltas on a row\n", d.size()); std::exit(1); }
+                if (!d.empty()) std::memcpy(h_pen + V + off, d.data(), d.size() * sizeof(PenEntry));
+                off += (int) d.size();
+            }
+            h_rowoff[rows] = off;
+            if (nb > 0) CK(cudaMemcpyAsync(smp_b.base, h_pen, (size_t) nb * sizeof(PenEntry), cudaMemcpyHostToDevice, st));
+            if (off > 0) CK(cudaMemcpyAsync(smp_b.deltas, h_pen + V, (size_t) off * sizeof(PenEntry), cudaMemcpyHostToDevice, st));
+            CK(cudaMemcpyAsync(smp_b.row_off, h_rowoff, ((size_t) rows + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, st));
+        }
+        q36s::run(smp_b, logits, V, V, rows, k, nb, s.penalises(), s.repeat, s.freq, s.present, st);
+        CK(cudaMemcpyAsync(h_topv, smp_b.ov, (size_t) rows * k * sizeof(float), cudaMemcpyDeviceToHost, st));
+        CK(cudaMemcpyAsync(h_topi, smp_b.oi, (size_t) rows * k * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        return k;
+    }
+    /// The token drawn for row r of the last topk_rows (k its return value).
+    int draw_row(int r, int k, const strata::qwen35::Sampling& s, std::mt19937_64& rng) const {
+        return strata::qwen35::sample_from_topk(h_topv + (size_t) r * k, h_topi + (size_t) r * k, k, s, rng);
+    }
+    /// The reference path for row r: the whole row to the host, the penalties and the draw there (its history: the window's then
+    /// extra[0 .. r - 1]).
+    int host_draw_row(int r, const strata::qwen35::PenaltyWindow& pw, const int32_t* extra, std::mt19937_64& rng) {
+        std::vector<float> lg((size_t) m->g.n_vocab);
+        CK(cudaMemcpyAsync(lg.data(), logits + (size_t) r * m->g.n_vocab, lg.size() * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        std::vector<int32_t> h = pw.hist();
+        h.insert(h.end(), extra, extra + r);
+        return strata::qwen35::sample(lg, pw.settings(), h, rng);
+    }
+    /// The next token of a sampled request from the logits of the last step.
+    int sample_next(const strata::qwen35::PenaltyWindow& pw, std::mt19937_64& rng) {
+        if (host_sample) return host_draw_row(0, pw, nullptr, rng);
+        const int k = topk_rows(pw, nullptr, 1);
+        return draw_row(0, k, pw.settings(), rng);
     }
 
     int greedy() {
@@ -3894,35 +3990,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
 // ------------------------------------------------------------------------------------------------ sampling
 using strata::qwen35::Sampling;
 
-int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
-    strata::qwen35::apply_penalties(lg, s, hist);
-    if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
-    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
-    std::vector<int> idx(lg.size());
-    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
-    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
-    idx.resize((size_t) kk);
-    std::vector<double> p(idx.size());
-    const double mx = lg[(size_t) idx[0]];
-    double sum = 0;
-    for (size_t i = 0; i < idx.size(); ++i) sum += (p[i] = std::exp((lg[(size_t) idx[i]] - mx) / s.temperature));
-    size_t keep = idx.size();
-    double cum = 0;
-    for (size_t i = 0; i < idx.size(); ++i) {
-        if (p[i] / sum < s.min_p * (p[0] / sum)) { keep = i; break; }
-        cum += p[i] / sum;
-        if (cum >= s.top_p) { keep = i + 1; break; }
-    }
-    keep = std::max<size_t>(1, keep);
-    double tot = 0;
-    for (size_t i = 0; i < keep; ++i) tot += p[i];
-    std::uniform_real_distribution<double> u(0.0, tot);
-    double r = u(rng);
-    for (size_t i = 0; i < keep; ++i) {
-        if ((r -= p[i]) <= 0) return idx[i];
-    }
-    return idx[keep - 1];
-}
+using strata::qwen35::sample;   // the reference pick on a whole row (sampling.hpp); the decode path draws among the card's candidates
 
 std::vector<int32_t> parse_ids(const char* s) {
     std::vector<int32_t> v;
@@ -4556,12 +4624,14 @@ struct Serve {
         }
         std::mt19937_64 rng(smp.seed);
         std::vector<int32_t> hist = ids;
+        strata::qwen35::PenaltyWindow pw;   // the sampler's penalty window (the device half: E.sample_next / spec_step)
+        pw.reset(smp, ids, (int) E.m->g.n_vocab);
         const auto d0 = Clock::now();
         long long produced = 0, offered = 0, accepted = 0;
         const char* finish = "length";
-        // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
-        // text); sampled ones, and requests beside others, one token at a time
-        const bool spec = E.mtp_d > 0 && !smp.needs_logits() && !adm;
+        // a request alone with the MTP block: speculative steps of mtp_d drafts (verified: a greedy request's text is the greedy
+        // text, a sampled one's every token a draw from the model, see spec_step); requests beside others, one token at a time
+        const bool spec = E.mtp_d > 0 && !adm;
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
         int nx = smp.needs_logits() ? -1 : E.greedy();
@@ -4599,16 +4669,16 @@ struct Serve {
                          prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, cont ? "" : ", done at once");
             return;
         }
+        bool have_nx = !smp.needs_logits();   // nx is decided (greedy above, or a speculative step's last draw)
         for (;;) {
-            if (smp.needs_logits()) {
-                E.host_logits(lg);
-                nx = sample(lg, smp, hist, rng);
-            }
+            if (!have_nx) nx = E.sample_next(pw, rng);
+            have_nx = false;
             auto emit = [&](int t) {   // false: the answer ends here
                 std::printf("T %d\n", t);
                 std::fflush(stdout);
                 ++produced;
                 hist.push_back(t);
+                pw.push(t);
                 if (is_eos(t)) { finish = "stop"; return false; }
                 if (produced >= max_new) return false;
                 if (stop.load()) { finish = "cancel"; return false; }
@@ -4617,7 +4687,7 @@ struct Serve {
             if (!emit(nx)) break;
             if (n_active > 0) window();
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop);
+                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop, smp.needs_logits() ? &pw : nullptr, &rng);
                 offered += E.mtp_d;
                 accepted += a;
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
@@ -4632,6 +4702,7 @@ struct Serve {
                     if (!emit(drafts[(size_t) i])) ended = true;
                 if (ended) break;
                 nx = picks[a];
+                have_nx = true;
                 continue;
             }
             if (E.pos + 1 > E.ctx) break;
@@ -4639,7 +4710,7 @@ struct Serve {
             E.process(&one, 1, [](int64_t) {});
             ss.live.push_back(nx);
             fix.clear();
-            if (!smp.needs_logits()) nx = E.greedy();
+            if (!smp.needs_logits()) { nx = E.greedy(); have_nx = true; }
         }
         E.sess[(size_t) E.cur].pos = E.pos;
         const double decode_ms = ms_since(d0);
