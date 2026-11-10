@@ -732,6 +732,15 @@ class PromptEncoder:
             self.entries = [e for e in self.entries if e[2] != ids]
 
 
+def read_merges(folder) -> list[str]:
+    """The merge list of a pack's tokenizer/ folder: merges.json (Gemma 4: a JSON list of "first second") or merges.txt (a line each)."""
+    folder = pathlib.Path(folder)
+    mj = folder / "merges.json"
+    if mj.exists():
+        return json.loads(mj.read_text(encoding="utf-8"))
+    return (folder / "merges.txt").read_text(encoding="utf-8").split("\n")
+
+
 def from_pack(tokens: list[str], merges: list[str], token_types: list[int] | None, cfg: dict):
     """The tokenizer of a pack's tokenizer/ files (vocab.json, merges.txt, token_type.json read into lists; `cfg` the
     tokenizer.json): the byte-level one for model `gpt2` (the default), Gemma 4's for `gemma4`."""
@@ -763,8 +772,12 @@ def extract(gguf_path, out_dir) -> dict:
             "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
         }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
-    (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
-                                              sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8")
+    ordered = ["%s %s" % k for k, _ in sorted(tk.ranks.items(), key=lambda kv: kv[1])]
+    if isinstance(tk, Gemma4Tokenizer):
+        # Gemma's tokens hold raw newlines (465 of its merges do): a line-per-merge file cannot carry them, a JSON list can
+        (out / "merges.json").write_text(json.dumps(ordered, ensure_ascii=False), encoding="utf-8")
+    else:
+        (out / "merges.txt").write_text("\n".join(ordered), encoding="utf-8")
 
     (out / "token_type.json").write_text(json.dumps(tk.token_types), encoding="utf-8")
     (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")

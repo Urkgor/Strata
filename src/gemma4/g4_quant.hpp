@@ -8,21 +8,22 @@
 #pragma once
 
 #include "g4_compat.hpp"
+#include "g4_iq_tables.hpp"
 
 namespace g4 {
 
 // ggml_type ids (GGUF's tensor types)
 enum QType : int {
     T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q4_1 = 3, T_Q5_0 = 6, T_Q5_1 = 7, T_Q8_0 = 8, T_Q2_K = 10, T_Q3_K = 11, T_Q4_K = 12, T_Q5_K = 13,
-    T_Q6_K = 14, T_IQ4_NL = 20, T_IQ4_XS = 23, T_BF16 = 30,
+    T_Q6_K = 14, T_IQ2_XXS = 16, T_IQ2_XS = 17, T_IQ3_XXS = 18, T_IQ4_NL = 20, T_IQ3_S = 21, T_IQ2_S = 22, T_IQ4_XS = 23, T_BF16 = 30, T_MXFP4 = 39,
 };
 
 /// elements per block and bytes per block of a type, 0 when the engine's kernels do not read it
 G4_HD int block_elems(int t) {
     switch (t) {
         case T_F32: case T_F16: case T_BF16: return 32;     // (no blocks: 32 values form a unit)
-        case T_Q4_0: case T_Q4_1: case T_Q5_0: case T_Q5_1: case T_Q8_0: case T_IQ4_NL: return 32;
-        case T_Q2_K: case T_Q3_K: case T_Q4_K: case T_Q5_K: case T_Q6_K: case T_IQ4_XS: return 256;
+        case T_Q4_0: case T_Q4_1: case T_Q5_0: case T_Q5_1: case T_Q8_0: case T_IQ4_NL: case T_MXFP4: return 32;
+        case T_Q2_K: case T_Q3_K: case T_Q4_K: case T_Q5_K: case T_Q6_K: case T_IQ4_XS: case T_IQ2_XXS: case T_IQ2_XS: case T_IQ3_XXS: case T_IQ3_S: case T_IQ2_S: return 256;
         default: return 0;
     }
 }
@@ -41,6 +42,12 @@ G4_HD int block_bytes(int t) {
         case T_Q5_K: return 176;
         case T_Q6_K: return 210;
         case T_IQ4_XS: return 136;
+        case T_IQ2_XXS: return 66;
+        case T_IQ2_XS: return 74;
+        case T_IQ3_XXS: return 98;
+        case T_IQ3_S: return 110;
+        case T_IQ2_S: return 82;
+        case T_MXFP4: return 17;
         default: return 0;
     }
 }
@@ -52,6 +59,8 @@ inline const char* type_name(int t) {
         case T_F32: return "F32"; case T_F16: return "F16"; case T_BF16: return "BF16"; case T_Q4_0: return "Q4_0"; case T_Q4_1: return "Q4_1";
         case T_Q5_0: return "Q5_0"; case T_Q5_1: return "Q5_1"; case T_Q8_0: return "Q8_0"; case T_Q2_K: return "Q2_K"; case T_Q3_K: return "Q3_K";
         case T_Q4_K: return "Q4_K"; case T_Q5_K: return "Q5_K"; case T_Q6_K: return "Q6_K"; case T_IQ4_NL: return "IQ4_NL"; case T_IQ4_XS: return "IQ4_XS";
+        case T_IQ2_XXS: return "IQ2_XXS"; case T_IQ2_XS: return "IQ2_XS"; case T_IQ3_XXS: return "IQ3_XXS"; case T_IQ3_S: return "IQ3_S"; case T_IQ2_S: return "IQ2_S";
+        case T_MXFP4: return "MXFP4";
         default: return "?";
     }
 }
@@ -144,6 +153,63 @@ G4_HD void q3k_scales(const uint8_t* s, int* out) {
         out[4 + i]  = ((s[4 + i] & 0xF) | (((s[8 + i] >> 2) & 3) << 4)) - 32;
         out[8 + i]  = (((s[i] >> 4) & 0xF) | (((s[8 + i] >> 4) & 3) << 4)) - 32;
         out[12 + i] = (((s[4 + i] >> 4) & 0xF) | (((s[8 + i] >> 6) & 3) << 4)) - 32;
+    }
+}
+
+G4_HD uint32_t rd32(const uint8_t* p) { return (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24); }
+/// MXFP4's shared scale: ggml's GGML_E8M0_TO_FP32_HALF (the 4-bit values are stored doubled)
+G4_HD float e8m0_half(int e) {
+    const uint32_t u = e < 2 ? (0x00200000u << e) : ((uint32_t) (e - 1) << 23);
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+G4_HD int byte_of(unsigned long long g, int j) { return (int) ((g >> (8 * j)) & 0xffull); }
+
+/// The code-book formats (IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S) and MXFP4: element `l` of unit u, as ggml's dequantize_row_* gives it.
+template <int T>
+G4_HD float dequant_elem_cb(const uint8_t* row, long long u, int l) {
+    if constexpr (T == T_MXFP4) {
+        const uint8_t* p = row + u * 17;
+        const int q = p[1 + (l & 15)];
+        return (float) kvalues_fp4(l < 16 ? (q & 0xF) : (q >> 4)) * e8m0_half(p[0]);
+    } else if constexpr (T == T_IQ2_XXS) {
+        const uint8_t* p = row + (u >> 3) * 66;
+        const int ib = (int) (u & 7), g = l >> 3, j = l & 7;
+        const uint32_t a1 = rd32(p + 2 + 8 * ib + 4);
+        const float db = rdh(p) * (0.5f + (float) (a1 >> 28)) * 0.25f;
+        const int signs = ksigns_iq2xs((int) ((a1 >> (7 * g)) & 127));
+        return db * (float) byte_of(iq2xxs_grid(p[2 + 8 * ib + g]), j) * ((signs >> j) & 1 ? -1.f : 1.f);
+    } else if constexpr (T == T_IQ2_XS) {
+        const uint8_t* p = row + (u >> 3) * 74;
+        const int ib = (int) (u & 7), g = l >> 3, j = l & 7;
+        const int qv = rd16(p + 2 + 2 * (4 * ib + g));
+        const float db = rdh(p) * (0.5f + (float) ((p[66 + ib] >> (4 * (g >> 1))) & 0xf)) * 0.25f;
+        const int signs = ksigns_iq2xs(qv >> 9);
+        return db * (float) byte_of(iq2xs_grid(qv & 511), j) * ((signs >> j) & 1 ? -1.f : 1.f);
+    } else if constexpr (T == T_IQ2_S) {
+        const uint8_t* p = row + (u >> 3) * 82;
+        const int ib = (int) (u & 7), g = l >> 3, j = l & 7;
+        const int gi = p[2 + 4 * ib + g] | ((p[66 + ib] << (8 - 2 * g)) & 0x300);
+        const float dl = rdh(p) * (0.5f + (float) ((p[74 + ib] >> (4 * (g >> 1))) & 0xf)) * 0.25f;
+        const int signs = p[34 + 4 * ib + g];
+        return dl * (float) byte_of(iq2s_grid(gi), j) * ((signs >> j) & 1 ? -1.f : 1.f);
+    } else if constexpr (T == T_IQ3_XXS) {
+        const uint8_t* p = row + (u >> 3) * 98;
+        const int ib = (int) (u & 7), g = l >> 3, j = l & 7;
+        const uint32_t a = rd32(p + 66 + 4 * ib);
+        const float db = rdh(p) * (0.5f + (float) (a >> 28)) * 0.5f;
+        const int signs = ksigns_iq2xs((int) ((a >> (7 * g)) & 127));
+        const uint32_t grid = iq3xxs_grid(p[2 + 8 * ib + 2 * g + (j >> 2)]);
+        return db * (float) ((grid >> (8 * (j & 3))) & 0xff) * ((signs >> j) & 1 ? -1.f : 1.f);
+    } else {   // T_IQ3_S
+        const uint8_t* p = row + (u >> 3) * 110;
+        const int s = (int) (u & 7), g = l >> 3, j = l & 7;
+        const float db = rdh(p) * (float) (1 + 2 * ((p[106 + (s >> 1)] >> (4 * (s & 1))) & 0xf));
+        const int qh = p[66 + s];
+        const int gi = p[2 + 8 * s + 2 * g + (j >> 2)] | ((qh << ((j >> 2) ? 7 - 2 * g : 8 - 2 * g)) & 256);
+        const int signs = p[74 + 4 * s + g];
+        return db * (float) ((iq3s_grid(gi) >> (8 * (j & 3))) & 0xff) * ((signs >> j) & 1 ? -1.f : 1.f);
     }
 }
 
@@ -270,6 +336,8 @@ G4_HD void dequant32(const uint8_t* row, long long u, float* out) {
             out[j] = dl * (float) kv_iq4nl(qs[j] & 0xf);
             out[j + 16] = dl * (float) kv_iq4nl(qs[j] >> 4);
         }
+    } else if constexpr (T == T_MXFP4 || T == T_IQ2_XXS || T == T_IQ2_XS || T == T_IQ2_S || T == T_IQ3_XXS || T == T_IQ3_S) {
+        for (int j = 0; j < 32; ++j) out[j] = dequant_elem_cb<T>(row, u, j);
     } else {
         for (int j = 0; j < 32; ++j) out[j] = 0.f;
     }
@@ -359,6 +427,8 @@ G4_HD float dequant_elem(const uint8_t* row, long long u, int l) {
         const int ls = ((p[4 + (ib >> 1)] >> (4 * (ib & 1))) & 0xf) | (((rd16(p + 2) >> (2 * ib)) & 3) << 4);
         const int b = p[8 + 16 * ib + (l & 15)];
         return rdh(p) * (float) (ls - 32) * (float) kv_iq4nl(l < 16 ? (b & 0xf) : (b >> 4));
+    } else if constexpr (T == T_MXFP4 || T == T_IQ2_XXS || T == T_IQ2_XS || T == T_IQ2_S || T == T_IQ3_XXS || T == T_IQ3_S) {
+        return dequant_elem_cb<T>(row, u, l);
     } else {
         return 0.f;
     }
@@ -382,6 +452,12 @@ G4_HD void dequant32_t(int t, const uint8_t* row, long long u, float* out) {
         case T_Q6_K: dequant32<T_Q6_K>(row, u, out); break;
         case T_IQ4_NL: dequant32<T_IQ4_NL>(row, u, out); break;
         case T_IQ4_XS: dequant32<T_IQ4_XS>(row, u, out); break;
+        case T_IQ2_XXS: dequant32<T_IQ2_XXS>(row, u, out); break;
+        case T_IQ2_XS: dequant32<T_IQ2_XS>(row, u, out); break;
+        case T_IQ2_S: dequant32<T_IQ2_S>(row, u, out); break;
+        case T_IQ3_XXS: dequant32<T_IQ3_XXS>(row, u, out); break;
+        case T_IQ3_S: dequant32<T_IQ3_S>(row, u, out); break;
+        case T_MXFP4: dequant32<T_MXFP4>(row, u, out); break;
         default: for (int j = 0; j < 32; ++j) out[j] = 0.f;
     }
 }

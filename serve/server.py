@@ -4118,7 +4118,8 @@ class Service:
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = end_token_ids(tokenizer)
-        self.family = None                              # the model family ("deepseek41"): set_family() below
+        self.family = None                              # the model family ("deepseek41", "gemma4"): set_family() below
+        self.thinking_default = True                    # a request that says nothing about thinking: Qwen and DeepSeek think, Gemma 4 does not
         self.parser_cls = OutputParser                  # reads the model's output (reasoning, content, tool calls)
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
@@ -4142,6 +4143,15 @@ class Service:
             self.stop_ids = {int(eos)}
             self.parser_cls = dsml.DsmlOutputParser
             self._force_text = dsml.to_dsml_force
+        if family == "gemma4":
+            from serve import gemma4
+            self.stop_ids = set(gemma4.STOP_IDS)
+            self.parser_cls = gemma4.Gemma4OutputParser
+            self._force_text = gemma4.to_gemma_force
+            self.thinking_default = False                # the template's `enable_thinking | default(false)`
+            self.template.defaults.update(gemma4.TEMPLATE_VARS)
+            self.template.wrap_tools = True
+            self.template.caps.update(gemma4.detect_caps(self.template))
         import serve.frontend as _frontend
         _frontend.use_family(family)
 
@@ -5051,7 +5061,7 @@ class Service:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
-        if force and kwargs.get("enable_thinking", True) is False:
+        if force and kwargs.get("enable_thinking", self.thinking_default) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
         self.embeddings.keys = None
@@ -5161,7 +5171,7 @@ class Service:
                 req["strata_prefix"] = {"messages": lead}
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images) or ds_pics)
-        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+        return ids, kwargs.get("enable_thinking", self.thinking_default) is not False, max_new
 
     @staticmethod
     def deepseek_shared_start(messages) -> int:
@@ -8657,7 +8667,7 @@ def check_request_sampling(req) -> None:
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
 FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b",
-                      "deepseek41": "deepseek-v4.1-flash"}
+                      "deepseek41": "deepseek-v4.1-flash", "gemma4": "gemma-4-26b-a4b"}
 
 
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
@@ -8672,6 +8682,8 @@ MODEL_CARD_SAMPLING = {
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
     # DeepSeek-V4.1-Flash: temperature 1.0, top_p 1.0 for local use (thinking or not), no penalties
     "deepseek41": {"thinking": {"temperature": 1.0, "top_p": 1.0}, "instruct": {"temperature": 1.0, "top_p": 1.0}},
+    # Gemma 4: the GGUF's own general.sampling (temperature 1.0, top_p 0.95, top_k 64), thinking or not
+    "gemma4": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 64}, "instruct": {"temperature": 1.0, "top_p": 0.95, "top_k": 64}},
 }
 
 
@@ -8688,6 +8700,8 @@ def arch_from_tokenizer(arch, pre) -> str | None:
     and no DSML tool calls.  The pack's tokenizer says what it is (its pre-tokenizer is "deepseek3"); an arch the config names is never changed."""
     if arch:
         return arch
+    if str(pre or "") == "gemma4":
+        return "gemma4"
     return "deepseek41" if str(pre or "").startswith("deepseek") else None
 
 
@@ -8960,7 +8974,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         tokens = [None] * len(vocab)
         for t, i in vocab.items():
             tokens[i] = t
-        merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
+        merges = ST.read_merges(tpath)
         types = json.loads((tpath / "token_type.json").read_text())
         try:                                            # the pack's pre-tokenizer name and special ids (DeepSeek's differ)
             tcfg = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8"))
@@ -8969,8 +8983,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         tok = ST.from_pack(tokens, merges, types, tcfg)
     if a.engine == "strata" and not cfg.get("arch") and arch_from_tokenizer(None, tcfg.get("pre")):
         cfg["arch"] = arch_from_tokenizer(None, tcfg.get("pre"))
-        print(f"[strata] the config names no \"arch\" and this tokenizer is DeepSeek's: serving it as {cfg['arch']} (its end token, DSML tool "
-              f"calls and effort words); add \"arch\": \"{cfg['arch']}\" to the config to say it outright", flush=True)
+        print(f"[strata] the config names no \"arch\" and this tokenizer is {cfg['arch']}'s: serving it as {cfg['arch']} (its end tokens, tool "
+              f"calls and thinking); add \"arch\": \"{cfg['arch']}\" to the config to say it outright", flush=True)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.offline and (hub is not None or cfg.get("before_load") or a.before_load):
         ap.error("--offline requires MCP servers and before_load commands to be disabled in this profile")
@@ -9113,7 +9127,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(svc.model_arch if svc.model_arch == "deepseek41" else None)
+        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "gemma4") else None)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])

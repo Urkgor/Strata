@@ -49,6 +49,8 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
+        self.defaults: dict = {}             # variables a family's template reads that a request never sets (Gemma 4: bos_token, eos_token)
+        self.wrap_tools = False              # the template reads OpenAI's {"type": "function", "function": {...}} tools (Gemma 4), not the bare declarations
         self.caps = self._detect_caps()
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
@@ -59,8 +61,10 @@ class ChatTemplate:
                     if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                       and not _text_of(m.get("content")).strip()
                                                       and not _has_image(m.get("content")) and not m.get("tool_calls"))]
+        if self.wrap_tools and tools:
+            tools = [t if t.get("type") == "function" and "function" in t else {"type": "function", "function": t} for t in tools]
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
-                                    **kwargs)
+                                    **{**self.defaults, **kwargs})
 
     def _detect_caps(self) -> dict[str, bool]:
         """llama.cpp's capability names, checked at load time against this template and Strata's tool-call format.
@@ -138,14 +142,16 @@ EFFORT_DEEPSEEK = {"none": None, "off": None, "minimal": None, "disabled": None,
                    "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
 _EFFORT_QWEN = dict(EFFORT)
 _NUMERIC_EFFORT = False
+_THINKING_SWITCH = False         # Gemma 4: its template only knows enable_thinking (any effort above "none" is thinking on)
 
 
 def use_family(family: str | None) -> None:
     """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER)."""
-    global _NUMERIC_EFFORT
+    global _NUMERIC_EFFORT, _THINKING_SWITCH
     EFFORT.clear()
     EFFORT.update(EFFORT_DEEPSEEK if family == "deepseek41" else _EFFORT_QWEN)
     _NUMERIC_EFFORT = family == "deepseek41"
+    _THINKING_SWITCH = family == "gemma4"
 
 
 def effort_kwargs(value) -> dict:
@@ -163,6 +169,8 @@ def effort_kwargs(value) -> dict:
         raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high"
                          + (", max or 1..100" if _NUMERIC_EFFORT else ""))
     level = EFFORT[key]
+    if _THINKING_SWITCH:
+        return {"enable_thinking": level is not None}
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
 
 
@@ -172,6 +180,8 @@ def budget_effort(tokens) -> dict:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
+    if _THINKING_SWITCH:
+        return {"enable_thinking": True}
     return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else EFFORT["high"]}
 
 
@@ -610,6 +620,8 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     for k, v in (req.get("chat_template_kwargs") or {}).items():
         if k == "enable_thinking" and not v:
             kwargs = {"enable_thinking": False}
+        elif k == "enable_thinking" and _THINKING_SWITCH:         # (Gemma 4 thinks only when asked)
+            kwargs = {"enable_thinking": True}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs

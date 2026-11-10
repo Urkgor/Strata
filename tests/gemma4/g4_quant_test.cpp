@@ -15,7 +15,8 @@ static int fails = 0;
 int main() {
     std::mt19937 rng(5);
     const int types[] = {g4::T_F32, g4::T_F16, g4::T_BF16, g4::T_Q4_0, g4::T_Q4_1, g4::T_Q5_0, g4::T_Q5_1, g4::T_Q8_0, g4::T_Q2_K,
-                         g4::T_Q3_K, g4::T_Q4_K, g4::T_Q5_K, g4::T_Q6_K, g4::T_IQ4_NL, g4::T_IQ4_XS};
+                         g4::T_Q3_K, g4::T_Q4_K, g4::T_Q5_K, g4::T_Q6_K, g4::T_IQ4_NL, g4::T_IQ4_XS, g4::T_IQ2_XXS, g4::T_IQ2_XS, g4::T_IQ2_S, g4::T_IQ3_XXS,
+                         g4::T_IQ3_S, g4::T_MXFP4};
     for (int t : types) {
         const int be = g4::block_elems(t), bb = g4::block_bytes(t);
         const ggml_type_traits* tr = ggml_get_type_traits((ggml_type) t);
@@ -39,6 +40,8 @@ int main() {
                 const size_t o = (size_t) b * (size_t) bb;
                 switch (t) {
                     case g4::T_Q4_0: case g4::T_Q5_0: case g4::T_Q8_0: case g4::T_IQ4_NL: case g4::T_IQ4_XS: patch_half(o); break;
+                    case g4::T_IQ2_XXS: case g4::T_IQ2_XS: case g4::T_IQ2_S: case g4::T_IQ3_XXS: case g4::T_IQ3_S: patch_half(o); break;
+                    case g4::T_MXFP4: row[o] = (uint8_t) (100 + (rng() % 40)); break;       // the shared exponent: a finite scale
                     case g4::T_Q4_1: case g4::T_Q5_1: patch_half(o); patch_half(o + 2); break;
                     case g4::T_Q4_K: case g4::T_Q5_K: patch_half(o); patch_half(o + 2); break;
                     case g4::T_Q2_K: patch_half(o + 80); patch_half(o + 82); break;
@@ -66,7 +69,8 @@ int main() {
                     switch (t) {
 #define CASE(T) case g4::T: e = g4::dequant_elem<g4::T>(row.data(), uu, l); break;
                         CASE(T_F32) CASE(T_F16) CASE(T_BF16) CASE(T_Q4_0) CASE(T_Q4_1) CASE(T_Q5_0) CASE(T_Q5_1) CASE(T_Q8_0) CASE(T_Q2_K) CASE(T_Q3_K)
-                        CASE(T_Q4_K) CASE(T_Q5_K) CASE(T_Q6_K) CASE(T_IQ4_NL) CASE(T_IQ4_XS)
+                        CASE(T_Q4_K) CASE(T_Q5_K) CASE(T_Q6_K) CASE(T_IQ4_NL) CASE(T_IQ4_XS) CASE(T_IQ2_XXS) CASE(T_IQ2_XS) CASE(T_IQ2_S) CASE(T_IQ3_XXS)
+                        CASE(T_IQ3_S) CASE(T_MXFP4)
 #undef CASE
                         default: break;
                     }

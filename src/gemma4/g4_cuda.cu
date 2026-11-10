@@ -51,6 +51,12 @@ void with_type(int t, F&& f) {
         case g4::T_Q6_K: f(std::integral_constant<int, g4::T_Q6_K>{}); break;
         case g4::T_IQ4_NL: f(std::integral_constant<int, g4::T_IQ4_NL>{}); break;
         case g4::T_IQ4_XS: f(std::integral_constant<int, g4::T_IQ4_XS>{}); break;
+        case g4::T_IQ2_XXS: f(std::integral_constant<int, g4::T_IQ2_XXS>{}); break;
+        case g4::T_IQ2_XS: f(std::integral_constant<int, g4::T_IQ2_XS>{}); break;
+        case g4::T_IQ2_S: f(std::integral_constant<int, g4::T_IQ2_S>{}); break;
+        case g4::T_IQ3_XXS: f(std::integral_constant<int, g4::T_IQ3_XXS>{}); break;
+        case g4::T_IQ3_S: f(std::integral_constant<int, g4::T_IQ3_S>{}); break;
+        case g4::T_MXFP4: f(std::integral_constant<int, g4::T_MXFP4>{}); break;
         default: std::fprintf(stderr, "strata-gemma4: no kernel for the type %d\n", t); std::exit(1);
     }
 }

@@ -142,7 +142,7 @@ inline std::string bind_tensors(Model& m) {
         const strata::TensorInfo* t = find(n);
         if (!t) return required ? "missing tensor " + n : "";
         if (g4::block_elems((int) t->type) == 0)
-            return "tensor " + n + " is " + t->type_name() + ", a type the Gemma 4 engine does not read (supported: F32 F16 BF16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K Q3_K Q4_K Q5_K Q6_K IQ4_NL IQ4_XS)";
+            return "tensor " + n + " is " + t->type_name() + ", a type the Gemma 4 engine does not read (supported: F32 F16 BF16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K Q3_K Q4_K Q5_K Q6_K IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_NL IQ4_XS MXFP4; not IQ1_S, IQ1_M, TQ1_0, TQ2_0)";
         const size_t nd = t->shape.size();
         if (nd > 3 || (long long) t->shape[0] != n_in || (nd > 1 ? (long long) t->shape[1] : 1) != n_out || (nd > 2 ? (long long) t->shape[2] : 1) != n_exp)
             return "tensor " + n + " has another shape than [" + std::to_string(n_in) + ", " + std::to_string(n_out) + (n_exp > 1 ? ", " + std::to_string(n_exp) : "") + "]";

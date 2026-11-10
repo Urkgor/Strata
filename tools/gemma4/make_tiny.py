@@ -81,6 +81,7 @@ def main():
     ap.add_argument("--quantize")
     ap.add_argument("--out-q")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--iq", action="store_true", help="--quantize with the code-book types (IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS) where a row is a multiple of 256")
     ap.add_argument("--vocab", type=int, help="keep only the first N tokens and no merges: a small model for the engine's emulation tests (llama.cpp cannot load it)")
     ap.add_argument("--gguf-py")
     a = ap.parse_args()
@@ -203,12 +204,37 @@ def main():
             2: dict(attn_q="q4_k", attn_k="q8_0", attn_output="q5_k", ffn_gate="q4_1", ffn_up="q6_k", ffn_down="q4_0"),
             3: dict(attn_q="q5_0", attn_k="q5_1", attn_v="q6_k", attn_output="q8_0", ffn_gate="q4_k", ffn_up="q5_1", ffn_down="q8_0"),
         }
-        args = [a.quantize, "--allow-requantize"] if False else [a.quantize]
+        if a.iq:     # the rows that are a multiple of 256 take the IQ types; the others (ffn_down: 192, experts' down: 64) what they can
+            mixes = {
+                0: dict(attn_q="iq2_xs", attn_k="iq2_s", attn_v="iq3_xxs", attn_output="q8_0", ffn_gate="iq3_s", ffn_up="iq4_xs", ffn_down="q8_0"),
+                1: dict(attn_q="iq4_nl", attn_k="iq3_s", attn_v="iq2_xs", attn_output="q8_0", ffn_gate="iq2_s", ffn_up="iq3_xxs", ffn_down="q8_0"),
+                2: dict(attn_q="iq3_xxs", attn_k="iq4_xs", attn_output="iq3_s", ffn_gate="iq4_nl", ffn_up="iq2_xs", ffn_down="q8_0"),
+                3: dict(attn_q="iq3_s", attn_k="iq2_s", attn_v="iq4_nl", attn_output="q8_0", ffn_gate="iq3_xxs", ffn_up="iq3_s", ffn_down="q8_0"),
+            }
+        args = [a.quantize]
+        if a.iq:     # the IQ2 / IQ3 types need an importance matrix: a flat one (every weight equally important), in llama.cpp's legacy .dat format
+            import struct
+            ents = []
+            for il in range(c["n_layer"]):
+                swa = c["pattern"][il]
+                for nm, n_in, n_exp in (("attn_q", E, 1), ("attn_k", E, 1), ("attn_v", E, 1), ("attn_output", c["n_head"] * (c["hd_swa"] if swa else c["hd_full"]), 1),
+                                        ("ffn_gate", E, 1), ("ffn_up", E, 1), ("ffn_down", c["n_ff"], 1), ("ffn_gate_up_exps", E, c["n_expert"]),
+                                        ("ffn_down_exps", c["n_ff_exp"], c["n_expert"])):
+                    if nm == "attn_v" and not swa:
+                        continue
+                    ents.append(("blk.%d.%s.weight" % (il, nm), n_in * n_exp))
+            with open(a.out_q + ".imatrix.dat", "wb") as f:
+                f.write(struct.pack("<i", len(ents)))
+                for nm, n in ents:
+                    b = nm.encode()
+                    f.write(struct.pack("<i", len(b)) + b + struct.pack("<ii", 1, n) + np.ones(n, dtype="<f4").tobytes())
+                f.write(struct.pack("<i", 1) + struct.pack("<i", 4) + b"none")
+            args += ["--imatrix", a.out_q + ".imatrix.dat"]
         for il, m in mixes.items():
             for t, ty in m.items():
                 args += ["--tensor-type", "blk\\.%d\\.%s\\.weight=%s" % (il, t, ty)]
         for il in range(c["n_layer"]):
-            args += ["--tensor-type", "blk\\.%d\\.ffn_gate_up_exps\\.weight=q4_k" % il,
+            args += ["--tensor-type", "blk\\.%d\\.ffn_gate_up_exps\\.weight=%s" % (il, ("iq3_s", "iq3_xxs", "iq2_s", "iq2_xs", "iq4_xs", "iq4_nl")[il % 6] if a.iq else "q4_k"),
                      "--tensor-type", "blk\\.%d\\.ffn_down_exps\\.weight=%s" % (il, "q8_0" if il == c["n_layer"] - 1 else "q5_1")]
         args += [a.out, a.out_q, "q8_0"]
         print(" ".join(args[:6]), "...")
