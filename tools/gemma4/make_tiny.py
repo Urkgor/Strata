@@ -81,6 +81,7 @@ def main():
     ap.add_argument("--quantize")
     ap.add_argument("--out-q")
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--vocab", type=int, help="keep only the first N tokens and no merges: a small model for the engine's emulation tests (llama.cpp cannot load it)")
     ap.add_argument("--gguf-py")
     a = ap.parse_args()
     if a.gguf_py:
@@ -92,6 +93,11 @@ def main():
         ap.error("--tokenizer-from and --out are required")
     c = CFG
     tk = read_tokenizer(a.tokenizer_from)
+    if a.vocab:
+        tk["tokenizer.ggml.tokens"] = tk["tokenizer.ggml.tokens"][:a.vocab]
+        tk["tokenizer.ggml.scores"] = tk["tokenizer.ggml.scores"][:a.vocab]
+        tk["tokenizer.ggml.token_type"] = tk["tokenizer.ggml.token_type"][:a.vocab]
+        tk["tokenizer.ggml.merges"] = []
     n_vocab = len(tk["tokenizer.ggml.tokens"])
     rng = np.random.default_rng(a.seed)
     w = gguf.GGUFWriter(a.out, "gemma4")
@@ -124,7 +130,8 @@ def main():
     w.add_token_list(tk["tokenizer.ggml.tokens"])
     w.add_token_scores(tk["tokenizer.ggml.scores"].tolist())
     w.add_token_types(tk["tokenizer.ggml.token_type"].tolist())
-    w.add_token_merges(tk["tokenizer.ggml.merges"])
+    if tk["tokenizer.ggml.merges"]:
+        w.add_token_merges(tk["tokenizer.ggml.merges"])
     for key, fn in (("bos", w.add_bos_token_id), ("eos", w.add_eos_token_id), ("unknown", w.add_unk_token_id), ("padding", w.add_pad_token_id),
                     ("mask", w.add_mask_token_id)):
         v = tk.get("tokenizer.ggml.%s_token_id" % key)

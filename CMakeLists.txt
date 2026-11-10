@@ -925,6 +925,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_QWEN35=1)
   endif()
 
+  # Gemma 4 (26B-A4B): its own engine, src/gemma4 - CUDA kernels that read the GGUF's quantized blocks, a CPU reference, the server's line
+  # protocol.  It shares no library with the other engines: only the CUDA runtime.  docs/GEMMA4.md.
+  if(STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP)
+    add_executable(strata-gemma4 src/gemma4/g4_main.cpp src/gemma4/g4_cuda.cu)
+    target_include_directories(strata-gemma4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
+                               ${_strata_gpu_include_directories})
+    target_compile_definitions(strata-gemma4 PRIVATE STRATA_G4_CUDA=1)
+    target_link_libraries(strata-gemma4 PRIVATE strata_warnings ${_strata_gpu_runtime_target})
+    strata_utf8_manifest(strata-gemma4)
+  endif()
+
   # DeepSeek-V4.1-Flash: the third engine path (src/dsv41, from Project Maya's maya-ds4, MIT, third_party/project-maya).
   # Its own executable for now (strata-dsv41); a family switch in `strata` comes after first light.  OFF by default: it
   # changes no existing target (the vendored kernels live in strata::dsv41k, so no symbol is shared with strata_kernels).
@@ -2847,6 +2858,26 @@ if(STRATA_BUILD_DSV41 AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND N
     target_link_libraries(ds4_gg_bench PRIVATE strata_kernels_cpu Threads::Threads)
     target_compile_definitions(ds4_gg_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
   endif()
+endif()
+
+# ---- Gemma 4 engine: CPU tests (tests/gemma4, tools/gemma4/README.md).  The quantization test compares src/gemma4/g4_quant.hpp with ggml's own
+# dequantization and needs the ggml target (STRATA_NATIVE_EXPERTS); the emulation test runs src/gemma4/g4_cuda.cu as plain C++ on the CPU emulation of CUDA
+# (src/gemma4/g4_emu.hpp) against the CPU reference on a tiny model GGUF: give its path with -DSTRATA_G4_TINY_GGUF=... (tools/gemma4/make_tiny.py --vocab 512).
+if(TARGET ggml)
+  add_executable(g4_quant_test tests/gemma4/g4_quant_test.cpp)
+  target_include_directories(g4_quant_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4)
+  target_link_libraries(g4_quant_test PRIVATE ggml)
+  add_test(NAME g4_quant_test COMMAND g4_quant_test)
+endif()
+set(STRATA_G4_TINY_GGUF "" CACHE FILEPATH "a tiny random Gemma 4 GGUF for the emulation test (tools/gemma4/make_tiny.py --vocab 512)")
+if(STRATA_G4_TINY_GGUF AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4/g4_cuda.cu ${CMAKE_CURRENT_BINARY_DIR}/gemma4_emu/g4_cuda_emu.cpp COPYONLY)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4/g4_cuda.cu)
+  add_executable(g4_emu_test tests/gemma4/g4_emu_test.cpp ${CMAKE_CURRENT_BINARY_DIR}/gemma4_emu/g4_cuda_emu.cpp)
+  target_include_directories(g4_emu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4 ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_definitions(g4_emu_test PRIVATE STRATA_G4_EMU=1)
+  target_link_libraries(g4_emu_test PRIVATE Threads::Threads)
+  add_test(NAME g4_emu_test COMMAND g4_emu_test ${STRATA_G4_TINY_GGUF} quick)
 endif()
 
 # ---- STRATA_Q36_ONLY: compile only what strata-q36 links --------------------------------------------------------------------

@@ -88,10 +88,6 @@ int main(int argc, char** argv) {
         else extra.push_back(a);      // (the server's other engine flags: --prefill, --kv, --mtp ...: this engine has no such thing; ignored below)
     }
     if (model.empty()) { usage(); return 2; }
-    for (size_t i = 0; i < extra.size(); ++i) {
-        // a flag with a value the engine does not know: said once, the value skipped
-        std::fprintf(stderr, "strata-gemma4: ignoring %s\n", extra[i].c_str());
-    }
     g4::Model m;
     const std::string err = g4::load_model(model, m);
     if (!err.empty()) { std::fprintf(stderr, "strata-gemma4: %s\n", err.c_str()); return 1; }
@@ -104,10 +100,15 @@ int main(int argc, char** argv) {
     ro.threads = std::max(1u, std::thread::hardware_concurrency());
     if (!cpu) {
 #ifdef STRATA_G4_CUDA
-        return g4cuda::run(m, ctx, serve, tokens, n_gen, dump, gpus, eos);
+        return g4cuda::run(m, ctx, serve, tokens, n_gen, dump, gpus, eos, extra);
 #else
         std::fprintf(stderr, "strata-gemma4: this build has no CUDA engine: running the CPU reference (slow)\n");
 #endif
+    }
+    if (!extra.empty()) {
+        std::string s;
+        for (const auto& e : extra) s += " " + e;
+        std::fprintf(stderr, "strata-gemma4: the CPU reference ignores:%s\n", s.c_str());
     }
     CpuEngine eng(m, ctx, ro);
     if (serve) {

@@ -28,28 +28,7 @@
 namespace g4 {
 
 namespace refmath {
-inline uint16_t float_to_half(float f) {      // round to nearest even
-    uint32_t u;
-    std::memcpy(&u, &f, 4);
-    const uint16_t s = (uint16_t) ((u >> 16) & 0x8000u);
-    const int e = (int) ((u >> 23) & 0xff) - 127 + 15;
-    uint32_t m = u & 0x7fffffu;
-    if (((u >> 23) & 0xff) == 0xff) return (uint16_t) (s | 0x7c00u | (m ? 0x200u : 0u));
-    if (e >= 31) return (uint16_t) (s | 0x7c00u);
-    if (e <= 0) {
-        if (e < -10) return s;
-        m |= 0x800000u;
-        const int sh = 14 - e;
-        uint32_t r = m >> sh;
-        const uint32_t rem = m & ((1u << sh) - 1), half = 1u << (sh - 1);
-        if (rem > half || (rem == half && (r & 1))) ++r;
-        return (uint16_t) (s | r);
-    }
-    uint32_t r = ((uint32_t) e << 10) | (m >> 13);
-    const uint32_t rem = m & 0x1fffu;
-    if (rem > 0x1000u || (rem == 0x1000u && (r & 1))) ++r;
-    return (uint16_t) (s | r);
-}
+using g4::float_to_half;
 inline float gelu_exact(float x) {            // the tanh form (gelu_pytorch_tanh), as ggml_gelu_f32
     const float coef = 0.044715f, sqrt_2_over_pi = 0.79788456080286535588f;
     return 0.5f * x * (1.0f + tanhf(sqrt_2_over_pi * x * (1.0f + coef * x * x)));

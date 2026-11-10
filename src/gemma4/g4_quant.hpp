@@ -83,6 +83,33 @@ G4_HD float half_to_float(uint16_t h) {
     return f;
 #endif
 }
+/// float to IEEE half, round to nearest even (the K / V cache's format); the device's own instruction on the GPU
+G4_HD uint16_t float_to_half(float f) {
+#if defined(__CUDA_ARCH__)
+    return __half_as_ushort(__float2half_rn(f));
+#else
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    const uint16_t s = (uint16_t) ((u >> 16) & 0x8000u);
+    const int e = (int) ((u >> 23) & 0xff) - 127 + 15;
+    uint32_t m = u & 0x7fffffu;
+    if (((u >> 23) & 0xff) == 0xff) return (uint16_t) (s | 0x7c00u | (m ? 0x200u : 0u));
+    if (e >= 31) return (uint16_t) (s | 0x7c00u);
+    if (e <= 0) {
+        if (e < -10) return s;
+        m |= 0x800000u;
+        const int sh = 14 - e;
+        uint32_t r = m >> sh;
+        const uint32_t rem = m & ((1u << sh) - 1), half = 1u << (sh - 1);
+        if (rem > half || (rem == half && (r & 1))) ++r;
+        return (uint16_t) (s | r);
+    }
+    uint32_t r = ((uint32_t) e << 10) | (m >> 13);
+    const uint32_t rem = m & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (r & 1))) ++r;
+    return (uint16_t) (s | r);
+#endif
+}
 G4_HD float bf16_to_float(uint16_t b) {
     const uint32_t u = (uint32_t) b << 16;
     float f;
