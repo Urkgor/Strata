@@ -1036,6 +1036,7 @@ float* upload_f32(const strata::TensorInfo& t, const uint8_t* src) {
     return d;
 }
 
+bool g_embd_host = false;   // --embd-host (set before load)
 bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     const auto t0 = Clock::now();
     m.file = std::make_shared<strata::GgufModel>(strata::GgufModel::open(path));
@@ -1183,10 +1184,25 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         m.embd_row = row_bytes(m.embd_type, (int64_t) t->shape[0]);
         const uint64_t nb = strata::tensor_payload_bytes(*t);
         uint8_t* d = nullptr;
-        CK(cudaMalloc(&d, nb));
-        CK(cudaMemcpy(d, gm.shard(s).tensor_data(*t), nb, cudaMemcpyHostToDevice));
+        if (g_embd_host) {   // --embd-host: the table in pinned host memory the card reads through (a token's row is 1 to 2 KB)
+            void* h = nullptr;
+            if (cudaHostAlloc(&h, nb, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess &&
+                cudaHostGetDevicePointer((void**) &d, h, 0) == cudaSuccess) {
+                std::memcpy(h, gm.shard(s).tensor_data(*t), nb);
+                std::fprintf(stderr, "strata-q36: --embd-host: the token embeddings (%.0f MiB) stay in host memory\n", (double) nb / (1 << 20));
+            } else {
+                (void) cudaGetLastError();
+                if (h) cudaFreeHost(h);
+                d = nullptr;
+                std::fprintf(stderr, "strata-q36: --embd-host: no mapped host memory for the embeddings: on the card\n");
+            }
+        }
+        if (d == nullptr) {
+            CK(cudaMalloc(&d, nb));
+            CK(cudaMemcpy(d, gm.shard(s).tensor_data(*t), nb, cudaMemcpyHostToDevice));
+            bytes += nb;
+        }
         m.embd = d;
-        bytes += nb;
     }
     std::fprintf(stderr, "strata-q36: %s: %zu tensors (layout checked), %.2f GiB on the GPU in %.1f s (the routed "
                  "experts are placed after the engine's buffers)\n", path.c_str(), checked, (double) bytes / (1 << 30),
@@ -1410,6 +1426,24 @@ struct Engine {
     int stream_pos = 0;
     long long hy_cpu = 0, hy_gpu = 0, hy_swaps = 0;   // entries computed on the CPU / GPU, slot replacements
     double hy_cpu_ms = 0;
+    // ---- misses served over PCIe.  A batch's missed experts all went to the CPU pool while the card waited.  Now a share of them
+    // is copied from the pinned host arena into the slots of residents this batch does not use (its own stream, while the pool
+    // computes the rest), a second expert call runs those entries, and the copied experts stay in their slots: the replacement the
+    // periodic rebalance would have made, at no extra copy.  The share balances the two: p of n misses go over PCIe when
+    // p * (ms per copy) = (n - p) * (ms per expert on the pool), the pool's figure an average of the last calls, the copy's from the
+    // bandwidth measured at load.  Same experts, same bits: only where an expert's rows are computed changes.
+    // STRATA_Q36_PCIE_GBPS=0 turns it off (=N takes that bandwidth instead of the measured one).
+    cudaStream_t pst = nullptr;
+    cudaEvent_t ev_pcie = nullptr;
+    bool hy_pinned = false;
+    double pcie_gbps = 0;
+    double cpu_ms_per_expert = 0.08;
+    long long hy_pcie = 0, hy_pcie_bytes = 0, hy_pcie_calls = 0;
+    unsigned long long* grp_ptr2 = nullptr;   // the second call's group tables (device), and pinned copies
+    int32_t *grp_start2 = nullptr, *n_groups2 = nullptr, *ent_dst2 = nullptr, *ent_tok2 = nullptr;
+    unsigned long long* h_grp_ptr2 = nullptr;
+    int32_t *h_grp_start2 = nullptr, *h_ent_dst2 = nullptr, *h_ent_tok2 = nullptr;
+    std::vector<int> pcie_x, pcie_s;        // (scratch) the experts moved this call and their slots
     // decode / verify rows: their routing is counted once the rows are kept (commit), so a verify window's rejected
     // drafts never move the slots; the slots follow the counts at every kRebalanceEvery-th position exactly (a
     // window never steps over one), so plain and speculative decoding see the same slot tables at every position
@@ -2902,44 +2936,120 @@ struct Engine {
         while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
         }
         const auto t0 = Clock::now();
-        // the missed entries per expert (up to MAXT tokens per job)
-        jobs.clear();
-        std::vector<char> quantized((size_t) T, 0);
-        int n_miss = 0;
-        std::map<int, size_t> open;   // expert -> its job with room
         const bool defer = rows_deferred && li < m->layers.size();
         if (defer) {
             if (row_ids.size() < m->layers.size()) row_ids.resize(m->layers.size());
             row_ids[li].assign(h_ids, h_ids + n_ent);
         }
+        // pass 1: the batch's misses, grouped by expert (entries in order), and the experts the batch uses
+        std::map<int, std::vector<int>> miss_ent;
+        std::vector<char> used((size_t) g.n_expert, 0);
+        int n_miss = 0;
         for (int e = 0; e < n_ent; ++e) {
             const int x = h_ids[e];
             if (!defer) H.score[(size_t) x] += 1.0;
+            used[(size_t) x] = 1;
             h_miss[e] = H.slot_of[(size_t) x] < 0;
-            if (!h_miss[e]) continue;
-            ++n_miss;
-            const int t = e / Kp;
-            if (!quantized[(size_t) t]) {
-                C::native_quant_act(H.fmt, h_h + (size_t) t * N, acts + (size_t) t * C::kNativeActBytes);
-                quantized[(size_t) t] = 1;
-            }
-            auto it = open.find(x);
-            if (it == open.end() || jobs[it->second].nt == C::MAXT) {
-                C::ExpertJobMulti j;
-                j.blob = L.hblobs + (size_t) x * L.stride;
-                jobs.push_back(j);
-                it = open.insert_or_assign(x, jobs.size() - 1).first;
-            }
-            C::ExpertJobMulti& j = jobs[it->second];
-            j.nact[j.nt] = acts + (size_t) t * C::kNativeActBytes;
-            j.out[j.nt] = cpu_out + (size_t) e * N;
-            ++j.nt;
+            if (h_miss[e]) { ++n_miss; miss_ent[x].push_back(e); }
         }
         hy_cpu += n_miss;
         hy_gpu += n_ent - n_miss;
         if (n_miss == 0) return;
+        // the PCIe share: the hottest misses, into the coldest slots the batch does not read
+        int n_pcie_ent = 0;
+        pcie_x.clear();
+        pcie_s.clear();
+        if (pcie_gbps > 0 && hy_pinned && L.n_slots > 0 && miss_ent.size() >= 2) {
+            const double q = (double) L.L.bytes / (pcie_gbps * 1e6);   // ms per copy
+            const double c = cpu_ms_per_expert;
+            int p = (int) std::lround((double) miss_ent.size() * c / (c + q));
+            p = std::min<int>(p, (int) miss_ent.size() - 1);
+            if (p > 0) {
+                std::vector<int> cand;
+                for (const auto& kv : miss_ent) cand.push_back(kv.first);
+                std::sort(cand.begin(), cand.end(), [&](int x, int y) { return H.score[(size_t) x] > H.score[(size_t) y]; });
+                std::vector<int> victims;
+                for (int s = 0; s < L.n_slots; ++s)
+                    if (!used[(size_t) H.exp_in_slot[(size_t) s]]) victims.push_back(s);
+                std::sort(victims.begin(), victims.end(), [&](int a2, int b2) {
+                    return H.score[(size_t) H.exp_in_slot[(size_t) a2]] < H.score[(size_t) H.exp_in_slot[(size_t) b2]];
+                });
+                p = std::min<int>(p, (int) victims.size());
+                int ng = 0;
+                for (int i = 0; i < p; ++i) {
+                    const int x = cand[(size_t) i], s = victims[(size_t) i];
+                    CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) x * L.stride, L.L.bytes,
+                                       cudaMemcpyHostToDevice, pst));
+                    h_grp_ptr2[ng] = (unsigned long long) (L.blobs + (size_t) s * L.stride);
+                    h_grp_start2[ng] = n_pcie_ent;
+                    for (int e : miss_ent[x]) {
+                        h_ent_dst2[n_pcie_ent] = e;
+                        h_ent_tok2[n_pcie_ent] = e / Kp;
+                        h_miss[e] = 0;
+                        ++n_pcie_ent;
+                    }
+                    ++ng;
+                    pcie_x.push_back(x);
+                    pcie_s.push_back(s);
+                    hy_pcie_bytes += (long long) L.L.bytes;
+                }
+                h_grp_start2[ng] = n_pcie_ent;
+                if (ng > 0) {
+                    CK(cudaEventRecord(ev_pcie, pst));
+                    CK(cudaStreamWaitEvent(st, ev_pcie, 0));
+                    CK(cudaMemcpyAsync(grp_ptr2, h_grp_ptr2, (size_t) ng * 8, cudaMemcpyHostToDevice, st));
+                    CK(cudaMemcpyAsync(grp_start2, h_grp_start2, ((size_t) ng + 1) * 4, cudaMemcpyHostToDevice, st));
+                    CK(cudaMemcpyAsync(n_groups2, &ng, 4, cudaMemcpyHostToDevice, st));   // (pageable: staged now)
+                    CK(cudaMemcpyAsync(ent_dst2, h_ent_dst2, (size_t) n_pcie_ent * 4, cudaMemcpyHostToDevice, st));
+                    CK(cudaMemcpyAsync(ent_tok2, h_ent_tok2, (size_t) n_pcie_ent * 4, cudaMemcpyHostToDevice, st));
+                    K::native_expert_grouped(L.L, grp_ptr2, grp_start2, n_groups2, ent_dst2, ent_tok2, ng, n_pcie_ent, xq, escr, eparts, st);
+                    // the moved experts are residents now (their slots' previous experts are not)
+                    for (int i = 0; i < ng; ++i) {
+                        const int x = pcie_x[(size_t) i], s = pcie_s[(size_t) i];
+                        H.slot_of[(size_t) H.exp_in_slot[(size_t) s]] = -1;
+                        H.slot_of[(size_t) x] = s;
+                        H.exp_in_slot[(size_t) s] = x;
+                        miss_ent.erase(x);
+                    }
+                    CK(cudaMemcpyAsync(H.slot_of_d, H.slot_of.data(), (size_t) g.n_expert * 4, cudaMemcpyHostToDevice, st));
+                    hy_pcie += n_pcie_ent;
+                    hy_swaps += ng;
+                    ++hy_pcie_calls;
+                }
+            }
+        }
+        hy_cpu -= n_pcie_ent;
+        hy_gpu += n_pcie_ent;
+        if (miss_ent.empty()) return;
+        // the rest: the CPU pool's jobs (up to MAXT tokens per job)
+        jobs.clear();
+        std::vector<char> quantized((size_t) T, 0);
+        for (const auto& kv : miss_ent) {
+            const int x = kv.first;
+            size_t ji = (size_t) -1;
+            for (int e : kv.second) {
+                const int tk = e / Kp;
+                if (!quantized[(size_t) tk]) {
+                    C::native_quant_act(H.fmt, h_h + (size_t) tk * N, acts + (size_t) tk * C::kNativeActBytes);
+                    quantized[(size_t) tk] = 1;
+                }
+                if (ji == (size_t) -1 || jobs[ji].nt == C::MAXT) {
+                    C::ExpertJobMulti j;
+                    j.blob = L.hblobs + (size_t) x * L.stride;
+                    jobs.push_back(j);
+                    ji = jobs.size() - 1;
+                }
+                C::ExpertJobMulti& j = jobs[ji];
+                j.nact[j.nt] = acts + (size_t) tk * C::kNativeActBytes;
+                j.out[j.nt] = cpu_out + (size_t) e * N;
+                ++j.nt;
+            }
+        }
+        const auto t1 = Clock::now();
         pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
+        const double pool_ms = ms_since(t1);
         hy_cpu_ms += ms_since(t0);
+        cpu_ms_per_expert = 0.9 * cpu_ms_per_expert + 0.1 * (pool_ms / (double) miss_ent.size());
         CK(cudaMemcpyAsync(ecpu, cpu_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
         k_merge_cpu<<<n_ent, kThreads, 0, st>>>(eparts, ecpu, d_miss, N);
@@ -3660,6 +3770,7 @@ struct Engine {
         warming = false;
         for (Hy& H : hy) std::fill(H.score.begin(), H.score.end(), 0.0);
         hy_cpu = hy_gpu = hy_swaps = 0;
+        hy_pcie = hy_pcie_bytes = hy_pcie_calls = 0;
         hy_cpu_ms = 0;
         reset();
         std::fprintf(stderr, "strata-q36: warmed up in %.1f s (one prompt chunk, a decode step%s)\n",
@@ -3852,6 +3963,16 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     m.hybrid = true;
     E.main_hybrid = !mtp_only;
     if (E.main_hybrid) E.use_graph = false;   // the host takes part in every layer
+    // the attention scores buffer at 64 MB instead of 256 (the prompt attention takes more, smaller slices): 288 MiB more for the
+    // slots, about 4 experts per layer.  STRATA_Q36_KEEP_SCORES=1 keeps the 256 MB.
+    if (E.main_hybrid && !E.kvr && E.kAttScoreFloats > ((size_t) 16 << 20) && std::getenv("STRATA_Q36_KEEP_SCORES") == nullptr) {
+        const size_t before = fr;
+        E.shrink_att((size_t) 16 << 20);
+        CK(cudaMemGetInfo(&fr, &tot));
+        budget2 = vram_gib >= 0 ? budget : (fr > reserve ? fr - reserve : 0);
+        std::fprintf(stderr, "strata-q36: hybrid mode: the attention scores buffer at 64 MB (%.0f MiB more for the experts' slots; "
+                     "STRATA_Q36_KEEP_SCORES=1 keeps 256 MB)\n", (double) (fr > before ? fr - before : 0) / (1 << 20));
+    }
     E.mtp_graph = false;                      // the MTP block's layer is hybrid either way
     E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
     if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
@@ -3960,6 +4081,50 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         }
     }
     E.pool = std::make_unique<C::ExpertPool>(threads);
+    {   // the PCIe share's stream, event and tables, and the host -> card bandwidth (a 64 MiB copy from the arena, timed)
+        E.hy_pinned = pinned;
+        CK(cudaStreamCreateWithFlags(&E.pst, cudaStreamNonBlocking));
+        CK(cudaEventCreateWithFlags(&E.ev_pcie, cudaEventDisableTiming));
+        const size_t ng = std::min<size_t>(T * Kp, (size_t) ne) + 1;
+        E.grp_ptr2 = dalloc_t<unsigned long long>(ng);
+        E.grp_start2 = dalloc_t<int32_t>(ng);
+        E.n_groups2 = dalloc_t<int32_t>(1);
+        E.ent_dst2 = dalloc_t<int32_t>(T * Kp);
+        E.ent_tok2 = dalloc_t<int32_t>(T * Kp);
+        CK(cudaHostAlloc((void**) &E.h_grp_ptr2, ng * 8, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void**) &E.h_grp_start2, ng * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void**) &E.h_ent_dst2, T * Kp * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void**) &E.h_ent_tok2, T * Kp * 4, cudaHostAllocDefault));
+        const char* ev = std::getenv("STRATA_Q36_PCIE_GBPS");
+        if (ev != nullptr) {
+            E.pcie_gbps = std::atof(ev);
+        } else if (pinned && !mtp_only) {
+            const size_t probe = std::min<size_t>((size_t) 64 << 20, host);
+            void* tmp = nullptr;
+            if (cudaMalloc(&tmp, probe) == cudaSuccess) {
+                cudaEvent_t a = nullptr, b = nullptr;
+                CK(cudaEventCreate(&a));
+                CK(cudaEventCreate(&b));
+                CK(cudaMemcpyAsync(tmp, arena, probe, cudaMemcpyHostToDevice, E.pst));   // (a first copy warms the path)
+                CK(cudaEventRecord(a, E.pst));
+                CK(cudaMemcpyAsync(tmp, arena, probe, cudaMemcpyHostToDevice, E.pst));
+                CK(cudaEventRecord(b, E.pst));
+                CK(cudaEventSynchronize(b));
+                float ms = 0.f;
+                CK(cudaEventElapsedTime(&ms, a, b));
+                E.pcie_gbps = ms > 0.f ? (double) probe / (ms * 1e6) : 0.0;
+                CK(cudaEventDestroy(a));
+                CK(cudaEventDestroy(b));
+                CK(cudaFree(tmp));
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
+        if (E.pcie_gbps > 0 && !mtp_only)
+            std::fprintf(stderr, "strata-q36: host -> card %.1f GB/s%s: a share of each batch's missed experts is copied to the card (%.2f ms "
+                         "an expert) while the CPU pool computes the others, and stays there (STRATA_Q36_PCIE_GBPS=0 turns it off)\n",
+                         E.pcie_gbps, ev ? " (STRATA_Q36_PCIE_GBPS)" : " (measured)", (double) per_slot / (double) all.size() / (E.pcie_gbps * 1e6));
+    }
     CK(cudaDeviceSynchronize());
     if (mtp_only)
         std::fprintf(stderr, "strata-q36: every main layer's routed experts in VRAM (%.2f GiB); the MTP block's: %d of "
@@ -4874,6 +5039,7 @@ int strata::qwen35::run(int argc, char** argv) {
             }
         }
         else if (a == "--drop-packed") drop_packed = true;   // the packed Q8_0 decode copies back to the experts (hybrid mode too)
+        else if (a == "--embd-host") g_embd_host = true;     // the token embeddings in host memory (0.3 to 0.5 GiB of VRAM for the experts)
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
@@ -5031,9 +5197,10 @@ int strata::qwen35::run(int argc, char** argv) {
                     std::fprintf(stderr, "strata-q36 VERIFY   %s: %lld mismatches\n", kv.first.c_str(), kv.second);
             if (!E.m->hybrid) return;
             const long long n = E.hy_cpu + E.hy_gpu;
-            std::fprintf(stderr, "strata-q36: hybrid experts: %lld of %lld batch entries on the GPU (%.1f%%), %lld on the "
-                         "CPU pool in %.0f ms, %lld slot replacements\n", E.hy_gpu, n, n ? 100.0 * E.hy_gpu / n : 0.0,
-                         E.hy_cpu, E.hy_cpu_ms, E.hy_swaps);
+            std::fprintf(stderr, "strata-q36: hybrid experts: %lld of %lld batch entries on the GPU (%.1f%%; %lld of them copied over "
+                         "PCIe first, %.2f GiB in %lld calls), %lld on the CPU pool in %.0f ms (%.3f ms per expert lately), %lld slot "
+                         "replacements\n", E.hy_gpu, n, n ? 100.0 * E.hy_gpu / n : 0.0, E.hy_pcie, (double) E.hy_pcie_bytes / (1 << 30),
+                         E.hy_pcie_calls, E.hy_cpu, E.hy_cpu_ms, E.cpu_ms_per_expert, E.hy_swaps);
         }
     } report{E};
     E.reset();
