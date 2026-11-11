@@ -1323,6 +1323,7 @@ struct Engine {
     // the MTP block (when loaded)
     float *mtp_cat = nullptr, *hmtp = nullptr, *logits_m = nullptr;
     int32_t *tok_m = nullptr, *pos0_m = nullptr, *pick_m = nullptr;
+    int32_t* dpicks = nullptr;   // [kVerify] the drafts of a speculative step, on the device (each one feeds the next without the host)
     // graphs: [0] the decode step, [T] a verify window of T rows, mtp1 the MTP draft step
     // (the graphs hold the current session's state pointers as kernel arguments: one set per session)
     struct GSet {
@@ -1403,6 +1404,7 @@ struct Engine {
     int hybrid_t = 32;
     int vram_reserve_mib = -1;   // --vram-reserve-mib: the VRAM place_experts leaves free (-1: its 768 MiB)
     bool drop_packed = false;    // --drop-packed: give the packed Q8_0 decode copies back to the experts, hybrid mode too
+    bool mtp_resident = false;   // --mtp-resident: every expert of the MTP block in VRAM (it runs D + 1 times a step), the main layers' slots fewer
     bool main_hybrid = false;   // some main layer is hybrid (else only the MTP block is: the decode graph stays)
     bool mtp_graph = true;      // the MTP draft step may be a graph (not when its layer is hybrid)
     /// state index li's layer runs hybrid (its experts not all in VRAM)
@@ -1658,6 +1660,7 @@ struct Engine {
             tok_m = dalloc_t<int32_t>(T);
             pos0_m = dalloc_t<int32_t>(1);
             pick_m = dalloc_t<int32_t>(1);
+            dpicks = dalloc_t<int32_t>(kVerify);
         }
         sess.resize((size_t) n_sess);
         gsets.resize((size_t) n_sess);
@@ -2759,7 +2762,10 @@ struct Engine {
             mm(L.sh_down, shh, sy, T);
         }
         if (!ext) f32mm(L.sh_gate_inp, h, sgate, N, 1, T);
-        if (hy_rows) moe_hybrid_cpu(li, T);   // the CPU pool's experts (while the GPU runs the rest), merged
+        if (hy_rows) {   // the CPU pool's experts (while the GPU runs the rest), merged; a segment graph is cut here
+            if (seg_cur) seg_gap(li, T);
+            else moe_hybrid_cpu(li, T);
+        }
         // the combine, the shared expert's gate, the residual add and the next norm in one launch
         moe_end(T, prow, sy, ext ? logits_r + g.n_expert : sgate, wn, hout, ext ? (int) g.n_expert + 1 : 1);
     }
@@ -3130,6 +3136,61 @@ struct Engine {
         for (auto& kv : row_graphs)
             if (kv.second) CK(cudaGraphExecDestroy(kv.second));
         row_graphs.clear();
+        for (auto& kv : seg_runs)
+            for (cudaGraphExec_t g : kv.second.segs) CK(cudaGraphExecDestroy(g));
+        seg_runs.clear();
+    }
+
+    // ---- the decode graphs of the hybrid mode.  A CUDA graph cannot hold the host's part of a hybrid layer (the routing read back, the
+    // CPU pool, the PCIe share), so the hybrid mode ran every kernel eagerly: some 800 launches a token.  Here a forward is captured
+    // in segments, cut at every hybrid layer's gap: segment i holds the kernels from the previous gap to this layer's routing, its
+    // resident experts and its shared expert; the gap (moe_hybrid_cpu) runs eagerly between two segments.  The first run of a shape
+    // (the key: a decode step, a verify window of T rows, an MTP call of T rows) captures and runs; later runs launch the segments and
+    // run the gaps.  The same kernels in the same order: the same bits.  STRATA_Q36_SEG_GRAPH=0: the eager launches.
+    struct SegRun {
+        std::vector<cudaGraphExec_t> segs;
+        std::vector<int> gap_li;
+        bool built = false;
+    };
+    std::map<int, SegRun> seg_runs;
+    SegRun* seg_cur = nullptr;
+    bool seg_ok = false;
+    static bool debug_graphs_off() { const char* v = std::getenv("STRATA_Q36_SEG_GRAPH"); return v != nullptr && v[0] == '0'; }
+    void seg_begin() { CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal)); }
+    void seg_cut() {
+        cudaGraph_t graph = nullptr;
+        CK(cudaStreamEndCapture(st, &graph));
+        cudaGraphExec_t gx = nullptr;
+        CK(cudaGraphInstantiate(&gx, graph, 0));
+        CK(cudaGraphDestroy(graph));
+        seg_cur->segs.push_back(gx);
+        CK(cudaGraphLaunch(gx, st));
+    }
+    void seg_gap(size_t li, int T) {
+        seg_cut();
+        seg_cur->gap_li.push_back((int) li);
+        moe_hybrid_cpu(li, T);
+        seg_begin();
+    }
+    template <class F> void run_seg(int key, int T, F body) {
+        SegRun& R = seg_runs[key];
+        if (!R.built) {
+            seg_cur = &R;
+            seg_begin();
+            body();
+            seg_cut();
+            seg_cur = nullptr;
+            R.built = true;
+        } else {
+            for (size_t i = 0; i < R.segs.size(); ++i) {
+                CK(cudaGraphLaunch(R.segs[i], st));
+                if (i < R.gap_li.size()) moe_hybrid_cpu((size_t) R.gap_li[i], T);
+            }
+        }
+        // what the body leaves behind on the host (the first run did it itself)
+        xq_ready = false;
+        xq_post = false;
+        grouped_by_route = false;
     }
 
     template <class F> void graph_run(cudaGraphExec_t& gx, F body) {
@@ -3221,6 +3282,7 @@ struct Engine {
             rows_deferred = true;
             // a prompt cell of a picture request (its rotary position is in the table, its row a picture's) runs eagerly
             if (mtab_now || map_on) forward(1, pos, 1, false, false);
+            else if (seg_ok) run_seg(1, 1, [&] { forward(1, pos, 1, true, false); });
             else graph_run(gs().g1, [&] { forward(1, pos, 1, use_graph, false); });
             mtab_now = nullptr;
             map_on = false;
@@ -3694,39 +3756,39 @@ struct Engine {
         if (!fix.empty())
             CK(cudaMemcpyAsync(seeds, hmain, fix.size() * (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         CK(cudaMemcpyAsync(seeds + fix.size() * (size_t) N, hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
-        forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0, false);
+        if (seg_ok) run_seg(2000 + T0, T0, [&] { forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0, true); });
+        else forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0, false);
         drafts.assign((size_t) D, 0);
-        if (D > 0) {
-            CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
-            CK(cudaStreamSynchronize(st));
-            drafts[0] = hpin[2];
-        }
+        // the drafts chain on the device: draft d's token is the block's pick after draft d - 1 (dpicks), read by the next call's
+        // embedding without a round trip to the host; the host reads them all with the verify window's picks (one sync per step)
+        if (D > 0) CK(cudaMemcpyAsync(dpicks, pick_m, 4, cudaMemcpyDeviceToDevice, st));
         int last_row = T0 - 1;   // the row of the previous MTP call whose output seeds the next draft
         for (int d = 1; d < D; ++d) {   // chained: (the block's own output, the last draft) at the next position
-            hpin[0] = drafts[(size_t) d - 1];
-            hpin[1] = (int32_t) (pos + d);
-            CK(cudaMemcpyAsync(tok_m, hpin, 4, cudaMemcpyHostToDevice, st));
-            CK(cudaMemcpyAsync(pos0_m, hpin + 1, 4, cudaMemcpyHostToDevice, st));
+            hpin[24 + d] = (int32_t) (pos + d);   // (its own pinned word: the copies of this step are still in flight)
+            CK(cudaMemcpyAsync(tok_m, dpicks + (d - 1), 4, cudaMemcpyDeviceToDevice, st));
+            CK(cudaMemcpyAsync(pos0_m, hpin + 24 + d, 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(seeds, hmtp + (size_t) last_row * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
             last_row = 0;
-            if (mtp_graph) graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
+            if (seg_ok) run_seg(2100, 1, [&] { forward_mtp(1, pos + d, seeds, true, true); });
+            else if (mtp_graph) graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
             else forward_mtp(1, pos + d, seeds, true, false);
-            CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
-            CK(cudaStreamSynchronize(st));
-            drafts[(size_t) d] = hpin[2];
+            CK(cudaMemcpyAsync(dpicks + d, pick_m, 4, cudaMemcpyDeviceToDevice, st));
         }
-        // the verify window
+        // the verify window: x then the drafts
         const int T = D + 1;
         hpin[16] = x_tok;
-        for (int d = 0; d < D; ++d) hpin[17 + d] = drafts[(size_t) d];
-        hpin[1] = (int32_t) pos;
-        CK(cudaMemcpyAsync(tok, hpin + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
+        hpin[40] = (int32_t) pos;
+        CK(cudaMemcpyAsync(tok, hpin + 16, 4, cudaMemcpyHostToDevice, st));
+        if (D > 0) CK(cudaMemcpyAsync(tok + 1, dpicks, (size_t) D * 4, cudaMemcpyDeviceToDevice, st));
+        CK(cudaMemcpyAsync(pos0, hpin + 40, 4, cudaMemcpyHostToDevice, st));
         rows_deferred = true;
-        graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); });
+        if (seg_ok) run_seg(1000 + T, T, [&] { forward(T, pos, T, true, true); });
+        else graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); });
         rows_deferred = false;
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
+        if (D > 0) CK(cudaMemcpyAsync(hpin + 48, dpicks, (size_t) D * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+        for (int d = 0; d < D; ++d) drafts[(size_t) d] = hpin[48 + d];
         int a = 0;
         if (pw != nullptr) {
             const int k = host_sample ? 0 : topk_rows(*pw, drafts.data(), T);
@@ -3989,13 +4051,27 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         const size_t left = budget2 > total_main ? budget2 - total_main : 0;
         S = (int) std::min<size_t>((size_t) ne, left / m.mtp.stride);
     }
+    // --mtp-resident: the MTP block's experts all in VRAM (its layer runs D + 1 times a speculative step, the others once), the main
+    // layers' slots from what is left
+    int S_mtp = S;
+    bool mtp_res = E.mtp_resident && m.has_mtp && !mtp_only && slots <= 0;
+    if (mtp_res) {
+        const size_t need_m = m.mtp.stride * (size_t) ne + kMmqTail, per_main = per_slot - m.mtp.stride;
+        if (slot_bytes > need_m && per_main > 0) {
+            S = (int) std::min<size_t>((size_t) ne, (slot_bytes - need_m) / per_main);
+            S_mtp = (int) ne;
+        } else {
+            mtp_res = false;
+            std::fprintf(stderr, "strata-q36: --mtp-resident: not enough room for the MTP block's experts beside the layers: ignored\n");
+        }
+    }
     {   // what the hybrid mode allocates next (the staging pair, the CPU part's outputs, the slots) against the VRAM the
         // sessions and the context left: said with the numbers instead of a cudaMalloc failure (8 slots on a 12 GB card)
         const size_t Tn = (size_t) E.tmax, Nn = (size_t) g.n_embd, Kn = (size_t) m.top_k;
         size_t need = staging + Tn * Kn * Nn * 4 + Tn * Kn * 4;
         for (Layer* L : all) {
             if (mtp_only && L != &m.mtp) need += L->stride * (size_t) ne + kMmqTail;
-            else need += (S > 0 ? (size_t) S * L->stride + kMmqTail : 0);
+            else { const int Sl = L == &m.mtp ? S_mtp : S; need += (Sl > 0 ? (size_t) Sl * L->stride + kMmqTail : 0); }
         }
         if (need > fr) {
             err = "not enough VRAM left for the hybrid experts' buffers and slots (" + std::to_string((need >> 20)) +
@@ -4038,16 +4114,17 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         off += L.stride * (size_t) ne + kMmqTail;
         std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
         for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
-        L.n_slots = S;
-        if (S > 0) {
-            CK(cudaMalloc(&L.blobs, L.stride * (size_t) S + kMmqTail));
-            CK(cudaMemset(L.blobs, 0, L.stride * (size_t) S + kMmqTail));
-            CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) S, cudaMemcpyHostToDevice));
+        const int Sl = &L == &m.mtp ? S_mtp : S;
+        L.n_slots = Sl;
+        if (Sl > 0) {
+            CK(cudaMalloc(&L.blobs, L.stride * (size_t) Sl + kMmqTail));
+            CK(cudaMemset(L.blobs, 0, L.stride * (size_t) Sl + kMmqTail));
+            CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) Sl, cudaMemcpyHostToDevice));
         }
         Engine::Hy& H = E.hy[li];
         H.slot_of.assign((size_t) ne, -1);
-        H.exp_in_slot.assign((size_t) S, 0);
-        for (int s = 0; s < S; ++s) {
+        H.exp_in_slot.assign((size_t) Sl, 0);
+        for (int s = 0; s < Sl; ++s) {
             H.slot_of[(size_t) s] = s;
             H.exp_in_slot[(size_t) s] = s;
         }
@@ -4130,7 +4207,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         std::fprintf(stderr, "strata-q36: every main layer's routed experts in VRAM (%.2f GiB); the MTP block's: %d of "
                      "%lld in VRAM, the rest on the CPU pool (its drafts only)\n", (double) total_main / (1 << 30), S,
                      (long long) ne);
-    else
+    else if (mtp_res)
+        std::fprintf(stderr, "strata-q36: --mtp-resident: the MTP block's %lld experts in VRAM (%.2f GiB), the main layers %d of %lld each\n",
+                     (long long) ne, (double) m.mtp.stride * (double) ne / (1 << 30), S, (long long) ne);
+    if (!mtp_only)
     std::fprintf(stderr, "strata-q36: hybrid experts: %d of %lld per layer in VRAM (%.2f GiB), all %.2f GiB in %s host "
                  "memory, the rest of a batch of <= %d rows on %d CPU threads, bigger prompt chunks streamed (%.2f GiB "
                  "staging); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30), (double) host / (1 << 30),
@@ -4957,7 +5037,7 @@ int strata::qwen35::run(int argc, char** argv) {
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false, kv16 = false, kvq8 = false, kvq4 = false;
     int vram_reserve = -1;
-    bool drop_packed = false;
+    bool drop_packed = false, mtp_resident = false;
     bool kv_p2p = false;
     int prompt_cache = 6, turn_token = 248045, ck_every = 4096;   // the prompt cache's checkpoints (q36_ckpt.hpp)
     int kv_gpu = -1;   // --kv-gpu N: the K / V cache and the attention on device N (-1: all on the main device)
@@ -5040,6 +5120,7 @@ int strata::qwen35::run(int argc, char** argv) {
         }
         else if (a == "--drop-packed") drop_packed = true;   // the packed Q8_0 decode copies back to the experts (hybrid mode too)
         else if (a == "--embd-host") g_embd_host = true;     // the token embeddings in host memory (0.3 to 0.5 GiB of VRAM for the experts)
+        else if (a == "--mtp-resident") mtp_resident = true;   // every expert of the MTP block in VRAM (hybrid mode)
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
@@ -5101,6 +5182,7 @@ int strata::qwen35::run(int argc, char** argv) {
     }
     E.vram_reserve_mib = vram_reserve;
     E.drop_packed = drop_packed;
+    E.mtp_resident = mtp_resident;
     if (kv_gpu >= 0) {
         int n_dev = 0;
         CK(cudaGetDeviceCount(&n_dev));
@@ -5188,6 +5270,10 @@ int strata::qwen35::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
     }
+    E.seg_ok = graph && E.main_hybrid && !E.kvr && !E.verify_k && !E.debug_graphs_off() && E.n_sess == 1;
+    if (E.main_hybrid)
+        std::fprintf(stderr, "strata-q36: hybrid mode: the decode's kernels %s\n",
+                     E.seg_ok ? "run as CUDA graphs cut at every hybrid layer (STRATA_Q36_SEG_GRAPH=0: eager launches)" : "are launched one by one");
     struct Report {
         Engine& E;
         ~Report() {
