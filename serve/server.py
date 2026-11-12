@@ -8472,6 +8472,39 @@ def apply_saved_tuning(cfg: dict, *, say=None) -> dict:
         return cfg
 
 
+def run_calibration(a, cfg: dict, tok, exe: str, env: dict, effort_end, sampling_defaults: dict) -> int:
+    """--calibrate (serve/calibrate.py): the engine started once per option tried, the best options printed, and written with
+    --calibrate-write."""
+    from serve import calibrate as cal
+    profile = dict(cal.PROFILES[a.calibrate_profile])
+    if a.calibrate_temperature is not None:
+        profile["temperature"] = a.calibrate_temperature
+    elif sampling_defaults.get("temperature") is not None:
+        profile["temperature"] = float(sampling_defaults["temperature"])
+    if int(profile["context"]) + int(profile["new_prompt"]) + 2 * int(profile["gen"]) + 64 > \
+            (int(cfg["args"][cfg["args"].index("--max-context") + 1]) if "--max-context" in cfg["args"] else 32768):
+        profile["context"] = max(1000, (int(cfg["args"][cfg["args"].index("--max-context") + 1]) if "--max-context" in cfg["args"]
+                                        else 32768) - int(profile["new_prompt"]) - 2 * int(profile["gen"]) - 256)
+
+    def start(args):
+        return StrataEngine(exe, engine_args({**cfg, "args": args}) + (effort_end or []), cwd=cfg.get("cwd"),
+                            log=cfg.get("log"), env=env)
+    c = cal.Calibrator(cfg, tok, start, profile, quick=a.calibrate_quick)
+    best = c.run()
+    if not best.ok:
+        return 1
+    if a.calibrate_write:
+        if not a.config:
+            print("[calibrate] --calibrate-write needs --config", flush=True)
+            return 2
+        bak = cal.write_config(a.config, cfg, best)
+        print(f"[calibrate] written to {a.config} (the old file: {bak})", flush=True)
+    else:
+        print(f"[calibrate] to keep them: --calibrate-write, or put these in the config's \"args\": {' '.join(best.options) or '(none)'}",
+              flush=True)
+    return 0
+
+
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
@@ -8785,6 +8818,18 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
     ap.add_argument("--port", type=int, default=8095)
+    ap.add_argument("--calibrate", action="store_true",
+                    help="find the engine options that run fastest here (serve/calibrate.py): one engine start per option tried, "
+                         "a quality check (the greedy text must not change), then the best options are printed (and written with "
+                         "--calibrate-write); the server does not start")
+    ap.add_argument("--calibrate-profile", choices=["agent", "chat", "long"], default="agent",
+                    help="the use to tune for: agent (long contexts, 2000 new tokens and 300 written a turn), chat (short turns, "
+                         "long answers), long (big documents, short answers)")
+    ap.add_argument("--calibrate-temperature", type=float, default=None,
+                    help="the sampling temperature of the measured answers (default: the config's sampling, else the profile's)")
+    ap.add_argument("--calibrate-quick", action="store_true", help="try only the options that matter most (fewer engine starts)")
+    ap.add_argument("--calibrate-write", action="store_true",
+                    help="write the best options into the config's \"args\" (the old file kept as <config>.bak-calibrate)")
     ap.add_argument("--ready-file", help="write a JSON instance record once the API is bound and model state is known")
     ap.add_argument("--owner-fd", type=int, help=argparse.SUPPRESS)
     ap.add_argument("--shutdown-timeout", type=float, default=None,
@@ -8944,7 +8989,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         return 2
     # A key is recommended on a network, never required (owner decision 2026-10-20): the banner below warns once.
     try:                                                # before the minutes of loading: is the port free?
-        Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
+        if not a.calibrate:                             # (--calibrate serves nothing)
+            Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError as e:
         ap.error(listen_problem(a.host, a.port, e))
     if cfg.get("tokenizer"):
@@ -9057,6 +9103,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             effort_end = effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
+        if a.calibrate:
+            return run_calibration(a, cfg, tok, exe, env, effort_end, sampling_defaults)
         from serve import replicas as rp
         try:
             groups = rp.gpu_groups(cfg)

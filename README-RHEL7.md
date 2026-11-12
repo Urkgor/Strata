@@ -233,6 +233,22 @@ tools/build_rhel7.sh --arch "61;75" --cuda-home /usr/local/cuda-12.4 --ggml ~/ll
 ```
 Résultat : `build-rhel7/strata-q36` et `libstrata_kq.so`, puis `"exe": ".../build-rhel7/strata-q36"` dans `strata-<modèle>.json`. Mesuré dans le conteneur : 622 s pour `61;75` avec 3 jobs (`--jobs N` pour changer).
 
+## Trouver les meilleures options pour sa machine : `--calibrate`
+
+```sh
+python3 serve/server.py --engine strata --config $HOME/strata-qwen36.json --calibrate --calibrate-profile agent
+```
+
+Le serveur ne démarre pas : il lance le moteur une fois par option essayée (chaque lancement prend le temps d'un chargement, donc comptez de 15 à 40 minutes ; `--calibrate-quick` en essaie moins), et pour chacune :
+
+1. **contrôle de qualité** : une courte réponse à température 0 doit être identique, token pour token, à celle de la configuration de départ. Sinon l'option est refusée, quelle que soit sa vitesse ;
+2. **mesure** : un long prompt lu depuis zéro (débit de lecture), puis une réponse échantillonnée (débit de décodage, brouillons MTP compris) ;
+3. **tour suivant** de la même conversation (cache de conversation, second débit de décodage en profondeur).
+
+Le score est la durée d'un tour typique du profil : `agent` (DSH : ~16 000 tokens de contexte, 2 000 nouveaux et 300 écrits par tour), `chat` (tours courts, longues réponses) ou `long` (gros documents, réponses courtes). La recherche teste les options une à une (`--seg-graphs`, `--embd-host`, `--pcie-share`, `--mtp 0..3` avec `--mtp-sampled`, puis hors `--calibrate-quick` : `--mtp-resident`, `--draft-vocab 32768`, `--small-scores`, `--cpu-threads`) et garde chacune si elle fait gagner plus de 3 % sur le tour. Elle ne touche ni au cache K/V (`--kv`), ni au contexte, ni au GGUF. La température des réponses mesurées est celle du bloc `sampling` de la config, sinon celle du profil ; `--calibrate-temperature T` l'impose.
+
+À la fin : un tableau (un essai par ligne) puis `best: …`. `--calibrate-write` écrit ces options dans les `"args"` de la config, et garde l'ancien fichier en `<config>.bak-calibrate`. Sans cette option, la ligne finale donne les options à recopier. Testé sans GPU (`python3 -m unittest serve.test_calibrate`, un faux moteur) ; **jamais exécuté avec le vrai moteur**.
+
 ## Les options d'optimisation de novembre : toutes à activer une par une
 
 Les changements des sections suivantes **ne sont plus actifs par défaut** (sauf le tirage top‑k sur la carte, qui fait exactement le même calcul) : sans option, le moteur fait ce qu'il faisait avant. Chacune s'active dans `args`, et la ligne de démarrage `hybrid mode: … options on: …` dit lesquelles tournent. Ajoutez‑les **une à la fois**, en comparant le débit de décodage (ligne `generated in … (… tok/s)`) et la lecture des prompts sur une même conversation :
