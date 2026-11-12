@@ -1404,6 +1404,9 @@ struct Engine {
     int hybrid_t = 32;
     int vram_reserve_mib = -1;   // --vram-reserve-mib: the VRAM place_experts leaves free (-1: its 768 MiB)
     bool drop_packed = false;    // --drop-packed: give the packed Q8_0 decode copies back to the experts, hybrid mode too
+    bool small_scores = false;   // --small-scores: the attention scores buffer at 64 MB in the hybrid mode (more slots, slower long prompts)
+    bool pcie_share = false;     // --pcie-share: a share of each batch's missed experts copied over PCIe beside the CPU pool
+    bool mtp_sampled = false;    // --mtp-sampled: MTP drafts for sampled requests too (exact acceptance, see spec_step)
     bool mtp_resident = false;   // --mtp-resident: every expert of the MTP block in VRAM (it runs D + 1 times a step), the main layers' slots fewer
     bool main_hybrid = false;   // some main layer is hybrid (else only the MTP block is: the decode graph stays)
     bool mtp_graph = true;      // the MTP draft step may be a graph (not when its layer is hybrid)
@@ -2923,7 +2926,8 @@ struct Engine {
         const int64_t n_ent = (int64_t) T * Kp;
         CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaMemcpyAsync(h_h, h, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
-        if (!seg_cur) CK(cudaEventRecord(ev_route, st));   // (a segment graph's gap waits for the stream instead)
+        if (seg_cur) seg_route();   // (a segment graph: the event is recorded between two segments, never inside one)
+        else CK(cudaEventRecord(ev_route, st));
         group_entries(L, hy[li].slot_of_d, T);
         if (!xq_post) quant(h, N, T, xq);   // the experts' and the shared expert's input
         K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
@@ -3150,9 +3154,12 @@ struct Engine {
     // resident experts and its shared expert; the gap (moe_hybrid_cpu) runs eagerly between two segments.  The first run of a shape
     // (the key: a decode step, a verify window of T rows, an MTP call of T rows) captures and runs; later runs launch the segments and
     // run the gaps.  The same kernels in the same order: the same bits.  STRATA_Q36_SEG_GRAPH=0: the eager launches.
+    // A hybrid layer cuts twice: after its routing has been copied to the host (the host then records the route event, outside the
+    // graph, and goes on) and at its gap (the CPU pool waits for that event only, as in the eager path: it starts while the card
+    // still runs the resident experts and the shared expert of the second segment).
     struct SegRun {
         std::vector<cudaGraphExec_t> segs;
-        std::vector<int> gap_li;
+        std::vector<int> act;   // after segment i: -1 record the route event, else the gap of layer act[i]
         bool built = false;
     };
     std::map<int, SegRun> seg_runs;
@@ -3169,11 +3176,16 @@ struct Engine {
         seg_cur->segs.push_back(gx);
         CK(cudaGraphLaunch(gx, st));
     }
+    void seg_route() {
+        seg_cut();
+        seg_cur->act.push_back(-1);
+        CK(cudaEventRecord(ev_route, st));
+        seg_begin();
+    }
     void seg_gap(size_t li, int T) {
         seg_cut();
-        seg_cur->gap_li.push_back((int) li);
-        CK(cudaStreamSynchronize(st));
-        moe_hybrid_cpu(li, T, true);
+        seg_cur->act.push_back((int) li);
+        moe_hybrid_cpu(li, T);
         seg_begin();
     }
     template <class F> void run_seg(int key, int T, F body) {
@@ -3188,10 +3200,9 @@ struct Engine {
         } else {
             for (size_t i = 0; i < R.segs.size(); ++i) {
                 CK(cudaGraphLaunch(R.segs[i], st));
-                if (i < R.gap_li.size()) {
-                    CK(cudaStreamSynchronize(st));
-                    moe_hybrid_cpu((size_t) R.gap_li[i], T, true);
-                }
+                if (i >= R.act.size()) continue;
+                if (R.act[i] < 0) CK(cudaEventRecord(ev_route, st));
+                else moe_hybrid_cpu((size_t) R.act[i], T);
             }
         }
         // what the body leaves behind on the host (the first run did it itself)
@@ -4033,14 +4044,14 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.main_hybrid = !mtp_only;
     if (E.main_hybrid) E.use_graph = false;   // the host takes part in every layer
     // the attention scores buffer at 64 MB instead of 256 (the prompt attention takes more, smaller slices): 288 MiB more for the
-    // slots, about 4 experts per layer.  STRATA_Q36_KEEP_SCORES=1 keeps the 256 MB.
-    if (E.main_hybrid && !E.kvr && E.kAttScoreFloats > ((size_t) 16 << 20) && std::getenv("STRATA_Q36_KEEP_SCORES") == nullptr) {
+    // slots, about 4 experts per layer.  Opt-in (--small-scores): a long prompt's attention then runs in 4 times more slices.
+    if (E.small_scores && E.main_hybrid && !E.kvr && E.kAttScoreFloats > ((size_t) 16 << 20)) {
         const size_t before = fr;
         E.shrink_att((size_t) 16 << 20);
         CK(cudaMemGetInfo(&fr, &tot));
         budget2 = vram_gib >= 0 ? budget : (fr > reserve ? fr - reserve : 0);
         std::fprintf(stderr, "strata-q36: hybrid mode: the attention scores buffer at 64 MB (%.0f MiB more for the experts' slots; "
-                     "STRATA_Q36_KEEP_SCORES=1 keeps 256 MB)\n", (double) (fr > before ? fr - before : 0) / (1 << 20));
+                     "--small-scores)\n", (double) (fr > before ? fr - before : 0) / (1 << 20));
     }
     E.mtp_graph = false;                      // the MTP block's layer is hybrid either way
     E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
@@ -4180,7 +4191,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         CK(cudaHostAlloc((void**) &E.h_ent_dst2, T * Kp * 4, cudaHostAllocDefault));
         CK(cudaHostAlloc((void**) &E.h_ent_tok2, T * Kp * 4, cudaHostAllocDefault));
         const char* ev = std::getenv("STRATA_Q36_PCIE_GBPS");
-        if (ev != nullptr) {
+        if (!E.pcie_share) {
+            E.pcie_gbps = 0;
+        } else if (ev != nullptr) {
             E.pcie_gbps = std::atof(ev);
         } else if (pinned && !mtp_only) {
             const size_t probe = std::min<size_t>((size_t) 64 << 20, host);
@@ -4883,7 +4896,7 @@ struct Serve {
         const char* finish = "length";
         // a request alone with the MTP block: speculative steps of mtp_d drafts (verified: a greedy request's text is the greedy
         // text, a sampled one's every token a draw from the model, see spec_step); requests beside others, one token at a time
-        const bool spec = E.mtp_d > 0 && !adm;
+        const bool spec = E.mtp_d > 0 && !adm && (E.mtp_sampled || !smp.needs_logits());
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
         int nx = smp.needs_logits() ? -1 : E.greedy();
@@ -5044,7 +5057,7 @@ int strata::qwen35::run(int argc, char** argv) {
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false, kv16 = false, kvq8 = false, kvq4 = false;
     int vram_reserve = -1;
-    bool drop_packed = false, mtp_resident = false;
+    bool drop_packed = false, mtp_resident = false, seg_graphs = false, small_scores = false, pcie_share = false, mtp_sampled = false;
     bool kv_p2p = false;
     int prompt_cache = 6, turn_token = 248045, ck_every = 4096;   // the prompt cache's checkpoints (q36_ckpt.hpp)
     int kv_gpu = -1;   // --kv-gpu N: the K / V cache and the attention on device N (-1: all on the main device)
@@ -5128,6 +5141,10 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--drop-packed") drop_packed = true;   // the packed Q8_0 decode copies back to the experts (hybrid mode too)
         else if (a == "--embd-host") g_embd_host = true;     // the token embeddings in host memory (0.3 to 0.5 GiB of VRAM for the experts)
         else if (a == "--mtp-resident") mtp_resident = true;   // every expert of the MTP block in VRAM (hybrid mode)
+        else if (a == "--seg-graphs") seg_graphs = true;       // hybrid mode: the decode as CUDA graphs cut at each hybrid layer
+        else if (a == "--small-scores") small_scores = true;   // hybrid mode: the attention scores buffer at 64 MB
+        else if (a == "--pcie-share") pcie_share = true;       // hybrid mode: a share of the missed experts over PCIe
+        else if (a == "--mtp-sampled") mtp_sampled = true;     // MTP drafts for sampled requests too
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
@@ -5190,6 +5207,9 @@ int strata::qwen35::run(int argc, char** argv) {
     E.vram_reserve_mib = vram_reserve;
     E.drop_packed = drop_packed;
     E.mtp_resident = mtp_resident;
+    E.small_scores = small_scores;
+    E.pcie_share = pcie_share || std::getenv("STRATA_Q36_PCIE_GBPS") != nullptr;
+    E.mtp_sampled = mtp_sampled;
     if (kv_gpu >= 0) {
         int n_dev = 0;
         CK(cudaGetDeviceCount(&n_dev));
@@ -5277,10 +5297,13 @@ int strata::qwen35::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
     }
-    E.seg_ok = graph && E.main_hybrid && !E.kvr && !E.verify_k && !E.debug_graphs_off();
+    E.seg_ok = seg_graphs && graph && E.main_hybrid && !E.kvr && !E.verify_k && !E.debug_graphs_off();
     if (E.main_hybrid)
-        std::fprintf(stderr, "strata-q36: hybrid mode: the decode's kernels %s\n",
-                     E.seg_ok ? "run as CUDA graphs cut at every hybrid layer (STRATA_Q36_SEG_GRAPH=0: eager launches)" : "are launched one by one");
+        std::fprintf(stderr, "strata-q36: hybrid mode: the decode's kernels %s; options on: %s%s%s%s%s(each opt-in: --seg-graphs, "
+                     "--pcie-share, --small-scores, --mtp-sampled, --mtp-resident)\n",
+                     E.seg_ok ? "run as CUDA graphs cut at every hybrid layer" : "are launched one by one",
+                     E.seg_ok ? "seg-graphs " : "", E.pcie_gbps > 0 ? "pcie-share " : "", E.small_scores ? "small-scores " : "",
+                     E.mtp_sampled ? "mtp-sampled " : "", E.mtp_resident ? "mtp-resident " : "");
     struct Report {
         Engine& E;
         ~Report() {

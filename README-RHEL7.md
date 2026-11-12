@@ -233,6 +233,21 @@ tools/build_rhel7.sh --arch "61;75" --cuda-home /usr/local/cuda-12.4 --ggml ~/ll
 ```
 Résultat : `build-rhel7/strata-q36` et `libstrata_kq.so`, puis `"exe": ".../build-rhel7/strata-q36"` dans `strata-<modèle>.json`. Mesuré dans le conteneur : 622 s pour `61;75` avec 3 jobs (`--jobs N` pour changer).
 
+## Les options d'optimisation de novembre : toutes à activer une par une
+
+Les changements des sections suivantes **ne sont plus actifs par défaut** (sauf le tirage top‑k sur la carte, qui fait exactement le même calcul) : sans option, le moteur fait ce qu'il faisait avant. Chacune s'active dans `args`, et la ligne de démarrage `hybrid mode: … options on: …` dit lesquelles tournent. Ajoutez‑les **une à la fois**, en comparant le débit de décodage (ligne `generated in … (… tok/s)`) et la lecture des prompts sur une même conversation :
+
+| Option | Ce qu'elle fait | Risque de ralentir |
+|---|---|---|
+| `--seg-graphs` | décodage hybride en graphes CUDA coupés à chaque couche hybride | faible ; à mesurer |
+| `--pcie-share` | une part des experts manquants copiée par PCIe à côté du pool CPU, et gardée en VRAM | oui si le PCIe est lent ou si le pool CPU est rapide (les copies évincent des experts utiles) |
+| `--small-scores` | tampon de scores d'attention à 64 Mo (≈ 4 experts de plus par couche) | **oui pour les longs prompts** : l'attention du prompt se fait en tranches 4 fois plus petites |
+| `--mtp-sampled` | brouillons MTP aussi pour les requêtes échantillonnées | **oui en mode hybride** si peu de brouillons sont acceptés : la fenêtre de 3 lignes demande au CPU 2 à 3 fois plus d'experts distincts par couche |
+| `--mtp-resident` | les 256 experts du bloc MTP en VRAM | oui si les brouillons sont peu acceptés (6 emplacements de moins ailleurs) |
+| `--embd-host` | les embeddings en mémoire hôte (0,3 à 0,5 Go rendus) | très faible |
+
+Le tirage top‑k sur la carte reste actif (`STRATA_Q36_HOST_SAMPLE=1` rend l'ancien chemin).
+
 ## Brouillons MTP avec l'échantillonnage, et le tirage sur la carte
 
 Deux changements du décodage (`git pull`, puis recompiler, étape 3), tous deux **non mesurés sur une carte** (pas de GPU ici) :
