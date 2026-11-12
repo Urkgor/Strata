@@ -2923,7 +2923,7 @@ struct Engine {
         const int64_t n_ent = (int64_t) T * Kp;
         CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaMemcpyAsync(h_h, h, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
-        CK(cudaEventRecord(ev_route, st));
+        if (!seg_cur) CK(cudaEventRecord(ev_route, st));   // (a segment graph's gap waits for the stream instead)
         group_entries(L, hy[li].slot_of_d, T);
         if (!xq_post) quant(h, N, T, xq);   // the experts' and the shared expert's input
         K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
@@ -2931,7 +2931,7 @@ struct Engine {
     }
     /// The CPU half: the entries without a slot on the pool (ggml-cpu's arithmetic for the layer's formats), their
     /// rows uploaded and merged into the entries' rows.
-    void moe_hybrid_cpu(size_t li, int T) {
+    void moe_hybrid_cpu(size_t li, int T, bool synced = false) {
 #if defined(STRATA_Q36_CPU_POOL)
         namespace C = strata::kernels::cpu;
         const auto& g = m->g;
@@ -2939,8 +2939,11 @@ struct Engine {
         const int n_ent = T * Kp;
         Hy& H = hy[li];
         const Layer& L = layer_at((int) li);
-        while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
-        }
+        // (`synced`: a segment graph's gap: the segment that holds the routing was waited for by the caller; the route event is not
+        // recorded inside a graph, and one captured in a graph must not be queried)
+        if (!synced)
+            while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
+            }
         const auto t0 = Clock::now();
         const bool defer = rows_deferred && li < m->layers.size();
         if (defer) {
@@ -3169,7 +3172,8 @@ struct Engine {
     void seg_gap(size_t li, int T) {
         seg_cut();
         seg_cur->gap_li.push_back((int) li);
-        moe_hybrid_cpu(li, T);
+        CK(cudaStreamSynchronize(st));
+        moe_hybrid_cpu(li, T, true);
         seg_begin();
     }
     template <class F> void run_seg(int key, int T, F body) {
@@ -3184,7 +3188,10 @@ struct Engine {
         } else {
             for (size_t i = 0; i < R.segs.size(); ++i) {
                 CK(cudaGraphLaunch(R.segs[i], st));
-                if (i < R.gap_li.size()) moe_hybrid_cpu((size_t) R.gap_li[i], T);
+                if (i < R.gap_li.size()) {
+                    CK(cudaStreamSynchronize(st));
+                    moe_hybrid_cpu((size_t) R.gap_li[i], T, true);
+                }
             }
         }
         // what the body leaves behind on the host (the first run did it itself)
