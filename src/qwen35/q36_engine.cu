@@ -3173,7 +3173,7 @@ struct Engine {
         seg_begin();
     }
     template <class F> void run_seg(int key, int T, F body) {
-        SegRun& R = seg_runs[key];
+        SegRun& R = seg_runs[cur * 10000 + key];   // (a session's graphs hold its own state and cache pointers)
         if (!R.built) {
             seg_cur = &R;
             seg_begin();
@@ -5270,7 +5270,7 @@ int strata::qwen35::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
     }
-    E.seg_ok = graph && E.main_hybrid && !E.kvr && !E.verify_k && !E.debug_graphs_off() && E.n_sess == 1;
+    E.seg_ok = graph && E.main_hybrid && !E.kvr && !E.verify_k && !E.debug_graphs_off();
     if (E.main_hybrid)
         std::fprintf(stderr, "strata-q36: hybrid mode: the decode's kernels %s\n",
                      E.seg_ok ? "run as CUDA graphs cut at every hybrid layer (STRATA_Q36_SEG_GRAPH=0: eager launches)" : "are launched one by one");
