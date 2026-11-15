@@ -29,6 +29,7 @@
 #include "strata/qwen35/sampling.hpp"
 #include "q36_kernels.cuh"
 #include "q36_sample.cuh"
+#include "q36_copy.hpp"
 #include "q36_attn.cuh"
 #include "q36_blas_check.hpp"
 #include "q36_ckpt.hpp"
@@ -1406,6 +1407,8 @@ struct Engine {
     bool drop_packed = false;    // --drop-packed: give the packed Q8_0 decode copies back to the experts, hybrid mode too
     bool small_scores = false;   // --small-scores: the attention scores buffer at 64 MB in the hybrid mode (more slots, slower long prompts)
     bool pcie_share = false;     // --pcie-share: a share of each batch's missed experts copied over PCIe beside the CPU pool
+    bool cp_mtp_fill = true;     // a copy step runs the MTP block over its redo rows (the request drafts with it too)
+    bool copy_drafts = false;    // --copy-drafts: drafts copied from the conversation (q36_copy.hpp), beside or without the MTP block
     bool mtp_sampled = false;    // --mtp-sampled: MTP drafts for sampled requests too (exact acceptance, see spec_step)
     bool mtp_resident = false;   // --mtp-resident: every expert of the MTP block in VRAM (it runs D + 1 times a step), the main layers' slots fewer
     bool main_hybrid = false;   // some main layer is hybrid (else only the MTP block is: the decode graph stays)
@@ -3756,11 +3759,16 @@ struct Engine {
     /// verify window: row r is sampled from its own logits (the model's distribution after x, d1 .. dr: the rows compute what a
     /// decode step computes), and draft d_{r+1} is kept when that draw is it, else the draw is the token after the kept ones.  Every
     /// emitted token is a draw from the model's distribution, as without drafts; the text differs from the plain path at equal seed.
+    /// `copy` (--copy-drafts, q36_copy.hpp): the drafts are these tokens, copied from the conversation, instead of the MTP block's (up to
+    /// kVerify - 1 of them); the block still runs over the rows it must redo, without drafting, so that its cache stays complete.
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
                   const std::atomic<bool>* cancel = nullptr, const strata::qwen35::PenaltyWindow* pw = nullptr,
-                  std::mt19937_64* rng = nullptr) {
+                  std::mt19937_64* rng = nullptr, const std::vector<int32_t>* copy = nullptr) {
         const int N = (int) m->g.n_embd;
+        if (copy) D = std::min<int>((int) copy->size(), kVerify - 1);
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
+        D = std::max(0, D);
+        if (copy) return copy_window(x_tok, fix, D, *copy, drafts, picks, cancel, pw, rng);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
         CK(cudaStreamSynchronize(st));
         // rows of the first MTP call: (hmain row i, fix[i]) at positions pos - fix.size() + i, then (hlast, x) at pos
@@ -3792,21 +3800,35 @@ struct Engine {
             else forward_mtp(1, pos + d, seeds, true, false);
             CK(cudaMemcpyAsync(dpicks + d, pick_m, 4, cudaMemcpyDeviceToDevice, st));
         }
-        // the verify window: x then the drafts
+        return verify_window(x_tok, D, true, drafts, picks, cancel, pw, rng);
+    }
+
+    /// The verify window [x, drafts] and what it keeps: the drafts the model picks itself (greedy: its arg-max; sampled: a draw per row,
+    /// see spec_step), then the state and the position advanced by the kept rows.  `on_device`: the drafts are in dpicks (the MTP
+    /// chain), else in `drafts` on the host.
+    int verify_window(int x_tok, int D, bool on_device, std::vector<int32_t>& drafts, int32_t* picks, const std::atomic<bool>* cancel,
+                      const strata::qwen35::PenaltyWindow* pw, std::mt19937_64* rng) {
+        const int N = (int) m->g.n_embd;
         const int T = D + 1;
         hpin[16] = x_tok;
         hpin[40] = (int32_t) pos;
-        CK(cudaMemcpyAsync(tok, hpin + 16, 4, cudaMemcpyHostToDevice, st));
-        if (D > 0) CK(cudaMemcpyAsync(tok + 1, dpicks, (size_t) D * 4, cudaMemcpyDeviceToDevice, st));
+        if (on_device) {
+            CK(cudaMemcpyAsync(tok, hpin + 16, 4, cudaMemcpyHostToDevice, st));
+            if (D > 0) CK(cudaMemcpyAsync(tok + 1, dpicks, (size_t) D * 4, cudaMemcpyDeviceToDevice, st));
+        } else {
+            for (int d = 0; d < D; ++d) hpin[17 + d] = drafts[(size_t) d];
+            CK(cudaMemcpyAsync(tok, hpin + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        }
         CK(cudaMemcpyAsync(pos0, hpin + 40, 4, cudaMemcpyHostToDevice, st));
         rows_deferred = true;
         if (seg_ok) run_seg(1000 + T, T, [&] { forward(T, pos, T, true, true); });
         else graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); });
         rows_deferred = false;
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
-        if (D > 0) CK(cudaMemcpyAsync(hpin + 48, dpicks, (size_t) D * 4, cudaMemcpyDeviceToHost, st));
+        if (on_device && D > 0) CK(cudaMemcpyAsync(hpin + 48, dpicks, (size_t) D * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
-        for (int d = 0; d < D; ++d) drafts[(size_t) d] = hpin[48 + d];
+        if (on_device)
+            for (int d = 0; d < D; ++d) drafts[(size_t) d] = hpin[48 + d];
         int a = 0;
         if (pw != nullptr) {
             const int k = host_sample ? 0 : topk_rows(*pw, drafts.data(), T);
@@ -3826,6 +3848,29 @@ struct Engine {
         pos += a + 1;
         after_rows(a + 1);
         return a;
+    }
+
+    /// A copy step: the MTP block over the rows it must redo (no drafting: its cache only), then the verify window of the copied drafts.
+    int copy_window(int x_tok, const std::vector<int32_t>& fix, int D, const std::vector<int32_t>& copy, std::vector<int32_t>& drafts,
+                    int32_t* picks, const std::atomic<bool>* cancel, const strata::qwen35::PenaltyWindow* pw, std::mt19937_64* rng) {
+        const int N = (int) m->g.n_embd;
+        CK(cudaStreamSynchronize(st));
+        if (m->has_mtp && mtp_d > 0 && cp_mtp_fill) {
+            const int T0 = (int) fix.size() + 1;
+            for (int i = 0; i < (int) fix.size(); ++i) hpin[16 + i] = fix[(size_t) i];
+            hpin[16 + fix.size()] = x_tok;
+            hpin[1] = (int32_t) (pos - (int64_t) fix.size());
+            CK(cudaMemcpyAsync(tok_m, hpin + 16, (size_t) T0 * 4, cudaMemcpyHostToDevice, st));
+            CK(cudaMemcpyAsync(pos0_m, hpin + 1, 4, cudaMemcpyHostToDevice, st));
+            float* seeds = mtp_seed();
+            if (!fix.empty()) CK(cudaMemcpyAsync(seeds, hmain, fix.size() * (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+            CK(cudaMemcpyAsync(seeds + fix.size() * (size_t) N, hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+            if (seg_ok) run_seg(2200 + T0, T0, [&] { forward_mtp(T0, pos - (int64_t) fix.size(), seeds, false, true); });
+            else forward_mtp(T0, pos - (int64_t) fix.size(), seeds, false, false);
+            CK(cudaStreamSynchronize(st));   // (hpin[16 ..] is the verify window's next)
+        }
+        drafts.assign(copy.begin(), copy.begin() + D);
+        return verify_window(x_tok, D, false, drafts, picks, cancel, pw, rng);
     }
 
     /// The first prompt after load ran at about half speed (pp4096 rep 0: ~1770 tok/s against ~3290): the GPU's code
@@ -4935,6 +4980,9 @@ struct Serve {
             return;
         }
         bool have_nx = !smp.needs_logits();   // nx is decided (greedy above, or a speculative step's last draw)
+        q36cp::CopyDrafter cdr;                // --copy-drafts: drafts copied from the conversation (q36_copy.hpp)
+        if (E.copy_drafts) cdr.reset(ids, (int) std::min<int64_t>(max_new, E.ctx));
+        long long c_offered = 0, c_accepted = 0, c_steps = 0;
         for (;;) {
             if (!have_nx) nx = E.sample_next(pw, rng);
             have_nx = false;
@@ -4944,6 +4992,7 @@ struct Serve {
                 ++produced;
                 hist.push_back(t);
                 pw.push(t);
+                if (E.copy_drafts) cdr.push(t);
                 if (is_eos(t)) { finish = "stop"; return false; }
                 if (produced >= max_new) return false;
                 if (stop.load()) { finish = "cancel"; return false; }
@@ -4951,9 +5000,25 @@ struct Serve {
             };
             if (!emit(nx)) break;
             if (n_active > 0) window();
-            if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop, smp.needs_logits() ? &pw : nullptr, &rng);
-                offered += E.mtp_d;
+            std::vector<int32_t> cd;
+            if (E.copy_drafts && n_active == 0) {
+                const int room = (int) std::min<int64_t>({(int64_t) Engine::kVerify - 1, (int64_t) E.ctx - (int64_t) E.pos - 1,
+                                                          (int64_t) max_new - (int64_t) produced});
+                if (room > 0) cd = cdr.propose(room);
+                if ((int) cd.size() <= (spec ? E.mtp_d : 1)) cd.clear();   // (no more than the MTP block would offer: its drafts then)
+                E.cp_mtp_fill = spec;   // (the block's cache matters only to a request that drafts with it)
+            }
+            if ((!cd.empty() || spec) && n_active == 0 && E.pos + std::max<int>((int) cd.size(), E.mtp_d) + 1 <= E.ctx) {
+                const bool cp = !cd.empty();
+                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop, smp.needs_logits() ? &pw : nullptr, &rng,
+                                          cp ? &cd : nullptr);
+                if (cp) {
+                    cdr.result(a, (int) drafts.size());
+                    c_offered += (long long) drafts.size();
+                    c_accepted += a;
+                    ++c_steps;
+                }
+                offered += cp ? (long long) drafts.size() : E.mtp_d;
                 accepted += a;
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
                 // answer, max_new): the held tokens say so, so a later request that continues this conversation matches them
@@ -4987,6 +5052,9 @@ struct Serve {
                      rc.src == q36ck::kTurn ? " (turn checkpoint)" : rc.src == q36ck::kPin ? " (pinned prefix)" : "",
                      (long long) fresh, prompt_ms, prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, produced,
                      decode_ms, decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, accepted, offered, finish);
+        if (E.copy_drafts)
+            std::fprintf(stderr, "strata serve: copy drafts: %lld steps, %lld of %lld kept (%lld cursor continuations)\n", c_steps, c_accepted,
+                         c_offered, cdr.cursor_hits);
     }
 
     int run() {
@@ -5058,6 +5126,7 @@ int strata::qwen35::run(int argc, char** argv) {
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false, kv16 = false, kvq8 = false, kvq4 = false;
     int vram_reserve = -1;
     bool drop_packed = false, mtp_resident = false, seg_graphs = false, small_scores = false, pcie_share = false, mtp_sampled = false;
+    bool copy_drafts = false;
     bool kv_p2p = false;
     int prompt_cache = 6, turn_token = 248045, ck_every = 4096;   // the prompt cache's checkpoints (q36_ckpt.hpp)
     int kv_gpu = -1;   // --kv-gpu N: the K / V cache and the attention on device N (-1: all on the main device)
@@ -5145,6 +5214,7 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--small-scores") small_scores = true;   // hybrid mode: the attention scores buffer at 64 MB
         else if (a == "--pcie-share") pcie_share = true;       // hybrid mode: a share of the missed experts over PCIe
         else if (a == "--mtp-sampled") mtp_sampled = true;     // MTP drafts for sampled requests too
+        else if (a == "--copy-drafts") copy_drafts = true;     // drafts copied from the conversation (edits, quotes, records)
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
@@ -5210,6 +5280,10 @@ int strata::qwen35::run(int argc, char** argv) {
     E.small_scores = small_scores;
     E.pcie_share = pcie_share || std::getenv("STRATA_Q36_PCIE_GBPS") != nullptr;
     E.mtp_sampled = mtp_sampled;
+    E.copy_drafts = copy_drafts;
+    if (copy_drafts)
+        std::fprintf(stderr, "strata-q36: --copy-drafts: drafts copied from the conversation (up to %d a step) when the answer repeats it\n",
+                     Engine::kVerify - 1);
     if (kv_gpu >= 0) {
         int n_dev = 0;
         CK(cudaGetDeviceCount(&n_dev));

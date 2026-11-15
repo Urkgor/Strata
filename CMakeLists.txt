@@ -359,6 +359,10 @@ if(STRATA_BUILD_TESTS)
   target_compile_options(q36_attn_gqa_test PRIVATE -ffp-contract=off -fno-strict-aliasing)
   target_link_libraries(q36_attn_gqa_test PRIVATE Threads::Threads)
   add_test(NAME q36_attn_gqa_test COMMAND q36_attn_gqa_test)
+  # the Qwen3.6 engine's copy drafter (--copy-drafts) against scripted answers: an edit, look-alike records, nothing to copy, false matches
+  add_executable(q36_copy_test tests/core/q36_copy_test.cpp)
+  target_include_directories(q36_copy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
+  add_test(NAME q36_copy_test COMMAND q36_copy_test)
   # the Qwen3.6 sampler's device half (the penalties from a list, the top k of a row) on the CPU emulation of CUDA, against the host reference
   add_executable(q36_sample_test tests/core/q36_sample_test.cpp)
   target_include_directories(q36_sample_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35 ${CMAKE_CURRENT_SOURCE_DIR}/tests/core ${CMAKE_CURRENT_SOURCE_DIR}/include)

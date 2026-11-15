@@ -42,6 +42,7 @@ MANAGED = {
     "--mtp-resident": False,
     "--draft-vocab": True,
     "--cpu-threads": True,
+    "--copy-drafts": False,
 }
 
 # What a turn looks like: the prompt it reads (new tokens at a depth of `context`), what it writes, with what sampling.
@@ -152,7 +153,8 @@ def physical_cores() -> int:
 
 def steps(quick: bool, has_mtp: bool, sampled: bool, cores: int) -> list[tuple[str, list]]:
     """The search, option by option: (name, values to try besides the current one)."""
-    s: list[tuple[str, list]] = [("--seg-graphs", [True, None]), ("--embd-host", [True, None]), ("--pcie-share", [True, None])]
+    s: list[tuple[str, list]] = [("--seg-graphs", [True, None]), ("--embd-host", [True, None]), ("--pcie-share", [True, None]),
+                                 ("--copy-drafts", [True, None])]
     if has_mtp:
         s.append(("--mtp", ["0", "1", "2", "3"]))
         if sampled:

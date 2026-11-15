@@ -233,6 +233,17 @@ tools/build_rhel7.sh --arch "61;75" --cuda-home /usr/local/cuda-12.4 --ggml ~/ll
 ```
 Résultat : `build-rhel7/strata-q36` et `libstrata_kq.so`, puis `"exe": ".../build-rhel7/strata-q36"` dans `strata-<modèle>.json`. Mesuré dans le conteneur : 622 s pour `61;75` avec 3 jobs (`--jobs N` pour changer).
 
+## Brouillons copiés de la conversation : `--copy-drafts`
+
+Quand une réponse recopie son entrée (un outil d'édition qui réécrit une fonction, un fichier rendu avec quelques changements, des enregistrements JSON modifiés un par un), les tokens qui suivent les derniers écrits ont déjà été vus, dans le prompt ou plus tôt dans la réponse : ce qui les suivait est un bon brouillon. Avec `"--copy-drafts"` dans `args` (option, désactivée par défaut), le moteur propose jusqu'à **7 tokens copiés** par pas et les vérifie dans la même fenêtre que les brouillons MTP. Seuls ceux que le modèle choisit lui‑même sont gardés : **le texte ne change pas** (glouton) et chaque token reste un tirage du modèle (échantillonné). L'idée vient de YASAKANI (index des séquences de 4 tokens, curseur qui suit la source, reprise à l'endroit le plus proche pour ne pas mélanger des lignes qui se ressemblent) ; c'est une implémentation à part, avec des fenêtres de 8 lignes au plus (au‑delà, le moteur passerait aux noyaux de prompt, qui ne donnent pas les mêmes chiffres).
+
+- Le nombre de brouillons s'adapte : 3 au départ, +2 tant que tout est gardé (7 au plus), retour à ce qui a été gardé après un refus, et une pause après deux faux départs (une fausse correspondance coûte une fenêtre entière).
+- Avec le MTP : une copie est préférée quand elle propose plus de tokens que le bloc MTP, sinon ce sont les brouillons MTP. Sans `--mtp-sampled`, une requête échantillonnée n'a que les copies.
+- Journal, par requête : `copy drafts: N steps, X of Y kept (Z cursor continuations)` ; la ligne `DONE` compte copies et MTP ensemble dans `accepted / offered`.
+- `--calibrate` l'essaie aussi.
+
+Coût en mode hybride : une fenêtre de 8 lignes demande au pool CPU les experts de 8 tokens (estimé 2,5 à 4 fois un pas). Elle paye quand 3 à 4 copies sont gardées : c'est le cas des éditions (≈ 7 sur 7), pas de la prose, où rien n'est proposé. Vérifié : le drafter sur des réponses scriptées (`q36_copy_test` : une édition de 2 000 tokens à 7,55 tokens par pas, des enregistrements qui se ressemblent à 5,7 par pas, rien de proposé sur de la prose, faux départs limités) et la compilation CUDA 12.4. **Pas de mesure sur une carte.**
+
 ## Trouver les meilleures options pour sa machine : `--calibrate`
 
 ```sh
