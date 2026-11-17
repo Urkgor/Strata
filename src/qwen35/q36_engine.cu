@@ -24,8 +24,12 @@
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/qwen35/context_fit.hpp"
+#if defined(__linux__) && defined(STRATA_Q36_CPU_POOL)
+#include "strata/kernels/cpu/card_node.hpp"
+#endif
 #include "strata/qwen35/engine.hpp"
 #include "strata/qwen35/sampling.hpp"
 #include "q36_kernels.cuh"
@@ -1581,10 +1585,14 @@ struct Engine {
             rcur = dalloc_t<int32_t>((size_t) g.n_expert);
             rbounds = dalloc_t<int32_t>((size_t) g.n_expert + 1);
             rmax = dalloc_t<int32_t>(1);
-            ident = dalloc_t<int32_t>((size_t) ne);
+            // (from main a041fd038) llama.cpp's MMQ reads the row table past its end (a whole J-column tile, J up to 128, and the stream-k fixup up to
+            // roundup(max_rows, J)): the table takes roundup(max_rows, 128) + 128 entries, max_rows <= T, and the identity is written over all of them
+            const int64_t ids_rows = (int64_t) MMQ::mmq_ids_table_rows((uint64_t) ne, (uint64_t) T);
+            if (ids_rows <= 0) { std::fprintf(stderr, "strata-q36: the MMQ row table does not fit\n"); std::exit(1); }
+            ident = dalloc_t<int32_t>((size_t) ids_rows);
             rinv = dalloc_t<int32_t>((size_t) ne);
             CK(cudaDeviceSynchronize());   // ident's cudaMemset (legacy stream) before the iota on the non-blocking stream
-            MMQ::iota(ident, ne, st);
+            MMQ::iota(ident, ids_rows, st);
             CK(cudaMalloc(&mq_x, MMQ::q8_bytes(ne, g.n_embd)));
             CK(cudaMalloc(&mq_hq, MMQ::q8_bytes(ne, g.n_ff)));
             mq_gu = dalloc((size_t) ne * 2 * FF);
@@ -5387,6 +5395,56 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr, "strata-q36: chunk rule: free %.2f GiB (raw %.2f, with %.2f packed), main experts %.2f GiB, chunk %d\n",
                          fr / 1073741824.0, fr_raw / 1073741824.0, packed / 1073741824.0, experts / 1073741824.0, chunk);
     }
+#if defined(__linux__) && defined(STRATA_Q36_CPU_POOL)
+    {   // (from main 716ebae14) THE CARD'S NUMA NODE (strata/kernels/cpu/card_node.hpp): on a machine with two or more memory nodes the process
+        // restricts itself to the CPUs of the card's node before the pool, its threads and the pinned expert arena exist (measured there:
+        // decode with CPU experts on a two-socket host 1.11-1.18 times).  One node, STRATA_NUMA_CARD=0, or a case the rule leaves: nothing changes.
+        namespace kc = strata::kernels::cpu;
+        kc::CardNodeInput ci;
+        ci.switch_off = kc::card_node_switch_off(std::getenv("STRATA_NUMA_CARD"));
+        const std::map<int, std::vector<int>> node_cpus =
+            ci.switch_off ? std::map<int, std::vector<int>>{} : kc::card_node_node_cpus("/sys");
+        ci.nodes_with_cpus = ci.switch_off ? 1 : std::max(1, (int) node_cpus.size());
+        std::string cards_text;
+        if (!ci.switch_off && ci.nodes_with_cpus >= 2) {
+            ci.mask = kc::card_node_describe("/sys", kc::card_node_thread_cpus(), node_cpus);
+            std::string status;
+            if (kc::card_node_read_file("/proc/self/status", status)) ci.mems_known = kc::card_node_mems_allowed(status, ci.mems_allowed);
+            int dev = 0;
+            CK(cudaGetDevice(&dev));
+            cudaDeviceProp p{};
+            int node = -1;
+            std::string bdf = "?";
+            if (cudaGetDeviceProperties(&p, dev) == cudaSuccess) {
+                bdf = kc::card_node_bdf((unsigned) p.pciDomainID, (unsigned) p.pciBusID, (unsigned) p.pciDeviceID);
+                node = kc::card_node_pci_node("/sys", bdf);
+            } else {
+                (void) cudaGetLastError();
+            }
+            ci.card_nodes.push_back(node);
+            cards_text = "CUDA" + std::to_string(dev) + " " + bdf + " node " + std::to_string(node);
+            ci.card_node_free_bytes = kc::card_node_free_bytes("/sys", node);
+            ci.pinned_need_bytes = kc::card_node_pinned_need(ctx);
+            if (const char* e = std::getenv("STRATA_POOL_CORES"); e != nullptr && *e) ci.user_placed = "STRATA_POOL_CORES is set";
+            const kc::CpuTopology topo = kc::detect_cpu_topology(true);
+            ci.hybrid = topo.is_hybrid;
+            ci.cpu_quota = topo.cpu_quota;
+            ci.user_workers = cpu_threads > 0 ? cpu_threads : 0;
+            kc::PoolPlanInput pin = kc::pool_plan_input(topo);
+            ci.today_workers = ci.user_workers > 0 ? ci.user_workers
+                                                   : std::min(kc::plan_pool_workers(pin).workers, std::max(1, (int) topo.worker_cores.size()));
+        }
+        const kc::CardNodeDecision cd = kc::decide_card_node(ci);
+        int moved = 0, refused = 0;
+        if (cd.on) moved = kc::restrict_process_cpus(cd.cpus, refused);
+        if (ci.nodes_with_cpus >= 2)
+            std::fprintf(stderr, "strata-q36: %d memory nodes; card %s: %s%s (STRATA_NUMA_CARD=0 turns it off)\n", ci.nodes_with_cpus,
+                         cards_text.empty() ? "not read" : cards_text.c_str(), cd.on ? "the engine runs on the card's node" : "left as is: ",
+                         cd.on ? "" : cd.why.c_str());
+        (void) moved;
+        (void) refused;
+    }
+#endif
     E.init(m, ctx, chunk, batch, vision);
     if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, err)) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
