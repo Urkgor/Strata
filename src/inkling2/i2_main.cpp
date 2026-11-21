@@ -57,7 +57,8 @@ private:
 void usage() {
     std::fprintf(stderr,
                  "usage: strata-inkling2 --model GGUF [--serve | --tokens ID,ID,... [--n N]] [--max-context N] [--cpu] [--gpu 0,1] [--eos ID,ID,...]\n"
-                 "                       [--dump-logits FILE [--all]] [--loop-passes N]\n");
+                 "                       [--dump-logits FILE [--all]] [--loop-passes N]\n"
+                 "       GPU: [--prefill N] [--swa-slack N] [--vram-reserve-mib N] [--host-experts N] [--check] [--bench-pp N] [--bench-tg N]\n");
 }
 
 }  // namespace
