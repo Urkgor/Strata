@@ -40,10 +40,11 @@ options:
                      server starts it as `strata-q36 --serve ...`, the same arguments
   --gemma4           build strata-gemma4, the Gemma 4 26B-A4B engine (src/gemma4), instead of strata-q36: it needs no llama.cpp (no --ggml, no
                      network).  Run it with "exe": ".../strata-gemma4" in the model's config; docs/GEMMA4.md
+  --inkling2         build strata-inkling2, the Inkling 2 Mini engine (src/inkling2), like --gemma4 (no llama.cpp, no network); docs/INKLING2.md
   --no-kq            leave out libstrata_kq.so, the prompt kernels for Unsloth's UD-Q4/Q5/Q6_K_XL files (default: built)
 EOF
 }
-KQ=1; GEMMA4=""
+KQ=1; GEMMA4=""; INKLING2=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --arch) ARCH="$2"; shift 2 ;;
@@ -58,6 +59,7 @@ while [ $# -gt 0 ]; do
     --no-kq) KQ=0; shift ;;
     --q36-only) Q36ONLY=1; shift ;;
     --gemma4) GEMMA4=1; shift ;;
+    --inkling2) INKLING2=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "build_rhel7: unknown option $1 (--help lists them)" >&2; exit 2 ;;
   esac
@@ -207,13 +209,14 @@ set -- -S . -B "$BUILD_DIR" -G "$GEN" -DCMAKE_BUILD_TYPE=Release \
 [ -z "$GGML_TAG" ] || set -- "$@" "-DSTRATA_GGML_TAG=$GGML_TAG"
 [ -z "$Q36ONLY" ] || set -- "$@" -DSTRATA_Q36_ONLY=ON    # compile only the sources strata-q36 links (CMakeLists.txt, STRATA_Q36_ONLY)
 # the Gemma 4 engine uses nothing of ggml: no llama.cpp to fetch, and the options that compile ggml's MMQ kernels off
-[ -z "$GEMMA4" ] || set -- "$@" -DSTRATA_NATIVE_EXPERTS=OFF -DSTRATA_Q6K_EXPERTS=OFF -DSTRATA_MMQ_KQUANTS=OFF
+[ -z "$GEMMA4$INKLING2" ] || set -- "$@" -DSTRATA_NATIVE_EXPERTS=OFF -DSTRATA_Q6K_EXPERTS=OFF -DSTRATA_MMQ_KQUANTS=OFF
 [ "$KQ" = 1 ] && TARGETS="strata strata_kq"
 if [ -n "$Q36ONLY" ]; then
   ENGINE_BIN="strata-q36"; TARGETS="strata-q36"
   [ "$KQ" = 1 ] && TARGETS="strata-q36 strata_kq"
 fi
 [ -z "$GEMMA4" ] || { ENGINE_BIN="strata-gemma4"; TARGETS="strata-gemma4"; KQ=0; }
+[ -z "$INKLING2" ] || { ENGINE_BIN="strata-inkling2"; TARGETS="strata-inkling2"; KQ=0; }
 note "configuring $BUILD_DIR (sm_$(printf '%s' "$ARCH" | sed 's/;/, sm_/g'))"
 "$CMAKE_BIN" "$@"
 note "building $TARGETS with $JOBS jobs (a few minutes for one architecture, 10-30 for several)"

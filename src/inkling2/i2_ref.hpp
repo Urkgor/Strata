@@ -43,6 +43,7 @@ namespace i2 {
 
 struct RefOpts {
     int threads = 1;
+    bool cache_f16 = false;      // keep K / V as halves (what the CUDA engine does) instead of floats
 };
 
 class RefEngine {
@@ -87,6 +88,10 @@ private:
     const Hparams& hp_;
     int ctx_;
     RefOpts opt_;
+public:
+    std::vector<std::vector<int>>* sel_trace = nullptr;
+    std::vector<std::vector<float>>* trace = nullptr;     // test hook: the stream after every visit, token by token
+private:
     int passes_ = 0;
     int64_t pos_ = 0;
     std::vector<std::vector<float>> kc_, vc_, ci_;       // per visit: K / V [kv head][ctx][hd]; convolution inputs [pos][channels]
@@ -270,6 +275,10 @@ private:
         // cache the new K / V
         std::vector<float>& kc = kc_[(size_t) visit];
         std::vector<float>& vc = vc_[(size_t) visit];
+        if (opt_.cache_f16) {
+            for (auto& x : k) x = g4::half_to_float(g4::float_to_half(x));
+            for (auto& x : v) x = g4::half_to_float(g4::float_to_half(x));
+        }
         for (int h = 0; h < KV; ++h) {
             std::memcpy(kc.data() + ((size_t) h * (size_t) ctx_ + (size_t) pos_) * (size_t) hd, k.data() + (size_t) h * hd, (size_t) hd * 4);
             std::memcpy(vc.data() + ((size_t) h * (size_t) ctx_ + (size_t) pos_) * (size_t) hd, v.data() + (size_t) h * hd, (size_t) hd * 4);
@@ -336,6 +345,7 @@ private:
         std::vector<int> order((size_t) NE);
         for (int e = 0; e < NE; ++e) order[(size_t) e] = e;
         std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return sel[(size_t) a] > sel[(size_t) b]; });
+        if (sel_trace) sel_trace->push_back(std::vector<int>(order.begin(), order.begin() + NU));
         float wsum = 0.f;
         for (int i = 0; i < NU; ++i) wsum += probs[(size_t) order[(size_t) i]];
         wsum += 1e-20f;
@@ -355,6 +365,7 @@ private:
         std::vector<float> fo;
         convolve(visit, 2 * kd + E, moe.data(), E, w.ffn_post_conv, nullptr, 1, fo);
         for (int i = 0; i < E; ++i) cur[(size_t) i] = ffn_inp[(size_t) i] + fo[(size_t) i];
+        if (trace) trace->push_back(cur);
     }
 
     void token(int32_t id, std::vector<float>* logits) {

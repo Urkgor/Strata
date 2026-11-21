@@ -936,6 +936,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     strata_utf8_manifest(strata-gemma4)
   endif()
 
+  # Inkling 2 Mini (Thinking Machines, GGUF inkling2_loop): its own engine, src/inkling2 - built on the Gemma 4 kernels and GGUF reader
+  # (src/gemma4), plus the looped layers, relative-position attention, short convolutions and block attention residuals.  docs/INKLING2.md.
+  if(STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP)
+    add_executable(strata-inkling2 src/inkling2/i2_main.cpp src/inkling2/i2_cuda.cu)
+    target_include_directories(strata-inkling2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/inkling2 ${_strata_gpu_include_directories})
+    target_compile_definitions(strata-inkling2 PRIVATE STRATA_I2_CUDA=1)
+    target_link_libraries(strata-inkling2 PRIVATE strata_warnings ${_strata_gpu_runtime_target})
+    strata_utf8_manifest(strata-inkling2)
+  endif()
+
   # DeepSeek-V4.1-Flash: the third engine path (src/dsv41, from Project Maya's maya-ds4, MIT, third_party/project-maya).
   # Its own executable for now (strata-dsv41); a family switch in `strata` comes after first light.  OFF by default: it
   # changes no existing target (the vendored kernels live in strata::dsv41k, so no symbol is shared with strata_kernels).
@@ -2878,6 +2889,19 @@ if(STRATA_G4_TINY_GGUF AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
   target_compile_definitions(g4_emu_test PRIVATE STRATA_G4_EMU=1)
   target_link_libraries(g4_emu_test PRIVATE Threads::Threads)
   add_test(NAME g4_emu_test COMMAND g4_emu_test ${STRATA_G4_TINY_GGUF} quick)
+endif()
+
+# ---- Inkling 2 engine: the emulation test runs src/inkling2/i2_cuda.cu as plain C++ on the CPU emulation of CUDA against the CPU reference on a tiny
+# model GGUF (-DSTRATA_I2_TINY_GGUF=..., tools/inkling2/make_tiny.py).
+set(STRATA_I2_TINY_GGUF "" CACHE FILEPATH "a tiny random Inkling 2 GGUF for the emulation test (tools/inkling2/make_tiny.py)")
+if(STRATA_I2_TINY_GGUF AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/src/inkling2/i2_cuda.cu ${CMAKE_CURRENT_BINARY_DIR}/inkling2_emu/i2_cuda_emu.cpp COPYONLY)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/inkling2/i2_cuda.cu)
+  add_executable(i2_emu_test tests/inkling2/i2_emu_test.cpp ${CMAKE_CURRENT_BINARY_DIR}/inkling2_emu/i2_cuda_emu.cpp)
+  target_include_directories(i2_emu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/gemma4 ${CMAKE_CURRENT_SOURCE_DIR}/src/inkling2 ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_definitions(i2_emu_test PRIVATE STRATA_G4_EMU=1)
+  target_link_libraries(i2_emu_test PRIVATE Threads::Threads)
+  add_test(NAME i2_emu_test COMMAND i2_emu_test ${STRATA_I2_TINY_GGUF} quick)
 endif()
 
 # ---- STRATA_Q36_ONLY: compile only what strata-q36 links --------------------------------------------------------------------
