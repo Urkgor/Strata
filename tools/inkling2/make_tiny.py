@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--gguf-py", default="/tmp/claude-0/ll2/src/gguf-py")
     ap.add_argument("--passes", type=int, default=None)
+    ap.add_argument("--pre", default="gpt-2", help="tokenizer.ggml.pre (inkling2: the o200k-style pre-tokenizer of the real model)")
     a = ap.parse_args()
     sys.path.insert(0, a.gguf_py)
     import gguf
@@ -100,7 +101,7 @@ def main():
     types = [gguf.TokenType.NORMAL] * c["vocab"]
     types[-1] = types[-2] = gguf.TokenType.CONTROL
     w.add_tokenizer_model("gpt2")
-    w.add_tokenizer_pre("gpt-2")
+    w.add_tokenizer_pre(a.pre)
     w.add_token_list(toks)
     w.add_token_types(types)
     w.add_token_merges(merges)

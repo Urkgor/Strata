@@ -391,5 +391,25 @@ class ByteCache(unittest.TestCase):
             self.assertEqual(list(pool.map(decode, texts)), texts)
 
 
+class Gpt4oPreTokenizer(unittest.TestCase):
+    """Inkling 2's pre-tokenizer (llama.cpp's gpt-4o type): words split at a case change, digits in threes, contractions stay with the word."""
+
+    def pieces(self, text):
+        t = ST.Tokenizer([ST.BYTE_TO_UNICODE[b] for b in range(256)], [], None, "inkling2")
+        return t._split(text)
+
+    def test_splits(self):
+        self.assertEqual(self.pieces("Hello, world!"), ["Hello", ",", " world", "!"])
+        self.assertEqual(self.pieces("camelCaseWord"), ["camel", "Case", "Word"])
+        self.assertEqual(self.pieces("HTTPServer"), ["HTTPServer"])
+        self.assertEqual(self.pieces("it's THEY'LL 12345"), ["it's", " THEY'LL", " ", "123", "45"])
+        self.assertEqual(self.pieces("a\n\n b/\n"), ["a", "\n\n", " b", "/\n"])
+
+    def test_round_trip(self):
+        t = ST.Tokenizer([ST.BYTE_TO_UNICODE[b] for b in range(256)], [], None, "inkling2")
+        for text in ("", "x  y\n", "你好 😀", "e\u0301 tab\t"):
+            self.assertEqual(t.decode(t.encode(text)), text)
+
+
 if __name__ == "__main__":
     unittest.main()

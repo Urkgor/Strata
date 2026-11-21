@@ -66,6 +66,21 @@ QWEN35_PATTERN = (
 )
 
 
+# The `gpt-4o` pre-tokenizer (o200k style; llama.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O), which Inkling 2 uses (`tokenizer.ggml.pre` = "inkling2": the same
+# pattern, no BOS token).  Transcribed from llama.cpp's active expression (L455 of src/llama-vocab.cpp: the lookahead spelling of the `Lu Lt Lm Lo M` /
+# `Ll Lm Lo M` classes, which the `re` module can run) with its groups made non-capturing so that findall() returns the pieces.
+GPT4O_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?(?:(?=[\p{L}\p{M}])[^a-z])*(?:(?=[\p{L}\p{M}])[^A-Z])+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?"
+    r"|[^\r\n\p{L}\p{N}]?(?:(?=[\p{L}\p{M}])[^a-z])+(?:(?=[\p{L}\p{M}])[^A-Z])*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+GPT4O_PRES = ("inkling2", "gpt-4o", "llama4", "kanana2", "talkie")
+
+
 # ------------------------------------------------------------------ the pattern with the standard library's `re`
 # The pattern is written the way llama.cpp and the `regex` module read it - `\p{L}`, `\p{N}`, `\p{M}`, `\p{P}`, `\p{S}`, `\s` as the
 # Unicode classes - and `re` has none of them.  compile_pattern() turns each into a character class built from the
@@ -185,6 +200,9 @@ class Tokenizer:
         if str(pre).startswith("deepseek"):
             seq = [compile_pattern(x) for x in DEEPSEEK3_PATTERNS]
             self._split = lambda text: _sequence_findall(seq, text)
+        elif str(pre) in GPT4O_PRES:
+            self._re = compile_pattern(GPT4O_PATTERN)
+            self._split = self._re.findall
         else:
             self._re = compile_pattern(QWEN35_PATTERN)
             self._split = self._re.findall
@@ -768,8 +786,9 @@ def extract(gguf_path, out_dir) -> dict:
             "add_bos_token": False,
             # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
             # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-            "pre_pattern": QWEN35_PATTERN,
-            "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+            "pre_pattern": GPT4O_PATTERN if tk.pre in GPT4O_PRES else QWEN35_PATTERN,
+            "pre_pattern_source": ("llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_GPT4O)" if tk.pre in GPT4O_PRES
+                                   else ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
         }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     ordered = ["%s %s" % k for k, _ in sorted(tk.ranks.items(), key=lambda kv: kv[1])]

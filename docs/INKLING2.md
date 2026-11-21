@@ -5,7 +5,7 @@ engines. Text only. It is its own engine (`src/inkling2/`), built on the Gemma 4
 (`src/gemma4/`); it needs no llama.cpp.
 
 **Status: not run on a real card.** The CPU reference equals llama.cpp on a tiny random model (F32, F16, Q8_0); the CUDA engine equals the reference on the CPU
-emulation of CUDA. Speed, VRAM figures and the real 17.6 GB file are untested. Tokenizer, chat template and server glue are not written yet (see below).
+emulation of CUDA. The tokenizer and the server glue match llama.cpp / the model's template on small cases. Speed, VRAM figures and the real 17.6 GB file are untested.
 
 ## What the model is (llama.cpp `src/models/inkling2.cpp`)
 
@@ -28,6 +28,9 @@ emulation of CUDA. Speed, VRAM figures and the real 17.6 GB file are untested. T
 | `src/inkling2/i2_main.cpp` | `strata-inkling2` (serve, `--tokens`, `--check`, `--bench-pp/-tg`) |
 | `tools/inkling2/make_tiny.py`, `llama_ref.cpp` | a tiny random model with the real layout; the llama.cpp comparison tool |
 | `tests/inkling2/i2_emu_test.cpp` | engine on the CUDA emulation vs the reference |
+| `serve/inkling2.py`, `serve/fixtures/inkling2/chat_template.jinja` | the server side: thinking, answer and tool-call messages read into the form the server's parser takes; the repo's own chat template |
+| `tools/strata_tokenizer.py` (`GPT4O_PATTERN`) | the tokenizer: byte-level BPE, o200k-style pre-tokenizer (`tokenizer.ggml.pre` = `inkling2`), no BOS |
+| `serve/test_inkling2.py` | translator, parser, template and chat API against a fake engine |
 
 ## Build and run
 
@@ -40,6 +43,31 @@ strata-inkling2 --model F.gguf --bench-pp 512 --bench-tg 64
 Options: `--max-context N`, `--gpu N` (one card only), `--prefill N` (512), `--swa-slack N` (1024), `--vram-reserve-mib N` (700), `--host-experts N`, `--cpu`,
 `--eos ID,...`.
 
+## Serve it
+
+```sh
+python3 tools/strata_tokenizer.py --gguf Inkling-2-Mini-IQ4_NL.gguf --out $HOME/strata-data/packs/inkling2     # tokenizer + the GGUF's chat template
+```
+
+`strata-inkling2.json` for `python3 serve/server.py --engine strata --config strata-inkling2.json`:
+
+```json
+{
+ "exe": "/path/to/Strata/build-rhel7/strata-inkling2",
+ "args": ["--model", "/data/Inkling-2-Mini-IQ4_NL.gguf", "--max-context", "16384"],
+ "tokenizer": "/home/you/strata-data/packs/inkling2/tokenizer",
+ "arch": "inkling2",
+ "lib_dirs": ["/usr/local/cuda-12.4/lib64"],
+ "port": 8080
+}
+```
+
+How the text goes: the template has no generation prompt. The prompt ends with the last message's `<|end_message|>` and the model writes its own
+`<|message_model|><|content_thinking|>...<|end_message|>`, `<|message_model|><|content_text|>...<|end_message|>` and
+`<|message_model|>NAME<|content_invoke_tool_json|>{"name":..,"args":{..}}<|end_message|>`, then `<|content_model_end_sampling|>` (id 200006, the only stop).
+`serve/inkling2.py` turns that into thinking, answer and tool calls. Reasoning effort: `none`, `minimal`, `low`, `medium`, `high` (default, 0.9), `xhigh`, `max`, or a
+number 0 .. 0.99; `none` also turns the reasoning off. Sampling default: temperature 1.0 (the repo's `generation_config.json`). Images and audio are refused.
+
 ## Memory
 
 The IQ4_NL file is 17.6 GB: it does not fit an 11 GB card. The experts of the layers outside the loop stream from pinned host memory first, then the loop's
@@ -48,7 +76,7 @@ best on PCIe 3). No expert cache and no CUDA graphs yet.
 
 ## Not done
 
-- Tokenizer (o200k-style pre-tokenizer), chat template (`<|message_user|>`, `<|end_message|>`, reasoning effort), tool-call format and `serve/` glue.
+- Checked only on small cases: the tokenizer against llama.cpp on a tiny vocabulary (the real 200 058-token vocabulary was not available here), the server glue against a fake engine.
 - Expert cache (LFU) and prefetch for the streamed layers; CUDA graphs.
 - No MTP/speculative drafting: the GGUF has none.
 

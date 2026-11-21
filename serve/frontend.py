@@ -142,16 +142,18 @@ EFFORT_DEEPSEEK = {"none": None, "off": None, "minimal": None, "disabled": None,
                    "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
 _EFFORT_QWEN = dict(EFFORT)
 _NUMERIC_EFFORT = False
+_INKLING = False                 # Inkling 2: its template takes the effort itself (a word or a number), thinking is off at "none"
 _THINKING_SWITCH = False         # Gemma 4: its template only knows enable_thinking (any effort above "none" is thinking on)
 
 
 def use_family(family: str | None) -> None:
     """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER)."""
-    global _NUMERIC_EFFORT, _THINKING_SWITCH
+    global _NUMERIC_EFFORT, _THINKING_SWITCH, _INKLING
     EFFORT.clear()
     EFFORT.update(EFFORT_DEEPSEEK if family == "deepseek41" else _EFFORT_QWEN)
     _NUMERIC_EFFORT = family == "deepseek41"
     _THINKING_SWITCH = family == "gemma4"
+    _INKLING = family == "inkling2"
 
 
 def effort_kwargs(value) -> dict:
@@ -159,7 +161,11 @@ def effort_kwargs(value) -> dict:
     if value is None or value == "":
         return {}
     if value is False:
-        return {"enable_thinking": False}
+        return {"enable_thinking": False, "reasoning_effort": "none"} if _INKLING else {"enable_thinking": False}
+    if _INKLING:
+        from serve.inkling2 import effort_value
+        level = effort_value(value)
+        return {"enable_thinking": False, "reasoning_effort": "none"} if level in ("none", 0.0) else {"reasoning_effort": level}
     if _NUMERIC_EFFORT and isinstance(value, int) and not isinstance(value, bool):
         if not 1 <= value <= 100:
             raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high, max or 1..100")

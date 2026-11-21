@@ -4152,6 +4152,15 @@ class Service:
             self.template.defaults.update(gemma4.TEMPLATE_VARS)
             self.template.wrap_tools = True
             self.template.caps.update(gemma4.detect_caps(self.template))
+        if family == "inkling2":
+            from serve import inkling2
+            eos = (getattr(self.tok, "special_ids", None) or {}).get("tokenizer.ggml.eos_token_id")
+            self.stop_ids = {int(eos)} if eos is not None else set(inkling2.STOP_IDS)
+            self.parser_cls = inkling2.Inkling2OutputParser
+            self._force_text = inkling2.to_inkling_force
+            self.template.defaults.update(inkling2.TEMPLATE_VARS)
+            self.template.wrap_tools = True
+            self.template.caps.update(inkling2.detect_caps(self.template))
         import serve.frontend as _frontend
         _frontend.use_family(family)
 
@@ -8667,7 +8676,7 @@ def check_request_sampling(req) -> None:
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
 FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b",
-                      "deepseek41": "deepseek-v4.1-flash", "gemma4": "gemma-4-26b-a4b"}
+                      "deepseek41": "deepseek-v4.1-flash", "gemma4": "gemma-4-26b-a4b", "inkling2": "inkling-2-mini"}
 
 
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
@@ -8684,6 +8693,8 @@ MODEL_CARD_SAMPLING = {
     "deepseek41": {"thinking": {"temperature": 1.0, "top_p": 1.0}, "instruct": {"temperature": 1.0, "top_p": 1.0}},
     # Gemma 4: the GGUF's own general.sampling (temperature 1.0, top_p 0.95, top_k 64), thinking or not
     "gemma4": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 64}, "instruct": {"temperature": 1.0, "top_p": 0.95, "top_k": 64}},
+    # Inkling 2 Mini: the repo's generation_config.json (temperature 1.0, sampling on)
+    "inkling2": {"thinking": {"temperature": 1.0}, "instruct": {"temperature": 1.0}},
 }
 
 
@@ -8702,6 +8713,8 @@ def arch_from_tokenizer(arch, pre) -> str | None:
         return arch
     if str(pre or "") == "gemma4":
         return "gemma4"
+    if str(pre or "") == "inkling2":
+        return "inkling2"
     return "deepseek41" if str(pre or "").startswith("deepseek") else None
 
 
@@ -9127,7 +9140,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "gemma4") else None)
+        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "gemma4", "inkling2") else None)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])
