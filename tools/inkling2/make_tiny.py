@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--gguf-py", default="/tmp/claude-0/ll2/src/gguf-py")
     ap.add_argument("--passes", type=int, default=None)
+    ap.add_argument("--mixed", action="store_true", help="experts in F16, those of the last 2 layers in Q8_0 (the real IQ4_NL file mixes types per layer)")
     ap.add_argument("--pre", default="gpt-2", help="tokenizer.ggml.pre (inkling2: the o200k-style pre-tokenizer of the real model)")
     a = ap.parse_args()
     sys.path.insert(0, a.gguf_py)
@@ -114,6 +115,12 @@ def main():
 
     def put(name, arr, big=True):
         """big: a weight matrix that takes the chosen type (the rest is F32)"""
+        if a.mixed and "_exps" in name:
+            if int(name.split(".")[1]) >= c["n_layer"] - 2:
+                w.add_tensor(name, gguf.quants.quantize(arr, gguf.GGMLQuantizationType.Q8_0), raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+            else:
+                w.add_tensor(name, arr.astype(np.float16))
+            return
         if big and a.type == "q8_0rt":      # the Q8_0 weights written back as F32: llama.cpp then computes with the values the engine reads from the Q8_0 file
             q = gguf.quants.quantize(arr, gguf.GGMLQuantizationType.Q8_0)
             w.add_tensor(name, gguf.quants.dequantize(q, gguf.GGMLQuantizationType.Q8_0).astype(np.float32))

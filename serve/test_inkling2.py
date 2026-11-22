@@ -68,6 +68,12 @@ class Translator(unittest.TestCase):
         self.assertIn("<parameter=c>\n{\"d\": \"e\"}\n</parameter>", translate(text))
         self.assertIn("<parameter=n>\n-125.0\n</parameter>", translate(text))
 
+    def test_a_message_without_its_end(self):
+        got = translate("<|content_thinking|>hm<|message_model|><|content_text|>yes<|content_model_end_sampling|>")
+        self.assertEqual(got, "hm</think>yes")
+        for step in (1, 3, 7):
+            self.assertEqual(translate("<|content_thinking|>hm<|message_model|><|content_text|>yes<|content_model_end_sampling|>", True, step), got)
+
     def test_a_cut_call_is_closed(self):
         got = translate('<|message_model|>f<|content_invoke_tool_json|>{"name":"f","args":{"a":"par', False)
         self.assertTrue(got.endswith("par\n</parameter>\n</function>\n</tool_call>\n"), got)
@@ -252,10 +258,22 @@ class Api(unittest.TestCase):
         call = choice["message"]["tool_calls"][0]["function"]
         self.assertEqual((call["name"], json.loads(call["arguments"])), ("get_weather", {"city": "Paris", "days": 3}))
 
+    def test_tool_results_carry_the_tools_name(self):
+        """OpenAI's wire form (arguments a JSON string, the result paired by id) reaches the template as the model was trained on it: the call's name in the result's header."""
+        self.start("<|message_model|><|content_text|>ok<|end_message|>")
+        calls = [{"id": "a", "type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Paris", "days": 3}'}},
+                 {"id": "b", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]
+        msgs = [{"role": "user", "content": "w"}, {"role": "assistant", "content": None, "tool_calls": calls},
+                {"role": "tool", "tool_call_id": "b", "content": "R2"}, {"role": "tool", "tool_call_id": "a", "content": "R1"}]
+        status, r = self.chat(messages=msgs, tools=[{"type": "function", "function": WEATHER}])
+        self.assertEqual(status, 200, r)
+        self.assertIn(CALL.replace("<|message_model|>get_weather", "<|message_model|>get_weather"), self.prompt())
+        self.assertTrue(self.prompt().endswith("<|message_tool|>get_weather<|content_text|>R1<|end_message|><|message_tool|>lookup<|content_text|>R2<|end_message|>"), self.prompt())
+
     def test_family_wiring(self):
         self.assertEqual(FAMILY_MODEL_NAMES["inkling2"], "inkling-2-mini")
         self.assertEqual(arch_from_tokenizer(None, "inkling2"), "inkling2")
-        self.assertEqual(model_card_sampling("inkling2", True), {"temperature": 1.0})
+        self.assertEqual(model_card_sampling("inkling2", True), {"temperature": 1.0, "top_k": 50})
         frontend.use_family("inkling2")
         try:
             self.assertEqual(frontend.effort_kwargs("high"), {"reasoning_effort": "high"})

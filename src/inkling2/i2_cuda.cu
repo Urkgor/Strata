@@ -139,6 +139,19 @@ struct GpuEngine::Impl {
     int *dec_first = nullptr, *dec_n = nullptr, *dec_tok = nullptr, *dec_row = nullptr, *dec_slots = nullptr;
     std::vector<float*> pre_blk, post_blk, core_blk[2], outbuf;
     uint8_t *stgA = nullptr, *stgC = nullptr;
+    // the expert cache of the streamed layers (decode): device pools of `slots` experts (gate+up, down) at the largest layer's size; a slot holds the
+    // expert `key` = layer * n_expert + expert.  The slot kept is the one with the highest decayed use count (every use adds `inc`, which grows by 1 / decay
+    // at each decoded token: the same order as multiplying all counts by decay, without touching them).
+    struct ExpertCache {
+        int slots = 0;
+        uint8_t *a = nullptr, *c = nullptr;
+        std::vector<int> key, where;
+        std::vector<double> score;
+        double inc = 1.0;
+        long long hits = 0, misses = 0;
+    } ec;
+    size_t cache_budget = 0;
+    int* cache_slot_dev = nullptr;
     float *logits = nullptr, *pv = nullptr;
     int *pi = nullptr, *amax = nullptr;
     int64_t pos = 0;
@@ -221,7 +234,10 @@ struct GpuEngine::Impl {
     // ------------------------------------------------------------------------------------------------------------------------ sizes
     static size_t mat_bytes(const i2::Mat& a) { return a ? a.bytes : 0; }
     size_t layer_expert_bytes(int ip) const { return mat_bytes(m.L[(size_t) ip].gate_up) + mat_bytes(m.L[(size_t) ip].down); }
-    size_t per_expert_bytes() const { return hp.n_expert > 0 ? layer_expert_bytes(0) / (size_t) hp.n_expert : 0; }
+    // the layers' experts can have different types (the IQ4_NL file keeps the last 4 layers' in Q8_0): the staging slots take the largest
+    size_t max_gu_bytes() const { size_t b = 0; for (const auto& l : m.L) b = std::max<size_t>(b, l.gate_up.expert_bytes); return b; }
+    size_t max_dn_bytes() const { size_t b = 0; for (const auto& l : m.L) b = std::max<size_t>(b, l.down.expert_bytes); return b; }
+    size_t per_expert_bytes() const { return max_gu_bytes() + max_dn_bytes(); }
     size_t layer_dense_bytes(int ip) const {
         const i2::LayerW& w = m.L[(size_t) ip];
         size_t b = mat_bytes(w.wq) + mat_bytes(w.wk) + mat_bytes(w.wv) + mat_bytes(w.wo) + mat_bytes(w.wgate) + mat_bytes(w.wrel) + mat_bytes(w.wsink) +
@@ -256,6 +272,8 @@ struct GpuEngine::Impl {
     int core_blocks() const { return hp.has_loop() ? (hp.loop_end - hp.loop_start) / hp.block : 0; }
     int post_blocks() const { return hp.has_loop() ? (hp.n_layer - hp.loop_end + hp.block - 1) / hp.block : 0; }
 
+    int streamed_layers_count() const { int c = 0; for (char x : is_streamed) c += x != 0; return c; }
+
     /// which physical layers keep their experts in host memory: the ones outside the loop first (a loop layer is visited `passes` times), from the last
     std::string place() {
         const int n = hp.n_layer;
@@ -280,6 +298,16 @@ struct GpuEngine::Impl {
             is_streamed[(size_t) order[k]] = 1;
             need -= (long long) layer_expert_bytes(order[k]);
             ++k;
+        }
+        cache_budget = 0;
+        if (k > 0 && opt.cache_mib != 0) {
+            long long left = budget - (long long) stage_bytes() - need;
+            left -= left / 32;                                                // a margin for the allocator
+            size_t streamed = 0;
+            for (int ip = 0; ip < n; ++ip) if (is_streamed[(size_t) ip]) streamed += layer_expert_bytes(ip);
+            cache_budget = (size_t) std::max<long long>(0, left);
+            if (opt.cache_mib > 0) cache_budget = std::min<size_t>(cache_budget, (size_t) opt.cache_mib << 20);
+            cache_budget = std::min(cache_budget, streamed);
         }
         if (need > budget - (k > 0 ? (long long) stage_bytes() : 0)) {
             char buf[420];
@@ -432,8 +460,21 @@ struct GpuEngine::Impl {
         bool any_streamed = false;
         for (char s : is_streamed) any_streamed |= s != 0;
         if (any_streamed) {
-            stgA = alloc<uint8_t>(m.L[0].gate_up.expert_bytes * (size_t) stage_slots);
-            stgC = alloc<uint8_t>(m.L[0].down.expert_bytes * (size_t) stage_slots);
+            stgA = alloc<uint8_t>(max_gu_bytes() * (size_t) stage_slots);
+            stgC = alloc<uint8_t>(max_dn_bytes() * (size_t) stage_slots);
+            int want = opt.cache_slots >= 0 ? opt.cache_slots : (int) std::min<size_t>(cache_budget / std::max<size_t>(per_expert_bytes(), 1), 1u << 20);
+            int streamed_experts = 0;
+            for (int ip = 0; ip < hp.n_layer; ++ip) if (is_streamed[(size_t) ip]) streamed_experts += hp.n_expert;
+            want = std::min(want, streamed_experts);
+            if (want >= hp.n_used) {                       // (fewer slots than one step needs: no cache)
+                ec.slots = want;
+                ec.a = alloc<uint8_t>(max_gu_bytes() * (size_t) want);
+                ec.c = alloc<uint8_t>(max_dn_bytes() * (size_t) want);
+                ec.key.assign((size_t) want, -1);
+                ec.score.assign((size_t) want, 0.0);
+                ec.where.assign((size_t) hp.n_layer * (size_t) hp.n_expert, -1);
+                cache_slot_dev = alloc<int>((size_t) hp.n_used);
+            }
         }
         // the residual blocks' pool, the loop's outputs
         for (int i = 0; i < pre_blocks(); ++i) pre_blk.push_back(alloc<float>(TE));
@@ -456,6 +497,9 @@ struct GpuEngine::Impl {
             CK(cudaMemGetInfo(&fr, &tot));
             std::fprintf(stderr, "strata-inkling2: 1 CUDA device [device %d: %d layers (%d visits), %.2f GiB free after loading]; context %d, chunk %d\n", opt.device, hp.n_layer, hp.visits(),
                          (double) fr / (1 << 30), ctx, chunk);
+            if (ns && ec.slots)
+                std::fprintf(stderr, "strata-inkling2: expert cache: %d slots (%.2f GiB, %.0f%% of the streamed layers' experts), decayed use count (x%.2f a token)\n", ec.slots,
+                             (double) ec.slots * (double) per_expert_bytes() / (1 << 30), 100.0 * ec.slots / std::max(1, streamed_layers_count() * hp.n_expert), opt.cache_decay);
             if (ns)
                 std::fprintf(stderr, "strata-inkling2: the experts of %d of %d layers do not fit the VRAM: they stay in host memory (%.2f GiB%s) and the ones a visit needs are copied to the card "
                              "(about %.0f MiB a visit at 8 experts); --host-experts N chooses how many layers do it\n", ns, hp.n_layer, (double) host_bytes / (1 << 30),
@@ -549,7 +593,7 @@ struct GpuEngine::Impl {
         CK(cudaMemcpy(ent_row, ent_r.data(), ent_r.size() * 4, cudaMemcpyHostToDevice));
     }
     /// the experts of a layer on the card (xn = n0): gate+up, SITU, down for every (token, expert) pair, then the weighted sum into `moe`
-    void experts(const DevLayer& dl, int Tn) {
+    void experts(const DevLayer& dl, int ip, int Tn) {
         const int nu = hp.n_used, E = hp.n_embd;
         mm(dl.router, n0, E, Tn, rlog, hp.n_expert);
         G4_LAUNCH(i2k::k_topk, dim3(Tn), dim3(g4k::kThreads), st, (const float*) rlog, (const float*) dl.exp_bias, hp.n_expert, nu, hp.route_scale, topk_idx, topk_w);
@@ -561,7 +605,7 @@ struct GpuEngine::Impl {
             sel_trace->push_back(h);
         }
         if (dl.streamed) {
-            experts_streamed(dl, Tn);
+            experts_streamed(dl, ip, Tn);
         } else if (Tn == 1) {                      // one token: the router's own choice is the group table, no round trip to the host
             exp_ffn(dl.gate_up, dl.down, nu, true, topk_idx, dec_first, dec_n, dec_tok, dec_row, rows, nullptr);
         } else {                                   // prompt reading: group the pairs by expert on the host (the weights are then read once per 16 pairs)
@@ -588,7 +632,7 @@ struct GpuEngine::Impl {
     }
     /// The experts of a layer in host memory: the router's choice is read back, the experts it names are copied into the staging slots (the n_used of a decode
     /// step; for a prompt chunk the experts in batches of stage_slots, each with the groups of pairs that use it).
-    void experts_streamed(const DevLayer& dl, int Tn) {
+    void experts_streamed(const DevLayer& dl, int ip, int Tn) {
         const int nu = hp.n_used;
         const int rows = Tn * nu;
         std::vector<int> idx((size_t) rows);
@@ -600,6 +644,40 @@ struct GpuEngine::Impl {
         DevMat vgu = dl.gate_up, vdn = dl.down;
         vgu.d = stgA;
         vdn.d = stgC;
+        if (Tn == 1 && ec.slots >= nu) {                   // decode: the experts the cache has are used where they are, the others replace its least used
+            std::vector<int> sl((size_t) nu, -1);
+            for (int k = 0; k < nu; ++k) {                         // the hits first: a miss must not take the slot of an expert this step uses
+                sl[(size_t) k] = ec.where[(size_t) (ip * hp.n_expert + idx[(size_t) k])];
+                ec.hits += sl[(size_t) k] >= 0;
+            }
+            for (int k = 0; k < nu; ++k) {
+                const int e = idx[(size_t) k], key = ip * hp.n_expert + e;
+                int s = sl[(size_t) k];
+                if (s < 0) {
+                    ++ec.misses;
+                    double best = 1e300;
+                    for (int j = 0; j < ec.slots; ++j) {
+                        bool taken = false;
+                        for (int q = 0; q < nu; ++q) taken |= sl[(size_t) q] == j;
+                        if (!taken && ec.score[(size_t) j] < best) { best = ec.score[(size_t) j]; s = j; }
+                    }
+                    if (ec.key[(size_t) s] >= 0) ec.where[(size_t) ec.key[(size_t) s]] = -1;
+                    ec.key[(size_t) s] = key;
+                    ec.where[(size_t) key] = s;
+                    ec.score[(size_t) s] = 0.0;
+                    CK(cudaMemcpyAsync(ec.a + (size_t) s * max_gu_bytes(), dl.h_gu + (size_t) e * dl.gate_up.expert_bytes, dl.gate_up.expert_bytes, cudaMemcpyHostToDevice, st));
+                    CK(cudaMemcpyAsync(ec.c + (size_t) s * max_dn_bytes(), dl.h_dn + (size_t) e * dl.down.expert_bytes, dl.down.expert_bytes, cudaMemcpyHostToDevice, st));
+                    sl[(size_t) k] = s;
+                }
+                ec.score[(size_t) s] += ec.inc;
+            }
+            CK(cudaMemcpy(cache_slot_dev, sl.data(), (size_t) nu * 4, cudaMemcpyHostToDevice));
+            DevMat cgu = dl.gate_up, cdn = dl.down;
+            cgu.d = ec.a; cgu.expert_bytes = max_gu_bytes();
+            cdn.d = ec.c; cdn.expert_bytes = max_dn_bytes();
+            exp_ffn(cgu, cdn, nu, true, cache_slot_dev, dec_first, dec_n, dec_tok, dec_row, rows, nullptr);
+            return;
+        }
         if (Tn == 1) {
             for (int k = 0; k < nu; ++k) copy_in(k, idx[(size_t) k]);
             exp_ffn(vgu, vdn, nu, true, dec_slots, dec_first, dec_n, dec_tok, dec_row, rows, nullptr);
@@ -701,7 +779,7 @@ struct GpuEngine::Impl {
         }
         if (msgs_in) control(mixed, msgs_in + (size_t) 3 * TE, Tn, *lw, 3);
         rms(mixed, dl.ffn_norm, n0, Tn);
-        experts(dl, Tn);
+        experts(dl, ip, Tn);
         conv_res(moe, dl.ffn_post_conv, V.cring, 2 * kd + E, Tn, pos0, cur, cur);
         ring_store(moe, E, V.cring, 2 * kd + E, Tn, pos0);
         if (trace) {
@@ -714,6 +792,10 @@ struct GpuEngine::Impl {
 
     // ------------------------------------------------------------------------------------------------------------------------ a chunk
     void forward_chunk(const int32_t* ids, int Tn, bool want_logits) {
+        if (ec.slots && Tn == 1) {                                 // a decoded token: the use counts age by one step
+            ec.inc /= opt.cache_decay;
+            if (ec.inc > 1e50) { for (double& x : ec.score) x /= ec.inc; ec.inc = 1.0; }
+        }
         const int E = hp.n_embd;
         hbuf.resize((size_t) Tn * (size_t) E);
         for (int t = 0; t < Tn; ++t) g4::dequant_row(m.tok_embd.type, m.tok_embd.row(ids[t]), E, hbuf.data() + (size_t) t * (size_t) E);
@@ -776,6 +858,7 @@ std::string GpuEngine::init() { return p_->init(); }
 int GpuEngine::ctx() const { return p_->ctx; }
 int GpuEngine::n_vocab() const { return p_->hp.n_vocab; }
 int64_t GpuEngine::pos() const { return p_->pos; }
+void GpuEngine::cache_stats(int* slots, long long* hits, long long* misses) const { *slots = p_->ec.slots; *hits = p_->ec.hits; *misses = p_->ec.misses; }
 void GpuEngine::set_trace(std::vector<std::vector<float>>* t, std::vector<std::vector<int>>* s) { p_->trace = t; p_->sel_trace = s; }
 void GpuEngine::reset() { p_->pos = 0; p_->logits_ready = false; }
 void GpuEngine::truncate(int64_t q) { p_->pos = std::min(p_->pos, std::max<int64_t>(0, q)); p_->logits_ready = false; }
@@ -827,6 +910,8 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
         auto val = [&]() -> std::string { return i + 1 < extra.size() ? extra[++i] : std::string(); };
         if (a == "--prefill" || a == "--chunk") { const std::string v = val(); if (v != "auto") o.chunk = std::max(1, std::atoi(v.c_str())); }
         else if (a == "--host-experts") o.host_experts = std::max(0, std::atoi(val().c_str()));
+        else if (a == "--expert-cache-mib") o.cache_mib = std::max(0, std::atoi(val().c_str()));
+        else if (a == "--cache-decay") o.cache_decay = std::min(1.0, std::max(0.5, std::atof(val().c_str())));
         else if (a == "--swa-slack") o.slack = std::max(0, std::atoi(val().c_str()));
         else if (a == "--vram-reserve-mib") o.reserve_mib = std::max(0, std::atoi(val().c_str()));
         else if (a == "--check") check = true;
@@ -869,6 +954,10 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
             }
             const double ms = ms_now() - t0;
             std::printf("generation: %d tokens in %.0f ms: %.1f tok/s\n", n, ms, 1000.0 * n / ms);
+            int cs = 0;
+            long long ch = 0, cm = 0;
+            eng.cache_stats(&cs, &ch, &cm);
+            if (cs) std::printf("expert cache: %d slots, %lld hits, %lld misses (%.1f%% hits)\n", cs, ch, cm, 100.0 * (double) ch / (double) std::max<long long>(1, ch + cm));
         }
         return 0;
     }

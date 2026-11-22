@@ -18,7 +18,10 @@ struct GpuOptions {
     int slack = 1024;              // cells a sliding-window layer keeps beyond its window + one chunk, so that a conversation can step back this far
     int reserve_mib = 700;         // VRAM left free (the driver's context, the allocator)
     int host_experts = 0;          // keep the experts of (at least) this many layers in host memory, even if they would fit (a check of the streaming path)
-    int stage_slots = 32;          // experts of a streaming layer copied to the card at a time
+    int stage_slots = 32;          // experts of a streaming layer copied to the card at a time (prompt reading)
+    int cache_mib = -1;            // VRAM for the cache of the streamed layers' experts (decode): -1 = what is left, 0 = none
+    int cache_slots = -1;          // the same in experts, for tests (-1: from cache_mib)
+    double cache_decay = 0.97;     // an expert's use count is multiplied by this at every decoded token: the cache keeps the most used
     bool verbose = true;
 };
 
@@ -36,6 +39,8 @@ public:
     bool can_keep(int64_t p) const;
     /// the number of physical layers whose experts stay in host memory (valid after init())
     int streamed_layers() const;
+    /// the expert cache of the streamed layers: its slots, and the hits / misses of the decode steps so far
+    void cache_stats(int* slots, long long* hits, long long* misses) const;
     /// Append n tokens; the logits of the last one are made at the end.  on_piece(done) after each chunk (false: stop reading).
     bool process(const int32_t* ids, int64_t n, const std::function<bool(int64_t)>& on_piece, int64_t* done);
     void logits(std::vector<float>& out);

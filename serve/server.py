@@ -4160,6 +4160,7 @@ class Service:
             self._force_text = inkling2.to_inkling_force
             self.template.defaults.update(inkling2.TEMPLATE_VARS)
             self.template.wrap_tools = True
+            self.template.name_tool_results = True
             self.template.caps.update(inkling2.detect_caps(self.template))
         import serve.frontend as _frontend
         _frontend.use_family(family)
@@ -8693,8 +8694,8 @@ MODEL_CARD_SAMPLING = {
     "deepseek41": {"thinking": {"temperature": 1.0, "top_p": 1.0}, "instruct": {"temperature": 1.0, "top_p": 1.0}},
     # Gemma 4: the GGUF's own general.sampling (temperature 1.0, top_p 0.95, top_k 64), thinking or not
     "gemma4": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 64}, "instruct": {"temperature": 1.0, "top_p": 0.95, "top_k": 64}},
-    # Inkling 2 Mini: the repo's generation_config.json (temperature 1.0, sampling on)
-    "inkling2": {"thinking": {"temperature": 1.0}, "instruct": {"temperature": 1.0}},
+    # Inkling 2 Mini: the GGUF's own general.sampling (temperature 1.0, top_k 50, top_p 1.0)
+    "inkling2": {"thinking": {"temperature": 1.0, "top_k": 50}, "instruct": {"temperature": 1.0, "top_k": 50}},
 }
 
 

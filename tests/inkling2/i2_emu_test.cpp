@@ -40,9 +40,9 @@ int main(int argc, char** argv) {
     std::vector<float> all;
     ref.forward(ids.data(), n, nullptr, &all);
     auto row = [&](int t) { return all.data() + (size_t) t * (size_t) nv; };
-    auto make = [&](int chunk, int slack, int host_experts = 0, int stage_slots = 32) {
+    auto make = [&](int chunk, int slack, int host_experts = 0, int stage_slots = 32, int cache_slots = 0) {
         i2cuda::GpuOptions o;
-        o.chunk = chunk; o.slack = slack; o.reserve_mib = 0; o.host_experts = host_experts; o.stage_slots = stage_slots; o.verbose = false;
+        o.chunk = chunk; o.slack = slack; o.reserve_mib = 0; o.host_experts = host_experts; o.stage_slots = stage_slots; o.cache_slots = cache_slots; o.verbose = false;
         auto e = std::make_unique<i2cuda::GpuEngine>(m, 64, o);
         const std::string er = e->init();
         if (!er.empty()) { std::fprintf(stderr, "init: %s\n", er.c_str()); std::exit(1); }
@@ -124,6 +124,35 @@ int main(int argc, char** argv) {
         e->logits(lg);
         const double r = rel_rms(lg, row(n - 1));
         EXPECT(r < tol, "every layer streamed, one chunk: within %.2e", r);
+    }
+    {   // the expert cache: every layer streamed, 5 slots for 96 experts: a prompt through the staging slots, then single tokens through the cache (hits and evictions)
+        auto e = make(8, 1024, 1000, 4, 5);
+        int64_t done = 0;
+        e->process(ids.data(), 6, noop, &done);
+        double worst = 0;
+        for (int t = 6; t < n; ++t) {
+            e->process(&ids[(size_t) t], 1, noop, &done);
+            e->logits(lg);
+            worst = std::max(worst, rel_rms(lg, row(t)));
+        }
+        int slots = 0;
+        long long hits = 0, misses = 0;
+        e->cache_stats(&slots, &hits, &misses);
+        EXPECT(worst < tol && slots == 5 && hits > 0 && misses > 0, "expert cache of %d slots over %d decoded tokens: worst %.2e, %lld hits, %lld misses", slots, n - 6, worst, hits, misses);
+    }
+    {   // and the same cache big enough for everything: after a first pass the steps of a repeated token are all hits
+        auto e = make(8, 1024, 1000, 4, 96);
+        int64_t done = 0;
+        e->process(ids.data(), 6, noop, &done);
+        for (int rep = 0; rep < 2; ++rep) {
+            e->truncate(6);
+            e->process(&ids[6], 1, noop, &done);
+        }
+        e->logits(lg);
+        int slots = 0;
+        long long hits = 0, misses = 0;
+        e->cache_stats(&slots, &hits, &misses);
+        EXPECT(rel_rms(lg, row(6)) < tol && hits >= 48 && hits + misses == 96, "a token decoded twice with a cache of everything: the second time is all hits (%lld hits, %lld misses of 96 lookups)", hits, misses);
     }
     std::printf(fails ? "%d FAILED\n" : "i2_emu_test: all scenarios pass\n", fails);
     return fails ? 1 : 0;

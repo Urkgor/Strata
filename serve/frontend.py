@@ -37,6 +37,26 @@ class TemplateRequestError(jinja_lite.TemplateError, ValueError):
     client gets a 400 with the template's message instead of a dropped connection (#365)."""
 
 
+def name_tool_results(messages: list[dict]) -> list[dict]:
+    """The tool messages that follow an assistant message with tool calls get the calls' names, in order (a result is paired with its call by position,
+    as the conversions in this module and serve/responses.py leave them), unless they have a name already."""
+    out = [dict(m) if isinstance(m, dict) else m for m in messages]
+    i = 0
+    while i < len(out):
+        m = out[i]
+        if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls"):
+            names = [((c.get("function") or c).get("name") if isinstance(c, dict) else None) for c in m["tool_calls"]]
+            j, k = i + 1, 0
+            while j < len(out) and isinstance(out[j], dict) and out[j].get("role") == "tool":
+                if k < len(names) and names[k] and not out[j].get("name"):
+                    out[j]["name"] = names[k]
+                j, k = j + 1, k + 1
+            i = j
+        else:
+            i += 1
+    return out
+
+
 class ChatTemplate:
     """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template - by
     serve/jinja_lite.py, so the server needs no Jinja2 (its `tojson` is transformers' too: not HTML-escaped)."""
@@ -50,6 +70,7 @@ class ChatTemplate:
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
         self.defaults: dict = {}             # variables a family's template reads that a request never sets (Gemma 4: bos_token, eos_token)
+        self.name_tool_results = False       # Inkling 2: a tool message's header carries the tool's name (`<|message_tool|>NAME<|content_text|>`), taken from the call it answers
         self.wrap_tools = False              # the template reads OpenAI's {"type": "function", "function": {...}} tools (Gemma 4), not the bare declarations
         self.caps = self._detect_caps()
 
@@ -61,6 +82,8 @@ class ChatTemplate:
                     if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                       and not _text_of(m.get("content")).strip()
                                                       and not _has_image(m.get("content")) and not m.get("tool_calls"))]
+        if self.name_tool_results:
+            messages = name_tool_results(messages)
         if self.wrap_tools and tools:
             tools = [t if t.get("type") == "function" and "function" in t else {"type": "function", "function": t} for t in tools]
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,

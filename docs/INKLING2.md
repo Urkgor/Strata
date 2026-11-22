@@ -41,7 +41,7 @@ strata-inkling2 --model F.gguf --bench-pp 512 --bench-tg 64
 ```
 
 Options: `--max-context N`, `--gpu N` (one card only), `--prefill N` (512), `--swa-slack N` (1024), `--vram-reserve-mib N` (700), `--host-experts N`, `--cpu`,
-`--eos ID,...`.
+`--eos ID,...`, `--expert-cache-mib N` (VRAM for the expert cache, default: what is left; 0 = none), `--cache-decay X` (0.97).
 
 ## Serve it
 
@@ -70,14 +70,21 @@ number 0 .. 0.99; `none` also turns the reasoning off. Sampling default: tempera
 
 ## Memory
 
-The IQ4_NL file is 17.6 GB: it does not fit an 11 GB card. The experts of the layers outside the loop stream from pinned host memory first, then the loop's
-(each visited three times, so costlier). Per visit a decode step copies 8 experts; the real speed is unmeasured and expected to be low (tens of tokens a second at
-best on PCIe 3). No expert cache and no CUDA graphs yet.
+The IQ4_NL file is 17.6 GB: it does not fit an 11 GB card (20 layers' experts are IQ4_NL, the last 4 layers' Q8_0). The experts of the layers outside the loop stream
+from pinned host memory first, then the loop's (each visited three times, so costlier).
+
+**Expert cache.** What VRAM is left after the weights, the K/V and the staging slots becomes a cache of the streamed layers' experts. A decode step looks up the 8 experts
+the router chose; the ones the cache has are used where they are, the others are copied in over the experts with the lowest decayed use count (every use adds 1, every
+decoded token multiplies all counts by 0.97). The design is that of the official Strata engine's "decayed-frequency promotion ring"
+(github.com/Niko1221/Strata, `engine/src/inkling2/cuda/ink_hybrid.cuh`), done on the host side because this engine already reads the routing back at every streamed layer.
+Prompt reading does not use it (it streams through the staging slots). `strata-inkling2 --bench-tg 64` prints the hit rate. The real speed is unmeasured.
+No CUDA graphs yet.
 
 ## Not done
 
 - Checked only on small cases: the tokenizer against llama.cpp on a tiny vocabulary (the real 200 058-token vocabulary was not available here), the server glue against a fake engine.
-- Expert cache (LFU) and prefetch for the streamed layers; CUDA graphs.
+- Taken from the official Strata engine, not yet here: the CPU expert pool (cold experts computed on the CPU while the GPU runs the resident ones, only activations cross PCIe),
+  DSpark tree speculative decoding (needs `dspark-Inkling-2-Mini-Q8_0.gguf`), the vision tower (`mmproj-*.gguf`), K8V8/K8V4 KV compression. CUDA graphs.
 - No MTP/speculative drafting: the GGUF has none.
 
 ## Checks

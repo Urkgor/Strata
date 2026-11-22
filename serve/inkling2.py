@@ -171,18 +171,20 @@ class Inkling2Translator:
         return None
 
     def _body(self, out: list[str], final: bool):
-        """Inside a thinking, dropped or answer message: its text up to `<|end_message|>` (a marker's start is held back)."""
+        """Inside a thinking, dropped or answer message: its text up to `<|end_message|>` (a marker's start is held back).  A message the model leaves
+        without its end (the next `<|message_model|>`, or the end token, comes first) ends there as well."""
         s = self.buf
-        i = s.find(END)
-        if i >= 0:
+        cuts = [(s.find(t), t) for t in (END, MODEL, EOS, EOT) if t in s]
+        if cuts:
+            i, term = min(cuts)
             self._emit(s[:i], out)
-            self.buf = s[i + len(END):]
+            self.buf = s[i + len(END):] if term == END else s[i:]
             if self.state == "think":
                 out.append("</think>")
                 self.think = False
             self.state = "between"
             return None
-        k = 0 if final else _partial_suffix(s, END)
+        k = 0 if final else max(_partial_suffix(s, t) for t in (END, MODEL, EOS, EOT))
         self._emit(s[:len(s) - k], out)
         self.buf = s[len(s) - k:]
         return "wait" if k else None
