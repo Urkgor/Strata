@@ -41,7 +41,7 @@ strata-inkling2 --model F.gguf --bench-pp 512 --bench-tg 64
 ```
 
 Options: `--max-context N`, `--gpu N` (one card only), `--prefill N` (512), `--swa-slack N` (1024), `--vram-reserve-mib N` (700), `--host-experts N`, `--cpu`,
-`--eos ID,...`, `--expert-cache-mib N` (VRAM for the expert cache, default: what is left; 0 = none), `--cache-decay X` (0.97).
+`--eos ID,...`, `--expert-cache-mib N` (VRAM for the expert cache, default: what is left; 0 = none), `--cache-decay X` (0.97), `--cpu-experts auto|N` (the CPU expert pool: auto = on if faster here, 0 = off, N threads).
 
 ## Serve it
 
@@ -77,14 +77,17 @@ from pinned host memory first, then the loop's (each visited three times, so cos
 the router chose; the ones the cache has are used where they are, the others are copied in over the experts with the lowest decayed use count (every use adds 1, every
 decoded token multiplies all counts by 0.97). The design is that of the official Strata engine's "decayed-frequency promotion ring"
 (github.com/Niko1221/Strata, `engine/src/inkling2/cuda/ink_hybrid.cuh`), done on the host side because this engine already reads the routing back at every streamed layer.
-Prompt reading does not use it (it streams through the staging slots). `strata-inkling2 --bench-tg 64` prints the hit rate. The real speed is unmeasured.
+**CPU expert pool.** A decode step's expert that is not in the cache and not used more than the cache's least used one is not copied: it is computed on the CPU from the host copy
+(`src/inkling2/i2_cpu_pool.cpp`: AVX2 + FMA rows for IQ4_NL and Q8_0 chosen at run time, any other type through the portable dequantization, same float arithmetic as the GPU kernels)
+while the GPU runs the others; only the 2304 input activations go down and the expert's 2304 outputs come back. At start the engine times an expert on the pool and the same bytes over PCIe,
+and uses the pool only if it is faster on this machine (it says so). The idea is the official engine's CPU expert pool (`ink_hybrid.cuh`, `hybrid_doorbell.cu`); that one runs inside a CUDA graph through
+a mapped-memory doorbell, this one is plain host code between the layers' kernels. Prompt reading does not use the cache or the pool (it streams through the staging slots). `strata-inkling2 --bench-tg 64` prints the hit rate. The real speed is unmeasured.
 No CUDA graphs yet.
 
 ## Not done
 
 - Checked only on small cases: the tokenizer against llama.cpp on a tiny vocabulary (the real 200 058-token vocabulary was not available here), the server glue against a fake engine.
-- Taken from the official Strata engine, not yet here: the CPU expert pool (cold experts computed on the CPU while the GPU runs the resident ones, only activations cross PCIe),
-  DSpark tree speculative decoding (needs `dspark-Inkling-2-Mini-Q8_0.gguf`), the vision tower (`mmproj-*.gguf`), K8V8/K8V4 KV compression. CUDA graphs.
+- Taken from the official Strata engine, not yet here: DSpark speculative decoding (needs `dspark-Inkling-2-Mini-Q8_0.gguf`; it would run on a GTX 1080 Ti - 0.4 GB, plain FP32 kernels - but verifying 4 tokens touches about 3.6 times the experts of one, which is what a streaming card is short of, so it is not expected to speed this setup up), the vision tower (`mmproj-*.gguf`), K8V8/K8V4 KV compression. CUDA graphs.
 - No MTP/speculative drafting: the GGUF has none.
 
 ## Checks

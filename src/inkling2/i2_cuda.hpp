@@ -21,6 +21,8 @@ struct GpuOptions {
     int stage_slots = 32;          // experts of a streaming layer copied to the card at a time (prompt reading)
     int cache_mib = -1;            // VRAM for the cache of the streamed layers' experts (decode): -1 = what is left, 0 = none
     int cache_slots = -1;          // the same in experts, for tests (-1: from cache_mib)
+    int cpu_threads = -1;          // the CPU expert pool (decode: cold experts computed on the CPU instead of copied): -1 = on when a speed check says it beats the copy, 0 = off, N = N threads
+    bool cpu_force = false;        // use the pool without the speed check (tests)
     double cache_decay = 0.97;     // an expert's use count is multiplied by this at every decoded token: the cache keeps the most used
     bool verbose = true;
 };
@@ -40,7 +42,7 @@ public:
     /// the number of physical layers whose experts stay in host memory (valid after init())
     int streamed_layers() const;
     /// the expert cache of the streamed layers: its slots, and the hits / misses of the decode steps so far
-    void cache_stats(int* slots, long long* hits, long long* misses) const;
+    void cache_stats(int* slots, long long* hits, long long* misses, long long* cpu_experts = nullptr) const;
     /// Append n tokens; the logits of the last one are made at the end.  on_piece(done) after each chunk (false: stop reading).
     bool process(const int32_t* ids, int64_t n, const std::function<bool(int64_t)>& on_piece, int64_t* done);
     void logits(std::vector<float>& out);

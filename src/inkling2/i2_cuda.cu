@@ -14,11 +14,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <numeric>
 #include <thread>
 #include <type_traits>
 
 #include "../gemma4/g4_cuda_compat.hpp"
+#include "i2_cpu_pool.hpp"
 #include "i2_kernels.cuh"
 #include "i2_ref.hpp"
 #include "../gemma4/g4_serve.hpp"
@@ -146,10 +148,15 @@ struct GpuEngine::Impl {
         int slots = 0;
         uint8_t *a = nullptr, *c = nullptr;
         std::vector<int> key, where;
-        std::vector<double> score;
         double inc = 1.0;
         long long hits = 0, misses = 0;
     } ec;
+    // every (layer, expert)'s decayed use count, in the cache or not: what decides who stays in the cache and who is computed on the CPU
+    std::vector<double> freq;
+    std::unique_ptr<i2cpu::Pool> pool;
+    bool cpu_on = false;
+    long long cpu_evals = 0;
+    std::vector<float> xh_host, cpu_y;
     size_t cache_budget = 0;
     int* cache_slot_dev = nullptr;
     float *logits = nullptr, *pv = nullptr;
@@ -320,6 +327,42 @@ struct GpuEngine::Impl {
         return "";
     }
 
+    /// The CPU expert pool, if it pays: a decode step's cold expert is computed on the CPU instead of copied to the card when that is faster here (measured once: an
+    /// expert of a streamed layer evaluated by the pool against the same bytes copied over PCIe).
+    void setup_cpu_pool() {
+        if (ec.slots == 0 || opt.cpu_threads == 0) return;
+        int ip = -1;
+        for (int i = 0; i < hp.n_layer && ip < 0; ++i) if (is_streamed[(size_t) i]) ip = i;
+        if (ip < 0) return;
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        const int nt = opt.cpu_threads > 0 ? opt.cpu_threads : (int) std::max(2u, std::min(8u, hw - 1));
+        pool.reset(new i2cpu::Pool(nt));
+        const DevLayer& dl = L[(size_t) ip];
+        const int E = hp.n_embd, nj = std::min(4, hp.n_expert);
+        std::vector<float> x((size_t) E), y((size_t) nj * (size_t) E);
+        for (int i = 0; i < E; ++i) x[(size_t) i] = std::sin(0.37f * (float) i);
+        std::vector<i2cpu::Job> jobs;
+        for (int j = 0; j < nj; ++j)
+            jobs.push_back({dl.h_gu + (size_t) j * dl.gate_up.expert_bytes, dl.gate_up.type, dl.gate_up.row_bytes, dl.h_dn + (size_t) j * dl.down.expert_bytes, dl.down.type,
+                            dl.down.row_bytes, y.data() + (size_t) j * (size_t) E});
+        double t_cpu = 1e300, t_copy = 1e300;
+        for (int rep = 0; rep < 4; ++rep) {
+            const double t0 = ms_now();
+            pool->run(x.data(), E, hp.n_ff_exp, hp.situ_beta, hp.situ_lin, jobs.data(), nj);
+            t_cpu = std::min(t_cpu, (ms_now() - t0) / nj);
+            const double t1 = ms_now();
+            CK(cudaMemcpy(stgA, dl.h_gu, dl.gate_up.expert_bytes, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(stgC, dl.h_dn, dl.down.expert_bytes, cudaMemcpyHostToDevice));
+            t_copy = std::min(t_copy, ms_now() - t1);
+        }
+        cpu_on = opt.cpu_force || t_cpu < t_copy;
+        if (opt.verbose)
+            std::fprintf(stderr, "strata-inkling2: CPU expert pool (%d threads%s): an expert takes %.2f ms on the CPU, %.2f ms to copy to the card: %s\n", nt,
+                         have_avx2_s() ? ", AVX2" : ", portable code", t_cpu, t_copy, cpu_on ? "cold experts are computed on the CPU" : "off, the copy is faster here");
+        if (!cpu_on) pool.reset();
+    }
+    static bool have_avx2_s() { return i2cpu::have_avx2(); }
+
     // ------------------------------------------------------------------------------------------------------------------------ init
     std::string init() {
         if (hp.hd > 128 || hp.hd % 32 != 0 || hp.n_rel > 128 || hp.gate_rank > 256 || hp.n_expert > 512 || hp.rel_extent > i2k::kMaxExtent || hp.window > i2k::kMaxExtent)
@@ -471,7 +514,7 @@ struct GpuEngine::Impl {
                 ec.a = alloc<uint8_t>(max_gu_bytes() * (size_t) want);
                 ec.c = alloc<uint8_t>(max_dn_bytes() * (size_t) want);
                 ec.key.assign((size_t) want, -1);
-                ec.score.assign((size_t) want, 0.0);
+                freq.assign((size_t) hp.n_layer * (size_t) hp.n_expert, 0.0);
                 ec.where.assign((size_t) hp.n_layer * (size_t) hp.n_expert, -1);
                 cache_slot_dev = alloc<int>((size_t) hp.n_used);
             }
@@ -490,6 +533,7 @@ struct GpuEngine::Impl {
         pi = alloc<int>((size_t) (hp.n_vocab / 1024 + 2));
         amax = alloc<int>(1);
         CK(cudaDeviceSynchronize());
+        setup_cpu_pool();
         if (opt.verbose) {
             int ns = 0;
             for (char s : is_streamed) ns += s;
@@ -644,38 +688,67 @@ struct GpuEngine::Impl {
         DevMat vgu = dl.gate_up, vdn = dl.down;
         vgu.d = stgA;
         vdn.d = stgC;
-        if (Tn == 1 && ec.slots >= nu) {                   // decode: the experts the cache has are used where they are, the others replace its least used
+        if (Tn == 1 && ec.slots >= nu) {                   // decode: the experts the cache has are used where they are; each other one is either copied in (it is used more than
+                                                           // the cache's least used) or computed on the CPU, from the host copy, while the GPU runs the rest
+            const int E = hp.n_embd;
             std::vector<int> sl((size_t) nu, -1);
-            for (int k = 0; k < nu; ++k) {                         // the hits first: a miss must not take the slot of an expert this step uses
-                sl[(size_t) k] = ec.where[(size_t) (ip * hp.n_expert + idx[(size_t) k])];
+            std::vector<char> cpu((size_t) nu, 0);
+            for (int k = 0; k < nu; ++k) {
+                const int key = ip * hp.n_expert + idx[(size_t) k];
+                freq[(size_t) key] += ec.inc;
+                sl[(size_t) k] = ec.where[(size_t) key];                // the hits first: a miss must not take the slot of an expert this step uses
                 ec.hits += sl[(size_t) k] >= 0;
             }
+            auto taken = [&](int j) { for (int q = 0; q < nu; ++q) if (sl[(size_t) q] == j && !cpu[(size_t) q]) return true; return false; };
+            int ncpu = 0;
             for (int k = 0; k < nu; ++k) {
+                if (sl[(size_t) k] >= 0) continue;
+                ++ec.misses;
                 const int e = idx[(size_t) k], key = ip * hp.n_expert + e;
-                int s = sl[(size_t) k];
-                if (s < 0) {
-                    ++ec.misses;
-                    double best = 1e300;
-                    for (int j = 0; j < ec.slots; ++j) {
-                        bool taken = false;
-                        for (int q = 0; q < nu; ++q) taken |= sl[(size_t) q] == j;
-                        if (!taken && ec.score[(size_t) j] < best) { best = ec.score[(size_t) j]; s = j; }
-                    }
-                    if (ec.key[(size_t) s] >= 0) ec.where[(size_t) ec.key[(size_t) s]] = -1;
-                    ec.key[(size_t) s] = key;
-                    ec.where[(size_t) key] = s;
-                    ec.score[(size_t) s] = 0.0;
-                    CK(cudaMemcpyAsync(ec.a + (size_t) s * max_gu_bytes(), dl.h_gu + (size_t) e * dl.gate_up.expert_bytes, dl.gate_up.expert_bytes, cudaMemcpyHostToDevice, st));
-                    CK(cudaMemcpyAsync(ec.c + (size_t) s * max_dn_bytes(), dl.h_dn + (size_t) e * dl.down.expert_bytes, dl.down.expert_bytes, cudaMemcpyHostToDevice, st));
-                    sl[(size_t) k] = s;
+                double best = 1e300;
+                int s = -1;
+                for (int j = 0; j < ec.slots; ++j) {
+                    if (taken(j)) continue;
+                    const double sc = ec.key[(size_t) j] >= 0 ? freq[(size_t) ec.key[(size_t) j]] : 0.0;
+                    if (sc < best) { best = sc; s = j; }
                 }
-                ec.score[(size_t) s] += ec.inc;
+                if (cpu_on && s >= 0 && freq[(size_t) key] <= best) {   // not used more than the one it would replace: not worth a place
+                    cpu[(size_t) k] = 1;
+                    sl[(size_t) k] = 0;                                  // (the kernels compute something for it; its row is overwritten by the CPU's)
+                    ++ncpu;
+                    ++cpu_evals;
+                    continue;
+                }
+                if (ec.key[(size_t) s] >= 0) ec.where[(size_t) ec.key[(size_t) s]] = -1;
+                ec.key[(size_t) s] = key;
+                ec.where[(size_t) key] = s;
+                CK(cudaMemcpyAsync(ec.a + (size_t) s * max_gu_bytes(), dl.h_gu + (size_t) e * dl.gate_up.expert_bytes, dl.gate_up.expert_bytes, cudaMemcpyHostToDevice, st));
+                CK(cudaMemcpyAsync(ec.c + (size_t) s * max_dn_bytes(), dl.h_dn + (size_t) e * dl.down.expert_bytes, dl.down.expert_bytes, cudaMemcpyHostToDevice, st));
+                sl[(size_t) k] = s;
+            }
+            if (ncpu) {
+                xh_host.resize((size_t) E);
+                CK(cudaMemcpy(xh_host.data(), n0, (size_t) E * 4, cudaMemcpyDeviceToHost));
+                cpu_y.resize((size_t) nu * (size_t) E);
             }
             CK(cudaMemcpy(cache_slot_dev, sl.data(), (size_t) nu * 4, cudaMemcpyHostToDevice));
             DevMat cgu = dl.gate_up, cdn = dl.down;
             cgu.d = ec.a; cgu.expert_bytes = max_gu_bytes();
             cdn.d = ec.c; cdn.expert_bytes = max_dn_bytes();
             exp_ffn(cgu, cdn, nu, true, cache_slot_dev, dec_first, dec_n, dec_tok, dec_row, rows, nullptr);
+            if (ncpu) {                                              // (the GPU is busy with the launches above while the CPU works)
+                std::vector<i2cpu::Job> jobs;
+                std::vector<int> ks;
+                for (int k = 0; k < nu; ++k) {
+                    if (!cpu[(size_t) k]) continue;
+                    const int e = idx[(size_t) k];
+                    jobs.push_back({dl.h_gu + (size_t) e * dl.gate_up.expert_bytes, dl.gate_up.type, dl.gate_up.row_bytes, dl.h_dn + (size_t) e * dl.down.expert_bytes, dl.down.type,
+                                    dl.down.row_bytes, cpu_y.data() + (size_t) k * (size_t) E});
+                    ks.push_back(k);
+                }
+                pool->run(xh_host.data(), E, hp.n_ff_exp, hp.situ_beta, hp.situ_lin, jobs.data(), (int) jobs.size());
+                for (int k : ks) CK(cudaMemcpyAsync(ed + (size_t) k * (size_t) E, cpu_y.data() + (size_t) k * (size_t) E, (size_t) E * 4, cudaMemcpyHostToDevice, st));
+            }
             return;
         }
         if (Tn == 1) {
@@ -794,7 +867,7 @@ struct GpuEngine::Impl {
     void forward_chunk(const int32_t* ids, int Tn, bool want_logits) {
         if (ec.slots && Tn == 1) {                                 // a decoded token: the use counts age by one step
             ec.inc /= opt.cache_decay;
-            if (ec.inc > 1e50) { for (double& x : ec.score) x /= ec.inc; ec.inc = 1.0; }
+            if (ec.inc > 1e50) { for (double& x : freq) x /= ec.inc; ec.inc = 1.0; }
         }
         const int E = hp.n_embd;
         hbuf.resize((size_t) Tn * (size_t) E);
@@ -858,7 +931,10 @@ std::string GpuEngine::init() { return p_->init(); }
 int GpuEngine::ctx() const { return p_->ctx; }
 int GpuEngine::n_vocab() const { return p_->hp.n_vocab; }
 int64_t GpuEngine::pos() const { return p_->pos; }
-void GpuEngine::cache_stats(int* slots, long long* hits, long long* misses) const { *slots = p_->ec.slots; *hits = p_->ec.hits; *misses = p_->ec.misses; }
+void GpuEngine::cache_stats(int* slots, long long* hits, long long* misses, long long* cpu) const {
+    *slots = p_->ec.slots; *hits = p_->ec.hits; *misses = p_->ec.misses;
+    if (cpu) *cpu = p_->cpu_evals;
+}
 void GpuEngine::set_trace(std::vector<std::vector<float>>* t, std::vector<std::vector<int>>* s) { p_->trace = t; p_->sel_trace = s; }
 void GpuEngine::reset() { p_->pos = 0; p_->logits_ready = false; }
 void GpuEngine::truncate(int64_t q) { p_->pos = std::min(p_->pos, std::max<int64_t>(0, q)); p_->logits_ready = false; }
@@ -911,6 +987,7 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
         if (a == "--prefill" || a == "--chunk") { const std::string v = val(); if (v != "auto") o.chunk = std::max(1, std::atoi(v.c_str())); }
         else if (a == "--host-experts") o.host_experts = std::max(0, std::atoi(val().c_str()));
         else if (a == "--expert-cache-mib") o.cache_mib = std::max(0, std::atoi(val().c_str()));
+        else if (a == "--cpu-experts") { const std::string v = val(); o.cpu_threads = v == "auto" ? -1 : std::max(0, std::atoi(v.c_str())); }
         else if (a == "--cache-decay") o.cache_decay = std::min(1.0, std::max(0.5, std::atof(val().c_str())));
         else if (a == "--swa-slack") o.slack = std::max(0, std::atoi(val().c_str()));
         else if (a == "--vram-reserve-mib") o.reserve_mib = std::max(0, std::atoi(val().c_str()));
@@ -955,9 +1032,9 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
             const double ms = ms_now() - t0;
             std::printf("generation: %d tokens in %.0f ms: %.1f tok/s\n", n, ms, 1000.0 * n / ms);
             int cs = 0;
-            long long ch = 0, cm = 0;
-            eng.cache_stats(&cs, &ch, &cm);
-            if (cs) std::printf("expert cache: %d slots, %lld hits, %lld misses (%.1f%% hits)\n", cs, ch, cm, 100.0 * (double) ch / (double) std::max<long long>(1, ch + cm));
+            long long ch = 0, cm = 0, cc = 0;
+            eng.cache_stats(&cs, &ch, &cm, &cc);
+            if (cs) std::printf("expert cache: %d slots, %lld hits, %lld misses (%.1f%% hits), %lld experts computed on the CPU\n", cs, ch, cm, 100.0 * (double) ch / (double) std::max<long long>(1, ch + cm), cc);
         }
         return 0;
     }

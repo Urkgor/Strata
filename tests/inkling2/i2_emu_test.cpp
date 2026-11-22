@@ -40,9 +40,9 @@ int main(int argc, char** argv) {
     std::vector<float> all;
     ref.forward(ids.data(), n, nullptr, &all);
     auto row = [&](int t) { return all.data() + (size_t) t * (size_t) nv; };
-    auto make = [&](int chunk, int slack, int host_experts = 0, int stage_slots = 32, int cache_slots = 0) {
+    auto make = [&](int chunk, int slack, int host_experts = 0, int stage_slots = 32, int cache_slots = 0, int cpu_threads = 0) {
         i2cuda::GpuOptions o;
-        o.chunk = chunk; o.slack = slack; o.reserve_mib = 0; o.host_experts = host_experts; o.stage_slots = stage_slots; o.cache_slots = cache_slots; o.verbose = false;
+        o.chunk = chunk; o.slack = slack; o.reserve_mib = 0; o.host_experts = host_experts; o.stage_slots = stage_slots; o.cache_slots = cache_slots; o.cpu_threads = cpu_threads; o.cpu_force = cpu_threads > 0; o.verbose = false;
         auto e = std::make_unique<i2cuda::GpuEngine>(m, 64, o);
         const std::string er = e->init();
         if (!er.empty()) { std::fprintf(stderr, "init: %s\n", er.c_str()); std::exit(1); }
@@ -153,6 +153,21 @@ int main(int argc, char** argv) {
         long long hits = 0, misses = 0;
         e->cache_stats(&slots, &hits, &misses);
         EXPECT(rel_rms(lg, row(6)) < tol && hits >= 48 && hits + misses == 96, "a token decoded twice with a cache of everything: the second time is all hits (%lld hits, %lld misses of 96 lookups)", hits, misses);
+    }
+    {   // the CPU expert pool: the same cache, and the experts that are not worth a place in it computed by the pool (2 threads) from the host copy
+        auto e = make(8, 1024, 1000, 4, 5, 2);
+        int64_t done = 0;
+        e->process(ids.data(), 6, noop, &done);
+        double worst = 0;
+        for (int t = 6; t < n; ++t) {
+            e->process(&ids[(size_t) t], 1, noop, &done);
+            e->logits(lg);
+            worst = std::max(worst, rel_rms(lg, row(t)));
+        }
+        int slots = 0;
+        long long hits = 0, misses = 0, cpu = 0;
+        e->cache_stats(&slots, &hits, &misses, &cpu);
+        EXPECT(worst < tol && cpu > 0 && cpu < misses, "CPU expert pool over %d decoded tokens: worst %.2e, %lld experts on the CPU of %lld misses", n - 6, worst, cpu, misses);
     }
     std::printf(fails ? "%d FAILED\n" : "i2_emu_test: all scenarios pass\n", fails);
     return fails ? 1 : 0;
