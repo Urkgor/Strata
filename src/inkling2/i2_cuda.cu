@@ -508,6 +508,8 @@ struct GpuEngine::Impl {
         vraw = alloc<float>(T * (size_t) kd);
         r = alloc<float>(T * (size_t) H * (size_t) R);
         sink = alloc<float>(T * (size_t) H);
+        mixstat = alloc<float>(T * (size_t) i2k::kMaxStates * (size_t) (1 + i2k::kMaxQueries));
+        ctrl_gate = alloc<float>(T * (size_t) std::max(hp.gate_rank, 1));
         pm_ = alloc<float>((size_t) H * (size_t) std::max(1, opt.attn_max_split));
         pl_ = alloc<float>((size_t) H * (size_t) std::max(1, opt.attn_max_split));
         pacc_ = alloc<float>((size_t) H * (size_t) std::max(1, opt.attn_max_split) * (size_t) hd);
@@ -634,11 +636,16 @@ struct GpuEngine::Impl {
         const int S = (int) states.size();
         if (S > i2k::kMaxStates) { std::fprintf(stderr, "strata-inkling2: %d residual states (at most %d)\n", S, i2k::kMaxStates); std::exit(1); }
         for (int i = 0; i < S; ++i) s[i] = states[(size_t) i];
-        G4_LAUNCH(i2k::k_mix, dim3(Tn), dim3(i2k::kMixThreads), st, s[0], s[1], s[2], s[3], s[4], S, hp.n_embd, queries, nq, out, Tn, 1e-6f);
+        G4_LAUNCH(i2k::k_mix_stats, dim3((unsigned) S, (unsigned) Tn), dim3(i2k::kMixThreads), st, s[0], s[1], s[2], s[3], s[4], S, hp.n_embd, queries, nq, mixstat);
+        G4_LAUNCH(i2k::k_mix_apply, dim3((unsigned) ((hp.n_embd + 255) / 256), (unsigned) Tn), dim3(i2k::kMixThreads), st, s[0], s[1], s[2], s[3], s[4], S, hp.n_embd, nq,
+                  (const float*) mixstat, out, Tn, 1e-6f);
     }
+    float *mixstat = nullptr, *ctrl_gate = nullptr;            // the mix's per-state sums, the controller's gate (per token)
     void control(float* c, const float* msg, int Tn, const DevLoop& lw, int k) {
-        G4_LAUNCH(i2k::k_control, dim3(Tn), dim3(i2k::kMixThreads), st, c, msg, hp.n_embd, hp.gate_rank, (const float*) lw.down[k], (const float*) lw.gain[k], (const float*) lw.forget[k],
+        G4_LAUNCH(i2k::k_ctrl_gate, dim3((unsigned) ((hp.gate_rank + 3) / 4), (unsigned) Tn), dim3(128), st, (const float*) c, msg, hp.n_embd, hp.gate_rank, (const float*) lw.down[k], ctrl_gate,
                   1e-6f);
+        G4_LAUNCH(i2k::k_ctrl_apply, dim3((unsigned) ((hp.n_embd + 255) / 256), (unsigned) Tn), dim3(i2k::kMixThreads), st, c, msg, hp.n_embd, hp.gate_rank, (const float*) lw.gain[k],
+                  (const float*) lw.forget[k], (const float*) ctrl_gate);
     }
     void ring_store(const float* buf, int n, float* cring, int seg_off, int Tn, int pos0) {
         G4_LAUNCH(i2k::k_ring_store, dim3((unsigned) ((n + 127) / 128), (unsigned) Tn), dim3(g4k::kThreads), st, buf, n, n, cring, hp.conv_channels(), seg_off, pos0, Tn);

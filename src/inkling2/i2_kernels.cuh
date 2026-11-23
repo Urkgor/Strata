@@ -24,95 +24,102 @@ constexpr int kMaxQueries = 4;
 G4_DEV float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------
-/// The attention over the depth, a block per token: the rms-normed states (s0 .. s(S-1)) weighted by a softmax of their products with each of nq
-/// queries (scale 1 / sqrt(n)); out[q][t][i].  `t_out`: the token count of `out` (its q stride).
+/// The attention over the depth, in two launches so that a decoded token's 2304 values are not one block's work.
+/// k_mix_stats: a block per (state, token), grid (S, T): sum of squares of the state's row and its products with each of the nq queries -> stats[(t * S + s)][1 + kMaxQueries].
 __global__ void __launch_bounds__(kMixThreads)
-k_mix(const float* s0, const float* s1, const float* s2, const float* s3, const float* s4, int S, int n, const float* queries, int nq, float* out, int t_out,
-      float eps) {
-    __shared__ float red[8][kMaxStates * (1 + kMaxQueries)];
-    __shared__ float tot[kMaxStates * (1 + kMaxQueries)];
-    __shared__ float wgt[kMaxStates][kMaxQueries];
-    const float* st[kMaxStates] = {s0, s1, s2, s3, s4};
-    const int t = (int) blockIdx.x, tid = (int) threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    float ss[kMaxStates], dt[kMaxStates][kMaxQueries];
-    for (int s = 0; s < kMaxStates; ++s) {
-        ss[s] = 0.f;
-        for (int q = 0; q < kMaxQueries; ++q) dt[s][q] = 0.f;
-    }
+k_mix_stats(const float* s0, const float* s1, const float* s2, const float* s3, const float* s4, int S, int n, const float* queries, int nq, float* stats) {
+    __shared__ float red[8][1 + kMaxQueries];
+    const int s = (int) blockIdx.x, t = (int) blockIdx.y, tid = (int) threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float* x = (s == 0 ? s0 : s == 1 ? s1 : s == 2 ? s2 : s == 3 ? s3 : s4) + (size_t) t * (size_t) n;
+    float a = 0.f, d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
     for (int i = tid; i < n; i += kMixThreads) {
-        for (int s = 0; s < S; ++s) {
-            const float x = st[s][(size_t) t * (size_t) n + (size_t) i];
-            ss[s] += x * x;
-            for (int q = 0; q < nq; ++q) dt[s][q] += x * queries[(size_t) q * (size_t) n + (size_t) i];
-        }
+        const float v = x[i];
+        a += v * v;
+        d0 += v * queries[i];
+        if (nq > 1) d1 += v * queries[(size_t) n + (size_t) i];
+        if (nq > 2) d2 += v * queries[(size_t) 2 * (size_t) n + (size_t) i];
+        if (nq > 3) d3 += v * queries[(size_t) 3 * (size_t) n + (size_t) i];
     }
-    for (int s = 0; s < S; ++s) {
-        const float a = warp_sum(ss[s]);
-        if (lane == 0) red[warp][s * (1 + kMaxQueries)] = a;
-        for (int q = 0; q < nq; ++q) {
-            const float b = warp_sum(dt[s][q]);
-            if (lane == 0) red[warp][s * (1 + kMaxQueries) + 1 + q] = b;
-        }
-    }
+    a = warp_sum(a); d0 = warp_sum(d0); d1 = warp_sum(d1); d2 = warp_sum(d2); d3 = warp_sum(d3);
+    if (lane == 0) { red[warp][0] = a; red[warp][1] = d0; red[warp][2] = d1; red[warp][3] = d2; red[warp][4] = d3; }
     __syncthreads();
-    for (int k = tid; k < S * (1 + kMaxQueries); k += kMixThreads) {
-        float a = 0.f;
-        for (int w = 0; w < kMixThreads / 32; ++w) a += red[w][k];
-        tot[k] = a;
+    if (tid < 1 + kMaxQueries) {
+        float v = 0.f;
+        for (int w = 0; w < kMixThreads / 32; ++w) v += red[w][tid];
+        stats[((size_t) t * (size_t) S + (size_t) s) * (1 + kMaxQueries) + (size_t) tid] = v;
     }
-    __syncthreads();
-    if (tid < nq) {                               // the softmax of query `tid` over the states (one thread each: S <= 5)
-        const int q = tid;
+}
+
+/// k_mix_apply: grid (ceil(n / 256), T): out[q][t][i] = sum_s w[s][q] state_s[t][i], w = softmax over the states of (state's products with the query) / rms(state) / sqrt(n),
+/// times 1 / rms(state).  `t_out`: the token count of `out` (its q stride).
+__global__ void __launch_bounds__(kMixThreads)
+k_mix_apply(const float* s0, const float* s1, const float* s2, const float* s3, const float* s4, int S, int n, int nq, const float* stats, float* out, int t_out, float eps) {
+    const int t = (int) blockIdx.y, i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) return;
+    const float* st[kMaxStates] = {s0, s1, s2, s3, s4};
+    const float* sp = stats + (size_t) t * (size_t) S * (1 + kMaxQueries);
+    float inv[kMaxStates], v[kMaxStates];
+#pragma unroll
+    for (int s = 0; s < kMaxStates; ++s) {
+        inv[s] = s < S ? 1.0f / sqrtf(sp[s * (1 + kMaxQueries)] / (float) n + eps) : 0.f;
+        v[s] = s < S ? st[s][(size_t) t * (size_t) n + (size_t) i] : 0.f;
+    }
+#pragma unroll
+    for (int q = 0; q < kMaxQueries; ++q) {
+        if (q >= nq) break;
         float sc[kMaxStates], mx = -INFINITY;
-        for (int s = 0; s < S; ++s) {
-            const float inv = 1.0f / sqrtf(tot[s * (1 + kMaxQueries)] / (float) n + eps);
-            sc[s] = tot[s * (1 + kMaxQueries) + 1 + q] * inv * (1.0f / sqrtf((float) n));
+#pragma unroll
+        for (int s = 0; s < kMaxStates; ++s) {
+            sc[s] = s < S ? sp[s * (1 + kMaxQueries) + 1 + q] * inv[s] * (1.0f / sqrtf((float) n)) : -INFINITY;
             mx = fmaxf(mx, sc[s]);
         }
         float sum = 0.f;
-        for (int s = 0; s < S; ++s) { sc[s] = expf(sc[s] - mx); sum += sc[s]; }
-        for (int s = 0; s < S; ++s) wgt[s][q] = sc[s] / sum * (1.0f / sqrtf(tot[s * (1 + kMaxQueries)] / (float) n + eps));
-    }
-    __syncthreads();
-    for (int i = tid; i < n; i += kMixThreads) {
-        for (int q = 0; q < nq; ++q) {
-            float o = 0.f;
-            for (int s = 0; s < S; ++s) o += wgt[s][q] * st[s][(size_t) t * (size_t) n + (size_t) i];
-            out[((size_t) q * (size_t) t_out + (size_t) t) * (size_t) n + (size_t) i] = o;
-        }
+#pragma unroll
+        for (int s = 0; s < kMaxStates; ++s) { sc[s] = s < S ? expf(sc[s] - mx) : 0.f; sum += sc[s]; }
+        float o = 0.f;
+#pragma unroll
+        for (int s = 0; s < kMaxStates; ++s) o += sc[s] / sum * inv[s] * v[s];
+        out[((size_t) q * (size_t) t_out + (size_t) t) * (size_t) n + (size_t) i] = o;
     }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------
-/// The cross-pass controller, a block per token: cur = cur - tanh(forget g) cur + tanh(gain g) m with g = down([rms(cur), rms(m)]).
-/// down [rk][2 n], gain / forget [n][rk] (floats); cur is updated in place.
-__global__ void __launch_bounds__(kMixThreads)
-k_control(float* cur, const float* msg, int n, int rk, const float* down, const float* gain, const float* forget, float eps) {
+/// The cross-pass controller: cur = cur - tanh(forget g) cur + tanh(gain g) m with g = down([rms(cur), rms(m)]), down [rk][2 n], gain / forget [n][rk] (floats); cur is
+/// updated in place.  Two launches so that its 2.4 MB of weights are not read by one block: k_ctrl_gate (grid (rk / 4, T), 4 warps, a rank row each) writes g[t][rk],
+/// k_ctrl_apply (grid (ceil(n / 256), T)) applies it.
+__global__ void __launch_bounds__(128)
+k_ctrl_gate(const float* cur, const float* msg, int n, int rk, const float* down, float* gate, float eps) {
     __shared__ float sh[32];
-    __shared__ float gate[256];
-    const int t = (int) blockIdx.x, tid = (int) threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    float* c = cur + (size_t) t * (size_t) n;
+    const int t = (int) blockIdx.y, tid = (int) threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const float* c = cur + (size_t) t * (size_t) n;
     const float* m = msg + (size_t) t * (size_t) n;
     float a = 0.f, b = 0.f;
-    for (int i = tid; i < n; i += kMixThreads) { a += c[i] * c[i]; b += m[i] * m[i]; }
+    for (int i = tid; i < n; i += 128) { a += c[i] * c[i]; b += m[i] * m[i]; }
     const float sa = 1.0f / sqrtf(block_sum(a, sh) / (float) n + eps);
     const float sb = 1.0f / sqrtf(block_sum(b, sh) / (float) n + eps);
-    for (int r = warp; r < rk; r += kMixThreads / 32) {
-        float acc = 0.f;
-        const float* d = down + (size_t) r * (size_t) 2 * (size_t) n;
-        for (int i = lane; i < n; i += 32) acc += d[i] * (c[i] * sa);
-        for (int i = lane; i < n; i += 32) acc += d[n + i] * (m[i] * sb);
-        acc = warp_sum(acc);
-        if (lane == 0) gate[r] = acc;
-    }
+    const int r = (int) blockIdx.x * 4 + warp;
+    if (r >= rk) return;
+    float acc = 0.f;
+    const float* d = down + (size_t) r * (size_t) 2 * (size_t) n;
+    for (int i = lane; i < n; i += 32) acc += d[i] * (c[i] * sa) + d[n + i] * (m[i] * sb);
+    acc = warp_sum(acc);
+    if (lane == 0) gate[(size_t) t * (size_t) rk + (size_t) r] = acc;
+}
+
+__global__ void __launch_bounds__(kMixThreads)
+k_ctrl_apply(float* cur, const float* msg, int n, int rk, const float* gain, const float* forget, const float* gate) {
+    __shared__ float g[256];
+    const int t = (int) blockIdx.y, tid = (int) threadIdx.x, i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    for (int r = tid; r < rk; r += kMixThreads) g[r] = gate[(size_t) t * (size_t) rk + (size_t) r];
     __syncthreads();
-    for (int i = tid; i < n; i += kMixThreads) {
-        float ga = 0.f, fo = 0.f;
-        const float* gr = gain + (size_t) i * (size_t) rk;
-        const float* fr = forget + (size_t) i * (size_t) rk;
-        for (int r = 0; r < rk; ++r) { ga += gr[r] * gate[r]; fo += fr[r] * gate[r]; }
-        c[i] = c[i] - tanhf(fo) * c[i] + tanhf(ga) * m[i];
-    }
+    if (i >= n) return;
+    float* c = cur + (size_t) t * (size_t) n;
+    const float* m = msg + (size_t) t * (size_t) n;
+    float ga = 0.f, fo = 0.f;
+    const float* gr = gain + (size_t) i * (size_t) rk;
+    const float* fr = forget + (size_t) i * (size_t) rk;
+    for (int r = 0; r < rk; ++r) { ga += gr[r] * g[r]; fo += fr[r] * g[r]; }
+    c[i] = c[i] - tanhf(fo) * c[i] + tanhf(ga) * m[i];
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------
