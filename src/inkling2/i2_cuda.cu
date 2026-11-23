@@ -165,15 +165,17 @@ struct GpuEngine::Impl {
     float *xh_host = nullptr, *cpu_y = nullptr;            // pinned: the CPU pool's input (one token) and outputs (n_used rows)
     int* slot_pin = nullptr;                               // pinned: the slots of a decode step, copied to the card without waiting
     // --profile: where a decoded token's time goes (the stream is synchronized at each boundary, so the total is a little more than without)
-    struct Prof { double res = 0, str = 0, wait = 0, host = 0, cpu = 0, total = 0; long long nres = 0, nstr = 0, tokens = 0; double lap[2][6] = {}, enq[2][6] = {}; } pf;
+    struct Prof { double res = 0, str = 0, wait = 0, host = 0, cpu = 0, total = 0; long long nres = 0, nstr = 0, tokens = 0, chunks = 0; double lap[2][6] = {}, enq[2][6] = {}; };
+    Prof pfk[2];                                        // [0] decoded tokens, [1] prompt chunks
+    int prof_kind = 0;
     double lap_t = 0;
     void lap_(bool prof, int i, bool streamed) {          // --profile: the time since the last lap, into phase i of a resident / streamed visit
         if (!prof) return;
         const double t_enq = ms_now();                        // (the host has queued the phase's work: how long that took, against how long the card took)
         CK(cudaStreamSynchronize(st));
         const double t = ms_now();
-        pf.enq[streamed ? 1 : 0][i] += t_enq - lap_t;
-        pf.lap[streamed ? 1 : 0][i] += t - lap_t;
+        pfk[prof_kind].enq[streamed ? 1 : 0][i] += t_enq - lap_t;
+        pfk[prof_kind].lap[streamed ? 1 : 0][i] += t - lap_t;
         lap_t = t;
     }
     size_t cache_budget = 0;
@@ -916,7 +918,7 @@ struct GpuEngine::Impl {
         const double tw0 = opt.profile ? ms_now() : 0.0;
         CK(cudaMemcpy(idx.data(), topk_idx, (size_t) rows * 4, cudaMemcpyDeviceToHost));       // (also the barrier: the router has run)
         const double tw1 = opt.profile ? ms_now() : 0.0;
-        if (opt.profile && Tn == 1) pf.wait += tw1 - tw0;
+        if (opt.profile && Tn == 1) pfk[0].wait += tw1 - tw0;
         auto copy_in = [&](int slot, int e) {
             CK(cudaMemcpyAsync(stgA + (size_t) slot * dl.gate_up.expert_bytes, dl.h_gu + (size_t) e * dl.gate_up.expert_bytes, dl.gate_up.expert_bytes, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(stgC + (size_t) slot * dl.down.expert_bytes, dl.h_dn + (size_t) e * dl.down.expert_bytes, dl.down.expert_bytes, cudaMemcpyHostToDevice, st));
@@ -995,7 +997,7 @@ struct GpuEngine::Impl {
                 }
                 const double tc0 = opt.profile ? ms_now() : 0.0;
                 pool->run(xh_host, E, hp.n_ff_exp, hp.situ_beta, hp.situ_lin, jobs.data(), (int) jobs.size());
-                if (opt.profile) pf.cpu += ms_now() - tc0;
+                if (opt.profile) pfk[0].cpu += ms_now() - tc0;
                 for (int k : ks) CK(cudaMemcpyAsync(ed + (size_t) k * (size_t) E, cpu_y + (size_t) k * (size_t) E, (size_t) E * 4, cudaMemcpyHostToDevice, st));
             }
             return;
@@ -1039,7 +1041,8 @@ struct GpuEngine::Impl {
         const int E = hp.n_embd, qd = hp.q_dim(), kd = hp.kv_dim();
         const size_t TE = (size_t) Tn * (size_t) E;
         const bool swa = hp.swa[(size_t) ip] != 0;
-        const bool prof = opt.profile && Tn == 1;
+        const bool prof = opt.profile;
+        prof_kind = Tn > 1 ? 1 : 0;
         double tv0 = 0.0;
         if (prof) { CK(cudaStreamSynchronize(st)); tv0 = ms_now(); lap_t = tv0; }
         const dim3 b1(g4k::kThreads);
@@ -1124,8 +1127,8 @@ struct GpuEngine::Impl {
         ring_store(moe, E, V.cring, 2 * kd + E, Tn, pos0);
         if (prof) {
             lap_(prof, 5, dl.streamed);                           // (the router, the experts, their sum and convolution)
-            (dl.streamed ? pf.str : pf.res) += ms_now() - tv0;
-            ++(dl.streamed ? pf.nstr : pf.nres);
+            (dl.streamed ? pfk[prof_kind].str : pfk[prof_kind].res) += ms_now() - tv0;
+            ++(dl.streamed ? pfk[prof_kind].nstr : pfk[prof_kind].nres);
         }
         if (trace) {
             CK(cudaStreamSynchronize(st));
@@ -1137,7 +1140,7 @@ struct GpuEngine::Impl {
 
     // ------------------------------------------------------------------------------------------------------------------------ a chunk
     void forward_chunk(const int32_t* ids, int Tn, bool want_logits) {
-        const double tf0 = (opt.profile && Tn == 1) ? ms_now() : 0.0;
+        const double tf0 = opt.profile ? ms_now() : 0.0;
         if (ec.slots && Tn == 1) {                                 // a decoded token: the use counts age by one step
             ec.inc /= opt.cache_decay;
             if (ec.inc > 1e50) { for (double& x : freq) x /= ec.inc; ec.inc = 1.0; }
@@ -1194,7 +1197,7 @@ struct GpuEngine::Impl {
             logits_ready = false;
         }
         CK(cudaStreamSynchronize(st));
-        if (opt.profile && Tn == 1) { pf.total += ms_now() - tf0; ++pf.tokens; }
+        if (opt.profile) { Prof& f = pfk[Tn > 1 ? 1 : 0]; f.total += ms_now() - tf0; f.tokens += Tn; ++f.chunks; }
         pos += Tn;
     }
 };
@@ -1207,27 +1210,37 @@ int GpuEngine::ctx() const { return p_->ctx; }
 int GpuEngine::n_vocab() const { return p_->hp.n_vocab; }
 int64_t GpuEngine::pos() const { return p_->pos; }
 bool GpuEngine::dp_active() const { return p_->dp_any || p_->pf_any; }
-void GpuEngine::profile_reset() { p_->pf = Impl::Prof(); }
+void GpuEngine::profile_reset() { p_->pfk[0] = Impl::Prof(); p_->pfk[1] = Impl::Prof(); }
 std::string GpuEngine::profile_report() const {
-    const auto& f = p_->pf;
-    if (f.tokens == 0) return "";
-    const double n = (double) f.tokens;
-    char b[900];
-    std::snprintf(b, sizeof b,
-                  "profile, per decoded token (%lld tokens, %.1f ms): resident-expert visits %.1f ms (%.1f visits, %.2f ms each); streamed-expert visits %.1f ms (%.1f visits, %.2f ms each), of which waiting for the "
-                  "router's choice %.1f ms, the CPU pool %.1f ms; the rest (embedding, output head, sync) %.1f ms\n",
-                  f.tokens, f.total / n, f.res / n, (double) f.nres / n, f.nres ? f.res / (double) f.nres : 0.0, f.str / n, (double) f.nstr / n, f.nstr ? f.str / (double) f.nstr : 0.0, f.wait / n, f.cpu / n,
-                  (f.total - f.res - f.str) / n);
+    std::string out;
     static const char* ph[6] = {"norms+mixes", "projections", "prep+attention", "out proj+conv", "ffn mix+norm", "router+experts"};
-    std::string out = b;
-    for (int k = 0; k < 2; ++k) {
-        const double vn = (double) (k ? f.nstr : f.nres);
-        if (vn <= 0) continue;
-        out += k ? "  a streamed visit:" : "  a resident visit:";
-        for (int i = 0; i < 6; ++i) { std::snprintf(b, sizeof b, " %s %.3f", ph[i], f.lap[k][i] / vn); out += b; }
-        out += " (ms)\n  ... of which the host spent queueing it:";
-        for (int i = 0; i < 6; ++i) { std::snprintf(b, sizeof b, " %.3f", f.enq[k][i] / vn); out += b; }
-        out += " (ms)\n";
+    char b[900];
+    for (int kind = 0; kind < 2; ++kind) {
+        const auto& f = p_->pfk[kind];
+        if (f.tokens == 0) continue;
+        const double n = (double) f.tokens;
+        if (kind == 0)
+            std::snprintf(b, sizeof b,
+                          "profile, per decoded token (%lld tokens, %.1f ms): resident-expert visits %.1f ms (%.1f visits, %.2f ms each); streamed-expert visits %.1f ms (%.1f visits, %.2f ms each), of which waiting for the "
+                          "router's choice %.1f ms, the CPU pool %.1f ms; the rest (embedding, output head, sync) %.1f ms\n",
+                          f.tokens, f.total / n, f.res / n, (double) f.nres / n, f.nres ? f.res / (double) f.nres : 0.0, f.str / n, (double) f.nstr / n, f.nstr ? f.str / (double) f.nstr : 0.0, f.wait / n, f.cpu / n,
+                          (f.total - f.res - f.str) / n);
+        else
+            std::snprintf(b, sizeof b, "profile, prompt (%lld tokens in %lld chunks, %.1f ms a token, %.0f ms a chunk): resident-expert visits %.0f ms a chunk (%.2f s in all, %.1f ms a visit); streamed-expert visits %.0f ms a chunk (%.1f ms a visit)\n",
+                          f.tokens, f.chunks, f.total / n, f.total / (double) f.chunks, f.res / (double) f.chunks, f.res / 1000.0, f.nres ? f.res / (double) f.nres : 0.0, f.str / (double) f.chunks, f.nstr ? f.str / (double) f.nstr : 0.0);
+        out += b;
+        for (int k = 0; k < 2; ++k) {
+            const double vn = (double) (k ? f.nstr : f.nres);
+            if (vn <= 0) continue;
+            out += k ? "  a streamed visit:" : "  a resident visit:";
+            for (int i = 0; i < 6; ++i) { std::snprintf(b, sizeof b, " %s %.3f", ph[i], f.lap[k][i] / vn); out += b; }
+            out += " (ms)\n";
+            if (kind == 0) {
+                out += "  ... of which the host spent queueing it:";
+                for (int i = 0; i < 6; ++i) { std::snprintf(b, sizeof b, " %.3f", f.enq[k][i] / vn); out += b; }
+                out += " (ms)\n";
+            }
+        }
     }
     return out;
 }
@@ -1329,6 +1342,7 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
             eng.logits(lg);
             const double ms = ms_now() - t0;
             std::printf("prompt: %lld tokens in %.0f ms: %.1f tok/s\n", (long long) done, ms, 1000.0 * (double) done / ms);
+            { const std::string rep = eng.profile_report(); if (!rep.empty()) std::printf("%s", rep.c_str()); eng.profile_reset(); }
         }
         if (bench_tg > 0) {
             eng.reset();
