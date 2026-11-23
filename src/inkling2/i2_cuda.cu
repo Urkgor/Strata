@@ -161,7 +161,15 @@ struct GpuEngine::Impl {
     double t_cpu_ms = 1.0, t_copy_ms = 1.0;      // an expert on the CPU pool / over PCIe, measured at start
     std::vector<float> xh_host, cpu_y;
     // --profile: where a decoded token's time goes (the stream is synchronized at each boundary, so the total is a little more than without)
-    struct Prof { double res = 0, str = 0, wait = 0, host = 0, cpu = 0, total = 0; long long nres = 0, nstr = 0, tokens = 0; } pf;
+    struct Prof { double res = 0, str = 0, wait = 0, host = 0, cpu = 0, total = 0; long long nres = 0, nstr = 0, tokens = 0; double lap[2][6] = {}; } pf;
+    double lap_t = 0;
+    void lap_(bool prof, int i, bool streamed) {          // --profile: the time since the last lap, into phase i of a resident / streamed visit
+        if (!prof) return;
+        CK(cudaStreamSynchronize(st));
+        const double t = ms_now();
+        pf.lap[streamed ? 1 : 0][i] += t - lap_t;
+        lap_t = t;
+    }
     size_t cache_budget = 0;
     int* cache_slot_dev = nullptr;
     float *logits = nullptr, *pv = nullptr;
@@ -818,7 +826,7 @@ struct GpuEngine::Impl {
         const bool swa = hp.swa[(size_t) ip] != 0;
         const bool prof = opt.profile && Tn == 1;
         double tv0 = 0.0;
-        if (prof) { CK(cudaStreamSynchronize(st)); tv0 = ms_now(); }
+        if (prof) { CK(cudaStreamSynchronize(st)); tv0 = ms_now(); lap_t = tv0; }
         const dim3 b1(g4k::kThreads);
         copy_f(sa, cur, TE);
         float* in[3] = {cur, cur, cur};
@@ -849,6 +857,7 @@ struct GpuEngine::Impl {
             nk = n1;
             nv = n2;
         }
+        lap_(prof, 0, dl.streamed);                               // (the mixes, controls and norms before the projections)
         mm(dl.wq, nq0, E, Tn, q, qd);
         mm(dl.wk, nk, E, Tn, kraw, kd);
         mm(dl.wv, nv, E, Tn, vraw, kd);
@@ -859,12 +868,14 @@ struct GpuEngine::Impl {
             mm(dl.kconv_proj, nk, E, Tn, ktap, hp.n_conv * hp.n_kv);
             mm(dl.vconv_proj, nv, E, Tn, vtap, hp.n_conv * hp.n_kv);
         }
+        lap_(prof, 1, dl.streamed);                               // (the q, k, v, relative, sink and gate projections)
         G4_LAUNCH(i2k::k_prep, dim3((unsigned) Tn, (unsigned) (2 * hp.n_head + 2 * hp.n_kv)), b1, st, q, (const float*) kraw, (const float*) vraw, r, (const float*) ktap, (const float*) vtap,
                   (const float*) dl.kconv, (const float*) dl.vconv, (const float*) dl.q_clip, (const float*) dl.rel_clip, (const float*) V.cring, hp.conv_channels(), V.kc, V.vc, hp.n_head, hp.n_kv,
                   hp.hd, hp.n_rel, hp.n_conv, pos0, V.cells, !swa, hp.qk_clip, hp.rel_clip, hp.eps, hp.log_alpha, hp.log_floor);
         ring_store(kraw, kd, V.cring, 0, Tn, pos0);
         ring_store(vraw, kd, V.cring, kd, Tn, pos0);
         attention(ip, V, Tn, pos0);
+        lap_(prof, 2, dl.streamed);                               // (the head preparation, the cache writes and the attention)
         mm(dl.wo, att, qd, Tn, proj, E);
         const bool push = ip % hp.block == 0;
         conv_res(proj, dl.post_conv, V.cring, 2 * kd, Tn, pos0, push ? nullptr : sa, cur);
@@ -873,6 +884,7 @@ struct GpuEngine::Impl {
             copy_f(push_dst, sa, TE);
             blocks.push_back(push_dst);
         }
+        lap_(prof, 3, dl.streamed);                               // (the output projection, its convolution, the residual)
         // the experts
         {
             std::vector<const float*> states = blocks;
@@ -881,11 +893,12 @@ struct GpuEngine::Impl {
         }
         if (msgs_in) control(mixed, msgs_in + (size_t) 3 * TE, Tn, *lw, 3);
         rms(mixed, dl.ffn_norm, n0, Tn);
+        lap_(prof, 4, dl.streamed);                               // (the experts' mix and norm)
         experts(dl, ip, Tn);
         conv_res(moe, dl.ffn_post_conv, V.cring, 2 * kd + E, Tn, pos0, cur, cur);
         ring_store(moe, E, V.cring, 2 * kd + E, Tn, pos0);
         if (prof) {
-            CK(cudaStreamSynchronize(st));
+            lap_(prof, 5, dl.streamed);                           // (the router, the experts, their sum and convolution)
             (dl.streamed ? pf.str : pf.res) += ms_now() - tv0;
             ++(dl.streamed ? pf.nstr : pf.nres);
         }
@@ -978,7 +991,16 @@ std::string GpuEngine::profile_report() const {
                   "router's choice %.1f ms, the CPU pool %.1f ms; the rest (embedding, output head, sync) %.1f ms\n",
                   f.tokens, f.total / n, f.res / n, (double) f.nres / n, f.nres ? f.res / (double) f.nres : 0.0, f.str / n, (double) f.nstr / n, f.nstr ? f.str / (double) f.nstr : 0.0, f.wait / n, f.cpu / n,
                   (f.total - f.res - f.str) / n);
-    return b;
+    static const char* ph[6] = {"norms+mixes", "projections", "prep+attention", "out proj+conv", "ffn mix+norm", "router+experts"};
+    std::string out = b;
+    for (int k = 0; k < 2; ++k) {
+        const double vn = (double) (k ? f.nstr : f.nres);
+        if (vn <= 0) continue;
+        out += k ? "  a streamed visit:" : "  a resident visit:";
+        for (int i = 0; i < 6; ++i) { std::snprintf(b, sizeof b, " %s %.3f", ph[i], f.lap[k][i] / vn); out += b; }
+        out += " (ms)\n";
+    }
+    return out;
 }
 void GpuEngine::cache_stats(int* slots, long long* hits, long long* misses, long long* cpu, long long* shared) const {
     *slots = p_->ec.slots; *hits = p_->ec.hits; *misses = p_->ec.misses;
