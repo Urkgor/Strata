@@ -1,15 +1,16 @@
-strata-inkling2 --model nkling-2-Mini-UD-Q4_K_M.gguf --gpu 0 --max-context 32768 --vram-reserve-mib 512 --bench-pp 512 --bench-tg 64 --profile --bench-warmup 256 --kv q4_0
+strata-inkling2 --model Inkling-2-Mini-UD-Q4_K_M.gguf --gpu 0 --max-context 32768 --vram-reserve-mib 512 --bench-pp 1024 --bench-tg 64 --profile --bench-warmup 256 --kv q4_0
 strata-inkling2: Inkling-2-Mini: 24 layers, 48 visits, 128 experts (8 used), vocabulary 200058
-strata-inkling2: integer decode kernels (--dp4a on|off|auto): Q8_0 matrix 0.030 ms (float kernel 0.087): used; NVFP4 expert matrix 0.012 ms (float kernel 0.085): used;
-strata-inkling2: CPU expert pool (8 threads, AVX2): an expert takes 0.36 ms on the CPU, 0.38 ms to copy to the card: cold experts are computed on the CPU
-strata-inkling2: 1 CUDA device [device 0: 24 layers (48 visits), 0.07 GiB free after loading]; context 32768, chunk 512
+strata-inkling2: integer decode kernels (--dp4a on|off|auto): Q8_0 matrix 0.030 ms (float kernel 0.086): used; NVFP4 expert matrix 0.012 ms (float kernel 0.085): used;
+strata-inkling2: integer prompt kernels, 16 tokens: Q8_0 matrix 0.129 ms (float kernel 0.286): used; NVFP4 expert matrix 0.086 ms (float kernel 0.273): used;
+strata-inkling2: CPU expert pool (8 threads, AVX2): an expert takes 0.20 ms on the CPU, 0.38 ms to copy to the card: cold experts are computed on the CPU
+strata-inkling2: 1 CUDA device [device 0: 24 layers (48 visits), 0.06 GiB free after loading]; context 32768, chunk 512
 strata-inkling2: expert cache: 53 slots (0.32 GiB, 4% of the streamed layers' experts), decayed use count (x0.97 a token)
 strata-inkling2: the experts of 10 of 24 layers do not fit the VRAM: they stay in host memory (6.29 GiB, pinned) and the ones a visit needs are copied to the card (about 49 MiB a visit at 8 experts); --host-experts N chooses how many layers do it
-prompt: 512 tokens in 7285 ms: 70.3 tok/s
-generation: 64 tokens in 3176 ms: 20.2 tok/s
-profile, per decoded token (64 tokens, 49.6 ms): resident-expert visits 21.2 ms (38.0 visits, 0.56 ms each); streamed-expert visits 26.2 ms (10.0 visits, 2.62 ms each), of which waiting for the router's choice 0.4 ms, the CPU pool 12.0 ms; the rest (embedding, output head, sync) 2.2 ms
-  a resident visit: norms+mixes 0.094 projections 0.117 prep+attention 0.078 out proj+conv 0.043 ffn mix+norm 0.045 router+experts 0.180 (ms)
+prompt: 1024 tokens in 10875 ms: 94.2 tok/s
+generation: 64 tokens in 2725 ms: 23.5 tok/s
+profile, per decoded token (64 tokens, 42.5 ms): resident-expert visits 21.1 ms (38.0 visits, 0.56 ms each); streamed-expert visits 19.3 ms (10.0 visits, 1.93 ms each), of which waiting for the router's choice 0.4 ms, the CPU pool 14.7 ms; the rest (embedding, output head, sync) 2.2 ms
+  a resident visit: norms+mixes 0.094 projections 0.116 prep+attention 0.078 out proj+conv 0.043 ffn mix+norm 0.046 router+experts 0.180 (ms)
   ... of which the host spent queueing it: 0.016 0.013 0.006 0.007 0.007 0.015 (ms)
-  a streamed visit: norms+mixes 0.030 projections 0.117 prep+attention 0.082 out proj+conv 0.043 ffn mix+norm 0.023 router+experts 2.325 (ms)
-  ... of which the host spent queueing it: 0.010 0.014 0.008 0.007 0.005 2.317 (ms)
-expert cache: 53 slots, 8936 hits, 16664 misses (34.9% hits); of the cold ones, 8951 computed on the CPU, 6711 copied by PCIe without a place in the cache
+  a streamed visit: norms+mixes 0.030 projections 0.117 prep+attention 0.082 out proj+conv 0.043 ffn mix+norm 0.023 router+experts 1.631 (ms)
+  ... of which the host spent queueing it: 0.010 0.014 0.008 0.007 0.005 1.559 (ms)
+expert cache: 53 slots, 9001 hits, 16599 misses (35.2% hits); of the cold ones, 10834 computed on the CPU, 4786 copied by PCIe without a place in the cache
