@@ -277,6 +277,14 @@ inline cudaError_t cudaMemcpyAsync(void* d, const void* s, size_t n, cudaMemcpyK
 inline cudaError_t cudaMemsetAsync(void* p, int v, size_t n, cudaStream_t) { std::memset(p, v, n); return cudaSuccess; }
 inline cudaError_t cudaStreamCreate(cudaStream_t* s) { *s = nullptr; return cudaSuccess; }
 inline cudaError_t cudaStreamDestroy(cudaStream_t) { return cudaSuccess; }
+enum { cudaStreamNonBlocking = 1, cudaEventDisableTiming = 2 };
+using cudaEvent_t = void*;
+inline cudaError_t cudaStreamCreateWithFlags(cudaStream_t* s, unsigned) { *s = nullptr; return cudaSuccess; }
+inline cudaError_t cudaEventCreateWithFlags(cudaEvent_t* e, unsigned) { *e = nullptr; return cudaSuccess; }
+inline cudaError_t cudaEventDestroy(cudaEvent_t) { return cudaSuccess; }
+inline cudaError_t cudaEventRecord(cudaEvent_t, cudaStream_t) { return cudaSuccess; }       // (every launch of the emulation is finished when it returns: nothing to wait for)
+inline cudaError_t cudaEventSynchronize(cudaEvent_t) { return cudaSuccess; }
+inline cudaError_t cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned = 0) { return cudaSuccess; }
 inline cudaError_t cudaStreamSynchronize(cudaStream_t) { return cudaSuccess; }
 inline cudaError_t cudaDeviceSynchronize() { return cudaSuccess; }
 inline cudaError_t cudaSetDevice(int d) { g4emu_device() = d; return cudaSuccess; }

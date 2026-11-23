@@ -146,6 +146,12 @@ struct GpuEngine::Impl {
     int *dec_first = nullptr, *dec_n = nullptr, *dec_tok = nullptr, *dec_row = nullptr, *dec_slots = nullptr;
     std::vector<float*> pre_blk, post_blk, core_blk[2], outbuf;
     uint8_t *stgA = nullptr, *stgC = nullptr;
+    // a prompt chunk's streamed experts: a copy stream, two halves of the staging slots and of the group tables, the events that order them
+    cudaStream_t stc = nullptr;
+    cudaEvent_t ev_copied[2] = {nullptr, nullptr}, ev_used[2] = {nullptr, nullptr};
+    int* dtab[2][5] = {};
+    int* htab[2] = {nullptr, nullptr};
+    size_t tab_cap_g = 0, tab_cap_e = 0;
     // the expert cache of the streamed layers (decode): device pools of `slots` experts (gate+up, down) at the largest layer's size; a slot holds the
     // expert `key` = layer * n_expert + expert.  The slot kept is the one with the highest decayed use count (every use adds `inc`, which grows by 1 / decay
     // at each decoded token: the same order as multiplying all counts by decay, without touching them).
@@ -627,6 +633,23 @@ struct GpuEngine::Impl {
         if (any_streamed) {
             stgA = alloc<uint8_t>(max_gu_bytes() * (size_t) stage_slots);
             stgC = alloc<uint8_t>(max_dn_bytes() * (size_t) stage_slots);
+            CK(cudaStreamCreateWithFlags(&stc, cudaStreamNonBlocking));
+            for (int q = 0; q < 2; ++q) {
+                CK(cudaEventCreateWithFlags(&ev_copied[q], cudaEventDisableTiming));
+                CK(cudaEventCreateWithFlags(&ev_used[q], cudaEventDisableTiming));
+                CK(cudaEventRecord(ev_copied[q], st));
+                CK(cudaEventRecord(ev_used[q], st));
+            }
+            tab_cap_g = (size_t) (T * (size_t) hp.n_used / kExpertTile + (size_t) stage_slots + 8);
+            tab_cap_e = (size_t) (T * (size_t) hp.n_used + 16 * (size_t) stage_slots + 16);
+            for (int q = 0; q < 2; ++q) {
+                for (int k = 0; k < 3; ++k) dtab[q][k] = alloc<int>(tab_cap_g);
+                for (int k = 3; k < 5; ++k) dtab[q][k] = alloc<int>(tab_cap_e);
+                void* hp_ = nullptr;
+                CK(cudaHostAlloc(&hp_, (3 * tab_cap_g + 2 * tab_cap_e) * 4 + 64, cudaHostAllocPortable));
+                host_allocs.push_back({hp_, true});
+                htab[q] = static_cast<int*>(hp_);
+            }
             int want = opt.cache_slots >= 0 ? opt.cache_slots : (int) std::min<size_t>(cache_budget / std::max<size_t>(per_expert_bytes(), 1), 1u << 20);
             int streamed_experts = 0;
             for (int ip = 0; ip < hp.n_layer; ++ip) if (is_streamed[(size_t) ip]) streamed_experts += hp.n_expert;
@@ -1007,28 +1030,58 @@ struct GpuEngine::Impl {
             exp_ffn(vgu, vdn, nu, true, dec_slots, dec_first, dec_n, dec_tok, dec_row, rows, nullptr);
             return;
         }
+        // A prompt chunk: the experts the chunk uses, in batches of half the staging slots.  Two halves take turns: the copy stream fills one (and uploads its group tables)
+        // while the compute stream works on the other, so that the PCIe and the card overlap.
         std::vector<std::vector<int>> by((size_t) hp.n_expert);
         for (int rr = 0; rr < rows; ++rr) by[(size_t) idx[(size_t) rr]].push_back(rr);
         std::vector<int> used;
         for (int e = 0; e < hp.n_expert; ++e)
             if (!by[(size_t) e].empty()) used.push_back(e);
-        for (size_t b0 = 0; b0 < used.size(); b0 += (size_t) stage_slots) {
-            const size_t nb = std::min<size_t>((size_t) stage_slots, used.size() - b0);
-            std::vector<int> gex, gfi, gnn, ent_t, ent_r;
+        const int half = std::max(1, stage_slots / 2);
+        const int nbat = (int) ((used.size() + (size_t) half - 1) / (size_t) half);
+        struct Batch { std::vector<int> gex, gfi, gnn, ent_t, ent_r; };
+        std::vector<Batch> bat((size_t) nbat);
+        auto issue = [&](int bi) {                                             // on the copy stream: this batch's tables and experts, then the event the compute waits for
+            const int p = bi & 1;
+            Batch& B = bat[(size_t) bi];
+            const size_t b0 = (size_t) bi * (size_t) half, nb = std::min<size_t>((size_t) half, used.size() - b0);
             for (size_t k = 0; k < nb; ++k) {
-                const int e = used[b0 + k];
-                copy_in((int) k, e);
-                const auto& v = by[(size_t) e];
-                for (size_t s = 0; s < v.size(); s += kExpertTile) {
-                    const size_t n = std::min<size_t>(kExpertTile, v.size() - s);
-                    gex.push_back((int) k);                                    // the slot: what the kernels index experts by here
-                    gfi.push_back((int) ent_t.size());
-                    gnn.push_back((int) n);
-                    for (size_t j = 0; j < n; ++j) { ent_r.push_back(v[s + j]); ent_t.push_back(v[s + j] / nu); }
+                const auto& v = by[(size_t) used[b0 + k]];
+                for (size_t s2 = 0; s2 < v.size(); s2 += kExpertTile) {
+                    const size_t n = std::min<size_t>(kExpertTile, v.size() - s2);
+                    B.gex.push_back((int) k);                                    // the slot of the half: what the kernels index experts by here
+                    B.gfi.push_back((int) B.ent_t.size());
+                    B.gnn.push_back((int) n);
+                    for (size_t j = 0; j < n; ++j) { B.ent_r.push_back(v[s2 + j]); B.ent_t.push_back(v[s2 + j] / nu); }
                 }
             }
-            upload_groups(gex, gfi, gnn, ent_t, ent_r);                          // (a copy on the legacy stream: it waits for the batch before, which reads these tables)
-            exp_ffn(vgu, vdn, (int) gex.size(), false, grp_expert, grp_first, grp_n, ent_tok, ent_row, (int) ent_r.size(), ent_row);
+            CK(cudaEventSynchronize(ev_copied[p]));                              // (the pinned tables of this parity are free: the copy that read them has run)
+            CK(cudaStreamWaitEvent(stc, ev_used[p], 0));                         // (and so is the half of the staging: the compute that read it has run)
+            int* h = htab[p];
+            auto put = [&](int slot, const std::vector<int>& v) {                 // (the pinned block: three group tables of tab_cap_g, then two entry tables of tab_cap_e)
+                int* at = h + (slot < 3 ? (size_t) slot * tab_cap_g : 3 * tab_cap_g + (size_t) (slot - 3) * tab_cap_e);
+                std::copy(v.begin(), v.end(), at);
+                CK(cudaMemcpyAsync(dtab[p][slot], at, v.size() * 4, cudaMemcpyHostToDevice, stc));
+            };
+            put(0, B.gex); put(1, B.gfi); put(2, B.gnn); put(3, B.ent_t); put(4, B.ent_r);
+            for (size_t k = 0; k < nb; ++k) {
+                const int e = used[b0 + k];
+                CK(cudaMemcpyAsync(stgA + ((size_t) p * (size_t) half + k) * dl.gate_up.expert_bytes, dl.h_gu + (size_t) e * dl.gate_up.expert_bytes, dl.gate_up.expert_bytes, cudaMemcpyHostToDevice, stc));
+                CK(cudaMemcpyAsync(stgC + ((size_t) p * (size_t) half + k) * dl.down.expert_bytes, dl.h_dn + (size_t) e * dl.down.expert_bytes, dl.down.expert_bytes, cudaMemcpyHostToDevice, stc));
+            }
+            CK(cudaEventRecord(ev_copied[p], stc));
+        };
+        if (nbat > 0) issue(0);
+        for (int bi = 0; bi < nbat; ++bi) {
+            if (bi + 1 < nbat) issue(bi + 1);                                    // the next batch's copy starts while this one computes
+            const int p = bi & 1;
+            const Batch& B = bat[(size_t) bi];
+            CK(cudaStreamWaitEvent(st, ev_copied[p], 0));
+            DevMat bgu = dl.gate_up, bdn = dl.down;
+            bgu.d = stgA + (size_t) p * (size_t) half * dl.gate_up.expert_bytes;
+            bdn.d = stgC + (size_t) p * (size_t) half * dl.down.expert_bytes;
+            exp_ffn(bgu, bdn, (int) B.gex.size(), false, dtab[p][0], dtab[p][1], dtab[p][2], dtab[p][3], dtab[p][4], (int) B.ent_r.size(), dtab[p][4]);
+            CK(cudaEventRecord(ev_used[p], st));
         }
     }
 
