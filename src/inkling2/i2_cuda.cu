@@ -350,6 +350,45 @@ struct GpuEngine::Impl {
         return "";
     }
 
+    /// The integer decode kernels, where they are faster: a Q8_0 dense matrix and an NVFP4 expert matrix of the model timed with the float kernel and the integer one.
+    void setup_dp() {
+        dp_ok[0] = dp_ok[1] = dp_any = false;
+        if (opt.dp4a == 0) return;
+        const DevMat *m8 = nullptr, *m4 = nullptr;
+        bool m4_streamed = false;
+        for (int ip = 0; ip < hp.n_layer; ++ip) {
+            if (!m8 && L[(size_t) ip].wq.type == g4::T_Q8_0) m8 = &L[(size_t) ip].wq;
+            if (!m4 && L[(size_t) ip].gate_up.type == g4::T_NVFP4) { m4 = &L[(size_t) ip].gate_up; m4_streamed = L[(size_t) ip].streamed; }
+        }
+        const int E = hp.n_embd;
+        auto bench = [&](const DevMat& W0, bool staged, double* t_f, double* t_i) {
+            DevMat W = W0;
+            if (staged) W.d = stgA;                                  // (a streamed layer's experts are not on the card: the staging slots hold the same shape)
+            float* out = gu;
+            prep(n0, E, 0);
+            auto timed = [&](auto fn) {
+                for (int i = 0; i < 3; ++i) fn();
+                CK(cudaStreamSynchronize(st));
+                const double t0 = ms_now();
+                for (int i = 0; i < 30; ++i) fn();
+                CK(cudaStreamSynchronize(st));
+                return (ms_now() - t0) / 30.0;
+            };
+            *t_f = timed([&] { mm(W, n0, E, 1, out, (int) W.n_out); });
+            *t_i = timed([&] { mv(W, qslot(0), dslot(0), 0, nullptr, 1, out, (int) W.n_out, 0, 0); });
+        };
+        double f8 = 0, i8 = 0, f4 = 0, i4 = 0;
+        if (m8 && (int) m8->n_in == E) { bench(*m8, false, &f8, &i8); dp_ok[0] = opt.dp4a == 1 || i8 < 0.9 * f8; }
+        if (m4 && (int) m4->n_in == E && !(m4_streamed && !stgA)) { bench(*m4, m4_streamed, &f4, &i4); dp_ok[1] = opt.dp4a == 1 || i4 < 0.9 * f4; }
+        dp_any = dp_ok[0] || dp_ok[1];
+        if (opt.verbose && (m8 || m4)) {
+            std::fprintf(stderr, "strata-inkling2: integer decode kernels (--dp4a on|off|auto):");
+            if (m8) std::fprintf(stderr, " Q8_0 matrix %.3f ms (float kernel %.3f): %s;", i8, f8, dp_ok[0] ? "used" : "not used");
+            if (m4) std::fprintf(stderr, " NVFP4 expert matrix %.3f ms (float kernel %.3f): %s;", i4, f4, dp_ok[1] ? "used" : "not used");
+            std::fprintf(stderr, "\n");
+        }
+    }
+
     /// The CPU expert pool, if it pays: a decode step's cold expert is computed on the CPU instead of copied to the card when that is faster here (measured once: an
     /// expert of a streamed layer evaluated by the pool against the same bytes copied over PCIe).
     void setup_cpu_pool() {
@@ -579,6 +618,7 @@ struct GpuEngine::Impl {
         pi = alloc<int>((size_t) (hp.n_vocab / 1024 + 2));
         amax = alloc<int>(1);
         CK(cudaDeviceSynchronize());
+        setup_dp();
         setup_cpu_pool();
         if (opt.verbose) {
             int ns = 0;
@@ -587,7 +627,6 @@ struct GpuEngine::Impl {
             CK(cudaMemGetInfo(&fr, &tot));
             std::fprintf(stderr, "strata-inkling2: 1 CUDA device [device %d: %d layers (%d visits), %.2f GiB free after loading]; context %d, chunk %d\n", opt.device, hp.n_layer, hp.visits(),
                          (double) fr / (1 << 30), ctx, chunk);
-            if (opt.dp4a) std::fprintf(stderr, "strata-inkling2: decode: integer kernels for Q8_0 and NVFP4 matrices (--dp4a off: float kernels)\n");
             if (ns && ec.slots)
                 std::fprintf(stderr, "strata-inkling2: expert cache: %d slots (%.2f GiB, %.0f%% of the streamed layers' experts), decayed use count (x%.2f a token)\n", ec.slots,
                              (double) ec.slots * (double) per_expert_bytes() / (1 << 30), 100.0 * ec.slots / std::max(1, streamed_layers_count() * hp.n_expert), opt.cache_decay);
@@ -606,7 +645,9 @@ struct GpuEngine::Impl {
     int8_t* xq_ = nullptr;                                // [5 slots of n_qw values] + the experts' activation rows
     float* xd_ = nullptr;
     int n_qw = 0;
-    bool dp_type(int t) const { return opt.dp4a && (t == g4::T_Q8_0 || t == g4::T_NVFP4); }
+    bool dp_ok[2] = {false, false};                       // Q8_0, NVFP4: the integer kernel is used (a speed check at start decides, --dp4a on|off forces)
+    bool dp_any = false;
+    bool dp_type(int t) const { return (t == g4::T_Q8_0 && dp_ok[0]) || (t == g4::T_NVFP4 && dp_ok[1]); }
     int8_t* qslot(int i) const { return xq_ + (size_t) i * (size_t) n_qw; }
     float* dslot(int i) const { return xd_ + (size_t) i * (size_t) (n_qw / 32); }
     void prep(const float* x, int n, int slot) {         // x[n] -> slot `slot`
@@ -949,19 +990,19 @@ struct GpuEngine::Impl {
         }
         lap_(prof, 0, dl.streamed);                               // (the mixes, controls and norms before the projections)
         int sk = -1, sv = -1;                                     // the quantized-activation slots of the k and v inputs (-1: not quantized)
-        if (Tn == 1 && opt.dp4a) {
+        if (Tn == 1 && dp_any) {
             prep(nq0, E, 0);
             sk = nk == nq0 ? 0 : 1;
             if (sk == 1) prep(nk, E, 1);
             sv = nv == nq0 ? 0 : nv == nk ? sk : 2;
             if (sv == 2) prep(nv, E, 2);
         }
-        mmd(dl.wq, nq0, E, Tn, q, qd, Tn == 1 && opt.dp4a ? 0 : -1);
+        mmd(dl.wq, nq0, E, Tn, q, qd, Tn == 1 && dp_any ? 0 : -1);
         mmd(dl.wk, nk, E, Tn, kraw, kd, sk);
         mmd(dl.wv, nv, E, Tn, vraw, kd, sv);
-        mmd(dl.wrel, nq0, E, Tn, r, hp.n_head * hp.n_rel, Tn == 1 && opt.dp4a ? 0 : -1);
-        mmd(dl.wsink, nq0, E, Tn, sink, hp.n_head, Tn == 1 && opt.dp4a ? 0 : -1);
-        mmd(dl.wgate, nq0, E, Tn, gate, qd, Tn == 1 && opt.dp4a ? 0 : -1);
+        mmd(dl.wrel, nq0, E, Tn, r, hp.n_head * hp.n_rel, Tn == 1 && dp_any ? 0 : -1);
+        mmd(dl.wsink, nq0, E, Tn, sink, hp.n_head, Tn == 1 && dp_any ? 0 : -1);
+        mmd(dl.wgate, nq0, E, Tn, gate, qd, Tn == 1 && dp_any ? 0 : -1);
         if (!swa) {
             mm(dl.kconv_proj, nk, E, Tn, ktap, hp.n_conv * hp.n_kv);
             mm(dl.vconv_proj, nv, E, Tn, vtap, hp.n_conv * hp.n_kv);
@@ -974,8 +1015,8 @@ struct GpuEngine::Impl {
         ring_store(vraw, kd, V.cring, kd, Tn, pos0);
         attention(ip, V, Tn, pos0);
         lap_(prof, 2, dl.streamed);                               // (the head preparation, the cache writes and the attention)
-        if (Tn == 1 && opt.dp4a) prep(att, qd, 3);
-        mmd(dl.wo, att, qd, Tn, proj, E, Tn == 1 && opt.dp4a ? 3 : -1);
+        if (Tn == 1 && dp_any) prep(att, qd, 3);
+        mmd(dl.wo, att, qd, Tn, proj, E, Tn == 1 && dp_any ? 3 : -1);
         const bool push = ip % hp.block == 0;
         conv_res(proj, dl.post_conv, V.cring, 2 * kd, Tn, pos0, push ? nullptr : sa, cur);
         ring_store(proj, E, V.cring, 2 * kd, Tn, pos0);
@@ -1060,8 +1101,8 @@ struct GpuEngine::Impl {
             states.push_back(cur + (size_t) (Tn - 1) * (size_t) E);
             mix(states, 1, output_res_query, 1, mixh);
             rms(mixh, output_norm, xh, 1);
-            if (opt.dp4a) prep(xh, E, 0);
-            mmd(head, xh, E, 1, logits, hp.n_vocab, opt.dp4a ? 0 : -1);
+            if (dp_any) prep(xh, E, 0);
+            mmd(head, xh, E, 1, logits, hp.n_vocab, dp_any ? 0 : -1);
             if (hp.softcap > 0.f) G4_LAUNCH(g4k::k_softcap, dim3((unsigned) ((hp.n_vocab + 127) / 128)), dim3(g4k::kThreads), st, logits, hp.n_vocab, hp.softcap);
             logits_ready = true;
         } else {
@@ -1080,6 +1121,7 @@ std::string GpuEngine::init() { return p_->init(); }
 int GpuEngine::ctx() const { return p_->ctx; }
 int GpuEngine::n_vocab() const { return p_->hp.n_vocab; }
 int64_t GpuEngine::pos() const { return p_->pos; }
+bool GpuEngine::dp_active() const { return p_->dp_any; }
 void GpuEngine::profile_reset() { p_->pf = Impl::Prof(); }
 std::string GpuEngine::profile_report() const {
     const auto& f = p_->pf;
@@ -1162,7 +1204,7 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
         else if (a == "--host-experts") o.host_experts = std::max(0, std::atoi(val().c_str()));
         else if (a == "--expert-cache-mib") o.cache_mib = std::max(0, std::atoi(val().c_str()));
         else if (a == "--profile") o.profile = true;
-        else if (a == "--dp4a") o.dp4a = val() != "off";
+        else if (a == "--dp4a") { const std::string v = val(); o.dp4a = v == "off" ? 0 : v == "on" ? 1 : -1; }
         else if (a == "--cpu-experts") { const std::string v = val(); o.cpu_threads = v == "auto" ? -1 : std::max(0, std::atoi(v.c_str())); }
         else if (a == "--cache-decay") o.cache_decay = std::min(1.0, std::max(0.5, std::atof(val().c_str())));
         else if (a == "--swa-slack") o.slack = std::max(0, std::atoi(val().c_str()));
@@ -1255,9 +1297,9 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
         const double rel = std::sqrt(d2 / std::max(s2, 1e-30));
         const int a = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin()), b = (int) (std::max_element(rl.begin(), rl.end()) - rl.begin());
         std::printf("check: %zu tokens, GPU against the CPU reference (%.0f ms): logits differ by %.2e (rms / spread), best token %d / %d\n", ids.size(), ms_now() - t0, rel, a, b);
-        const double lim = o.dp4a ? 3e-2 : 2e-3;       // (with the integer kernels the activations carry 8-bit noise: --dp4a off for the exact comparison)
+        const double lim = eng.dp_active() ? 3e-2 : 2e-3;       // (with the integer kernels the activations carry 8-bit noise: --dp4a off for the exact comparison)
         rc = (rel < lim && a == b) ? 0 : 1;
-        std::printf("check: %s\n", rc == 0 ? "ok" : o.dp4a ? "FAILED (more than 3e-2, or another best token)" : "FAILED (more than 2e-3, or another best token)");
+        std::printf("check: %s\n", rc == 0 ? "ok" : eng.dp_active() ? "FAILED (more than 3e-2, or another best token)" : "FAILED (more than 2e-3, or another best token)");
     }
     std::printf("generated:");
     for (int i = 0; i < n_gen; ++i) {

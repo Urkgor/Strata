@@ -21,7 +21,7 @@ struct GpuOptions {
     int stage_slots = 32;          // experts of a streaming layer copied to the card at a time (prompt reading)
     int cache_mib = -1;            // VRAM for the cache of the streamed layers' experts (decode): -1 = what is left, 0 = none
     bool profile = false;          // time the phases of a decoded token (--profile)
-    bool dp4a = true;              // decode: Q8_0 and NVFP4 matrices by integer arithmetic on activations quantized to 8 bits (the float kernels stay for the other types and the prompt)
+    int dp4a = -1;                 // decode: Q8_0 and NVFP4 matrices by integer arithmetic on activations quantized to 8 bits: -1 where a speed check at start says it is faster, 1 always, 0 never
     int kvq = 0;                   // K / V of the global layers: 0 halves, 1 q8_0 (a little over half the memory), 2 4 bits (a little over a quarter)
     int attn_split_keys = 256;     // a decoded token's attention is cut into parts of about this many keys (one block each)
     int attn_max_split = 64;
@@ -49,6 +49,7 @@ public:
     /// --profile's table (empty without it)
     std::string profile_report() const;
     void profile_reset();
+    bool dp_active() const;                                    // the integer decode kernels are in use
     /// the expert cache of the streamed layers: its slots, and the hits / misses of the decode steps so far
     void cache_stats(int* slots, long long* hits, long long* misses, long long* cpu_experts = nullptr, long long* shared = nullptr) const;
     /// Append n tokens; the logits of the last one are made at the end.  on_piece(done) after each chunk (false: stop reading).
