@@ -306,7 +306,9 @@ struct GpuEngine::Impl {
         f += T * (size_t) hp.n_used * ((size_t) 2 * (size_t) hp.n_ff_exp + (size_t) hp.n_ff_exp + E) + (size_t) 3 * (size_t) hp.n_vocab + E * 8;
         return f * 4 + (size_t) (1 << 20);
     }
-    size_t stage_bytes() const { return per_expert_bytes() * (size_t) stage_slots + (1 << 20); }
+    // what streaming reserves: the staging slots, and the floor of the expert cache (n_used slots + n_used transient ones: without them there is no cache and so no CPU pool)
+    size_t cache_floor_bytes() const { return per_expert_bytes() * (size_t) (2 * hp.n_used); }
+    size_t stage_bytes() const { return per_expert_bytes() * (size_t) stage_slots + cache_floor_bytes() + (1 << 20); }
     int pre_blocks() const { return (hp.has_loop() ? hp.loop_start : hp.n_layer + hp.block - 1) / hp.block + (hp.has_loop() ? 0 : 0); }
     int core_blocks() const { return hp.has_loop() ? (hp.loop_end - hp.loop_start) / hp.block : 0; }
     int post_blocks() const { return hp.has_loop() ? (hp.n_layer - hp.loop_end + hp.block - 1) / hp.block : 0; }
@@ -344,7 +346,7 @@ struct GpuEngine::Impl {
             left -= left / 32;                                                // a margin for the allocator
             size_t streamed = 0;
             for (int ip = 0; ip < n; ++ip) if (is_streamed[(size_t) ip]) streamed += layer_expert_bytes(ip);
-            cache_budget = (size_t) std::max<long long>(0, left);
+            cache_budget = (size_t) std::max<long long>(0, left) + per_expert_bytes() * (size_t) hp.n_used;       // (the floor's n_used slots; its transient ones are allocated apart)
             if (opt.cache_mib > 0) cache_budget = std::min<size_t>(cache_budget, (size_t) opt.cache_mib << 20);
             cache_budget = std::min(cache_budget, streamed);
         }
