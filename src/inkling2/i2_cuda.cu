@@ -162,7 +162,8 @@ struct GpuEngine::Impl {
     bool cpu_on = false;
     long long cpu_evals = 0, shared_evals = 0;
     double t_cpu_ms = 1.0, t_copy_ms = 1.0;      // an expert on the CPU pool / over PCIe, measured at start
-    std::vector<float> xh_host, cpu_y;
+    float *xh_host = nullptr, *cpu_y = nullptr;            // pinned: the CPU pool's input (one token) and outputs (n_used rows)
+    int* slot_pin = nullptr;                               // pinned: the slots of a decode step, copied to the card without waiting
     // --profile: where a decoded token's time goes (the stream is synchronized at each boundary, so the total is a little more than without)
     struct Prof { double res = 0, str = 0, wait = 0, host = 0, cpu = 0, total = 0; long long nres = 0, nstr = 0, tokens = 0; double lap[2][6] = {}, enq[2][6] = {}; } pf;
     double lap_t = 0;
@@ -602,6 +603,17 @@ struct GpuEngine::Impl {
                 freq.assign((size_t) hp.n_layer * (size_t) hp.n_expert, 0.0);
                 ec.where.assign((size_t) hp.n_layer * (size_t) hp.n_expert, -1);
                 cache_slot_dev = alloc<int>((size_t) hp.n_used);
+                {   // pinned host buffers of the decode path (a copy from pageable memory is staged, and ordered behind what is queued)
+                    void* p1 = nullptr;
+                    CK(cudaHostAlloc(&p1, (size_t) (hp.n_embd + hp.n_used * hp.n_embd) * 4 + 4096, cudaHostAllocPortable));
+                    host_allocs.push_back({p1, true});
+                    xh_host = static_cast<float*>(p1);
+                    cpu_y = xh_host + hp.n_embd;
+                    void* p2 = nullptr;
+                    CK(cudaHostAlloc(&p2, (size_t) hp.n_used * 4 + 64, cudaHostAllocPortable));
+                    host_allocs.push_back({p2, true});
+                    slot_pin = static_cast<int*>(p2);
+                }
             }
         }
         // the residual blocks' pool, the loop's outputs
@@ -854,6 +866,7 @@ struct GpuEngine::Impl {
             }
             auto taken = [&](int j) { for (int q = 0; q < nu; ++q) if (sl[(size_t) q] == j && !cpu[(size_t) q]) return true; return false; };
             int ncpu = 0, nprom = 0, nshare = 0;
+            std::vector<std::pair<int, int>> todo;                     // (slot, expert) copies to make, queued only after the CPU's input has been read back (below)
             for (int k = 0; k < nu; ++k) {
                 if (sl[(size_t) k] >= 0) continue;
                 ++ec.misses;
@@ -869,8 +882,7 @@ struct GpuEngine::Impl {
                     if ((double) (nprom + nshare + 1) * t_copy_ms < (double) (ncpu + 1) * t_cpu_ms) {
                         // the PCIe finishes it sooner than the CPU would (its queue counted): it takes this one, into a transient slot, outside the cache's books
                         const int ts = ec.slots + nshare++;
-                        CK(cudaMemcpyAsync(ec.a + (size_t) ts * max_gu_bytes(), dl.h_gu + (size_t) e * dl.gate_up.expert_bytes, dl.gate_up.expert_bytes, cudaMemcpyHostToDevice, st));
-                        CK(cudaMemcpyAsync(ec.c + (size_t) ts * max_dn_bytes(), dl.h_dn + (size_t) e * dl.down.expert_bytes, dl.down.expert_bytes, cudaMemcpyHostToDevice, st));
+                        todo.push_back({ts, e});
                         sl[(size_t) k] = ts;
                         ++shared_evals;
                         continue;
@@ -884,17 +896,18 @@ struct GpuEngine::Impl {
                 if (ec.key[(size_t) s] >= 0) ec.where[(size_t) ec.key[(size_t) s]] = -1;
                 ec.key[(size_t) s] = key;
                 ec.where[(size_t) key] = s;
-                CK(cudaMemcpyAsync(ec.a + (size_t) s * max_gu_bytes(), dl.h_gu + (size_t) e * dl.gate_up.expert_bytes, dl.gate_up.expert_bytes, cudaMemcpyHostToDevice, st));
-                CK(cudaMemcpyAsync(ec.c + (size_t) s * max_dn_bytes(), dl.h_dn + (size_t) e * dl.down.expert_bytes, dl.down.expert_bytes, cudaMemcpyHostToDevice, st));
+                todo.push_back({s, e});
                 sl[(size_t) k] = s;
                 ++nprom;
             }
-            if (ncpu) {
-                xh_host.resize((size_t) E);
-                CK(cudaMemcpy(xh_host.data(), n0, (size_t) E * 4, cudaMemcpyDeviceToHost));
-                cpu_y.resize((size_t) nu * (size_t) E);
+            // The CPU's input first: a synchronous read-back waits for everything queued before it, the expert copies included, and the CPU would start only when the PCIe was done.
+            if (ncpu) CK(cudaMemcpy(xh_host, n0, (size_t) E * 4, cudaMemcpyDeviceToHost));
+            for (const auto& c : todo) {
+                CK(cudaMemcpyAsync(ec.a + (size_t) c.first * max_gu_bytes(), dl.h_gu + (size_t) c.second * dl.gate_up.expert_bytes, dl.gate_up.expert_bytes, cudaMemcpyHostToDevice, st));
+                CK(cudaMemcpyAsync(ec.c + (size_t) c.first * max_dn_bytes(), dl.h_dn + (size_t) c.second * dl.down.expert_bytes, dl.down.expert_bytes, cudaMemcpyHostToDevice, st));
             }
-            CK(cudaMemcpy(cache_slot_dev, sl.data(), (size_t) nu * 4, cudaMemcpyHostToDevice));
+            for (int k = 0; k < nu; ++k) slot_pin[(size_t) k] = sl[(size_t) k];
+            CK(cudaMemcpyAsync(cache_slot_dev, slot_pin, (size_t) nu * 4, cudaMemcpyHostToDevice, st));
             DevMat cgu = dl.gate_up, cdn = dl.down;
             cgu.d = ec.a; cgu.expert_bytes = max_gu_bytes();
             cdn.d = ec.c; cdn.expert_bytes = max_dn_bytes();
@@ -906,13 +919,13 @@ struct GpuEngine::Impl {
                     if (!cpu[(size_t) k]) continue;
                     const int e = idx[(size_t) k];
                     jobs.push_back({dl.h_gu + (size_t) e * dl.gate_up.expert_bytes, dl.gate_up.type, dl.gate_up.row_bytes, dl.h_dn + (size_t) e * dl.down.expert_bytes, dl.down.type,
-                                    dl.down.row_bytes, cpu_y.data() + (size_t) k * (size_t) E, dl.gu_scale_h ? dl.gu_scale_h[e] : 1.f});
+                                    dl.down.row_bytes, cpu_y + (size_t) k * (size_t) E, dl.gu_scale_h ? dl.gu_scale_h[e] : 1.f});
                     ks.push_back(k);
                 }
                 const double tc0 = opt.profile ? ms_now() : 0.0;
-                pool->run(xh_host.data(), E, hp.n_ff_exp, hp.situ_beta, hp.situ_lin, jobs.data(), (int) jobs.size());
+                pool->run(xh_host, E, hp.n_ff_exp, hp.situ_beta, hp.situ_lin, jobs.data(), (int) jobs.size());
                 if (opt.profile) pf.cpu += ms_now() - tc0;
-                for (int k : ks) CK(cudaMemcpyAsync(ed + (size_t) k * (size_t) E, cpu_y.data() + (size_t) k * (size_t) E, (size_t) E * 4, cudaMemcpyHostToDevice, st));
+                for (int k : ks) CK(cudaMemcpyAsync(ed + (size_t) k * (size_t) E, cpu_y + (size_t) k * (size_t) E, (size_t) E * 4, cudaMemcpyHostToDevice, st));
             }
             return;
         }
