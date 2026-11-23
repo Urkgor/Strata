@@ -50,7 +50,15 @@ strata-inkling2 --model F.gguf --bench-pp 512 --bench-tg 64
 ```
 
 Options: `--max-context N`, `--gpu N` (one card only), `--prefill N` (512), `--swa-slack N` (1024), `--vram-reserve-mib N` (700), `--host-experts N`, `--cpu`,
-`--eos ID,...`, `--expert-cache-mib N` (VRAM for the expert cache, default: what is left; 0 = none), `--cache-decay X` (0.97), `--cpu-experts auto|N` (the CPU expert pool: auto = on if faster here, 0 = off, N threads).
+`--eos ID,...`, `--expert-cache-mib N` (VRAM for the expert cache, default: what is left; 0 = none), `--cache-decay X` (0.97), `--cpu-experts auto|N` (the CPU expert pool: auto = on if faster here, 0 = off, N threads), `--kv f16|q8_0|q4_0`, `--attn-split-keys N` (256), `--profile`, `--bench-warmup N`.
+
+## Long contexts
+
+The K / V of the four global layers (eight visits) is what grows with the context: 32 KiB a token in halves, so 2.1 GiB at 64k and 4.3 GiB at 128k, taken from the VRAM the experts could use.
+`--kv q8_0` keeps it in q8_0 (blocks of 32 values with a half scale: 136 bytes a head and cell instead of 256: 1.1 GiB at 64k, 2.3 GiB at 128k), `--kv q4_0` in 4 bits (72 bytes: 0.6 / 1.2 GiB).
+Only the global layers are quantized; the sliding-window layers' rings (about 10 MiB a visit) stay halves. A decoded token's attention over a long window is cut into parts of about 256 keys (one block each,
+then merged), because one block a head cannot fill a card. The CPU reference does the same quantization, and the emulation test compares the engine with it (the quality cost on the real model is not measured).
+Reading a long prompt is still slow (the experts, see Not done): a conversation cache that keeps the K / V of the earlier turns is what makes 64k usable.
 
 ## Memory of the machine
 

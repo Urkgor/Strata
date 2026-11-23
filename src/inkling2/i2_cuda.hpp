@@ -21,6 +21,9 @@ struct GpuOptions {
     int stage_slots = 32;          // experts of a streaming layer copied to the card at a time (prompt reading)
     int cache_mib = -1;            // VRAM for the cache of the streamed layers' experts (decode): -1 = what is left, 0 = none
     bool profile = false;          // time the phases of a decoded token (--profile)
+    int kvq = 0;                   // K / V of the global layers: 0 halves, 1 q8_0 (a little over half the memory), 2 4 bits (a little over a quarter)
+    int attn_split_keys = 256;     // a decoded token's attention is cut into parts of about this many keys (one block each)
+    int attn_max_split = 64;
     int cache_slots = -1;          // the same in experts, for tests (-1: from cache_mib)
     int cpu_threads = -1;          // the CPU expert pool (decode: cold experts computed on the CPU instead of copied): -1 = on when a speed check says it beats the copy, 0 = off, N = N threads
     bool cpu_force = false;        // use the pool without the speed check (tests)

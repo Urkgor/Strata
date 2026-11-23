@@ -44,6 +44,7 @@ namespace i2 {
 struct RefOpts {
     int threads = 1;
     bool cache_f16 = false;      // keep K / V as halves (what the CUDA engine does) instead of floats
+    int kvq = 0;                 // the global layers' K / V as the CUDA engine's --kv: 1 q8_0 (blocks of 32, half scale amax / 127), 2 4 bits (amax / 7); 0 as cache_f16 says
 };
 
 class RefEngine {
@@ -275,7 +276,23 @@ private:
         // cache the new K / V
         std::vector<float>& kc = kc_[(size_t) visit];
         std::vector<float>& vc = vc_[(size_t) visit];
-        if (opt_.cache_f16) {
+        if (opt_.kvq > 0 && !swa) {                                  // quantized and back, as the engine's cache holds them
+            auto qdq = [&](std::vector<float>& a) {
+                const float qmax = opt_.kvq == 1 ? 127.f : 7.f;
+                for (size_t b0 = 0; b0 + 32 <= a.size(); b0 += 32) {
+                    float amax = 0.f;
+                    for (size_t i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(a[b0 + i]));
+                    const float d = g4::half_to_float(g4::float_to_half(amax / qmax));
+                    for (size_t i = 0; i < 32; ++i) {
+                        int qi = d > 0.f ? (int) std::nearbyint(a[b0 + i] / d) : 0;
+                        qi = opt_.kvq == 1 ? std::max(-127, std::min(127, qi)) : std::max(-8, std::min(7, qi));
+                        a[b0 + i] = (float) qi * d;
+                    }
+                }
+            };
+            qdq(k);
+            qdq(v);
+        } else if (opt_.cache_f16) {
             for (auto& x : k) x = g4::half_to_float(g4::float_to_half(x));
             for (auto& x : v) x = g4::half_to_float(g4::float_to_half(x));
         }

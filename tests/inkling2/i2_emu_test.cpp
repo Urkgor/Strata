@@ -40,9 +40,9 @@ int main(int argc, char** argv) {
     std::vector<float> all;
     ref.forward(ids.data(), n, nullptr, &all);
     auto row = [&](int t) { return all.data() + (size_t) t * (size_t) nv; };
-    auto make = [&](int chunk, int slack, int host_experts = 0, int stage_slots = 32, int cache_slots = 0, int cpu_threads = 0) {
+    auto make = [&](int chunk, int slack, int host_experts = 0, int stage_slots = 32, int cache_slots = 0, int cpu_threads = 0, int kvq = 0, int split_keys = 256) {
         i2cuda::GpuOptions o;
-        o.chunk = chunk; o.slack = slack; o.reserve_mib = 0; o.host_experts = host_experts; o.stage_slots = stage_slots; o.cache_slots = cache_slots; o.cpu_threads = cpu_threads; o.cpu_force = cpu_threads > 0; o.verbose = false;
+        o.chunk = chunk; o.slack = slack; o.reserve_mib = 0; o.host_experts = host_experts; o.stage_slots = stage_slots; o.cache_slots = cache_slots; o.cpu_threads = cpu_threads; o.kvq = kvq; o.attn_split_keys = split_keys; o.cpu_force = cpu_threads > 0; o.verbose = false;
         auto e = std::make_unique<i2cuda::GpuEngine>(m, 64, o);
         const std::string er = e->init();
         if (!er.empty()) { std::fprintf(stderr, "init: %s\n", er.c_str()); std::exit(1); }
@@ -168,6 +168,36 @@ int main(int argc, char** argv) {
         long long hits = 0, misses = 0, cpu = 0, shared = 0;
         e->cache_stats(&slots, &hits, &misses, &cpu, &shared);
         EXPECT(worst < tol && cpu > 0 && shared > 0 && cpu + shared < misses, "CPU pool and PCIe sharing the cold experts over %d decoded tokens: worst %.2e, %lld on the CPU, %lld over PCIe, of %lld misses", n - 6, worst, cpu, shared, misses);
+    }
+    // the attention cut into parts (a decoded token over many keys): 4 keys a part so that a 22-token prompt's decode steps split, then merge
+    {
+        auto e = make(8, 1024, 0, 32, 0, 0, 0, 4);
+        int64_t done = 0;
+        e->process(ids.data(), 6, noop, &done);
+        double worst = 0;
+        for (int t = 6; t < n; ++t) {
+            e->process(&ids[(size_t) t], 1, noop, &done);
+            e->logits(lg);
+            worst = std::max(worst, rel_rms(lg, row(t)));
+        }
+        EXPECT(worst < tol, "decode with the attention split into parts of 4 keys (%d steps): worst %.2e", n - 6, worst);
+    }
+    for (int kvq = 1; kvq <= 2; ++kvq) {   // the global layers' K / V quantized: the reference quantizes the same way
+        i2::RefOpts rq = ro;
+        rq.kvq = kvq;
+        i2::RefEngine refq(m, 64, rq);
+        std::vector<float> allq;
+        refq.forward(ids.data(), n, nullptr, &allq);
+        auto e = make(8, 1024, 0, 32, 0, 0, kvq, 4);
+        int64_t done = 0;
+        e->process(ids.data(), 6, noop, &done);
+        double worst = 0;
+        for (int t = 6; t < n; ++t) {
+            e->process(&ids[(size_t) t], 1, noop, &done);
+            e->logits(lg);
+            worst = std::max(worst, rel_rms(lg, allq.data() + (size_t) t * (size_t) nv));
+        }
+        EXPECT(worst < tol, "global K / V as %s, split attention: worst %.2e against the reference quantizing the same way", kvq == 1 ? "q8_0" : "4 bits", worst);
     }
     std::printf(fails ? "%d FAILED\n" : "i2_emu_test: all scenarios pass\n", fails);
     return fails ? 1 : 0;

@@ -98,7 +98,10 @@ struct DevLoop {
 };
 
 struct Visit {
-    uint16_t *kc = nullptr, *vc = nullptr;           // [kv head][cells][hd]
+    uint16_t *kc = nullptr, *vc = nullptr;           // [kv head][cells][hd] halves (kvq 0)
+    uint8_t *kq = nullptr, *vq = nullptr;            // [kv head][cells][hd] int8 (kvq 1) or [hd / 2] bytes of two 4-bit values (kvq 2)
+    uint16_t *ks = nullptr, *vs = nullptr;           // [kv head][cells][hd / 32] half scales of the quantized ones
+    int kvq = 0;
     int cells = 0;
     float* cring = nullptr;                          // [kRing][conv channels]
 };
@@ -270,11 +273,16 @@ struct GpuEngine::Impl {
     size_t loop_bytes() const { return hp.has_loop() ? (size_t) (hp.loop_end - hp.loop_start) * 4 * (4 * (size_t) hp.n_embd + 4 * (size_t) (3 * hp.n_embd * hp.gate_rank)) : 0; }
     size_t head_bytes() const { return (size_t) hp.n_vocab * m.output.row_bytes; }
     int local_cells() const { return (int) std::min<int64_t>(ctx, (int64_t) hp.window + chunk + std::max(0, opt.slack)); }
+    /// the bytes of one cell of one KV head, K or V: halves, q8_0 (a half scale per 32 values) or 4 bits
+    size_t kv_cell_bytes(int kvq) const {
+        return kvq == 0 ? (size_t) hp.hd * 2 : kvq == 1 ? (size_t) hp.hd + (size_t) hp.hd / 16 : (size_t) hp.hd / 2 + (size_t) hp.hd / 16;
+    }
     size_t kv_bytes() const {
         size_t b = 0;
         for (int v = 0; v < hp.visits(); ++v) {
-            const int cells = hp.swa[(size_t) hp.phys(v)] ? local_cells() : ctx;
-            b += (size_t) 2 * (size_t) hp.n_kv * (size_t) cells * (size_t) hp.hd * 2;
+            const bool local = hp.swa[(size_t) hp.phys(v)] != 0;
+            const int cells = local ? local_cells() : ctx;
+            b += (size_t) 2 * (size_t) hp.n_kv * (size_t) cells * kv_cell_bytes(local ? 0 : opt.kvq);
             b += (size_t) i2k::kRing * (size_t) hp.conv_channels() * 4;
         }
         return b;
@@ -463,9 +471,19 @@ struct GpuEngine::Impl {
         vis.assign((size_t) hp.visits(), Visit());
         for (int v = 0; v < hp.visits(); ++v) {
             Visit& V = vis[(size_t) v];
-            V.cells = hp.swa[(size_t) hp.phys(v)] ? local_cells() : ctx;
-            V.kc = alloc<uint16_t>((size_t) KV * (size_t) V.cells * (size_t) hd);
-            V.vc = alloc<uint16_t>((size_t) KV * (size_t) V.cells * (size_t) hd);
+            const bool local = hp.swa[(size_t) hp.phys(v)] != 0;
+            V.cells = local ? local_cells() : ctx;
+            V.kvq = local ? 0 : opt.kvq;                        // (the sliding-window layers' rings are small: halves)
+            const size_t cn = (size_t) KV * (size_t) V.cells;
+            if (V.kvq == 0) {
+                V.kc = alloc<uint16_t>(cn * (size_t) hd);
+                V.vc = alloc<uint16_t>(cn * (size_t) hd);
+            } else {
+                V.kq = alloc<uint8_t>(cn * (size_t) (V.kvq == 1 ? hd : hd / 2));
+                V.vq = alloc<uint8_t>(cn * (size_t) (V.kvq == 1 ? hd : hd / 2));
+                V.ks = alloc<uint16_t>(cn * (size_t) (hd / 32));
+                V.vs = alloc<uint16_t>(cn * (size_t) (hd / 32));
+            }
             V.cring = alloc<float>((size_t) i2k::kRing * (size_t) hp.conv_channels());
         }
         // activations
@@ -488,6 +506,9 @@ struct GpuEngine::Impl {
         vraw = alloc<float>(T * (size_t) kd);
         r = alloc<float>(T * (size_t) H * (size_t) R);
         sink = alloc<float>(T * (size_t) H);
+        pm_ = alloc<float>((size_t) H * (size_t) std::max(1, opt.attn_max_split));
+        pl_ = alloc<float>((size_t) H * (size_t) std::max(1, opt.attn_max_split));
+        pacc_ = alloc<float>((size_t) H * (size_t) std::max(1, opt.attn_max_split) * (size_t) hd);
         ktap = alloc<float>(T * (size_t) C * (size_t) KV);
         vtap = alloc<float>(T * (size_t) C * (size_t) KV);
         rlog = alloc<float>(T * (size_t) hp.n_expert);
@@ -625,18 +646,39 @@ struct GpuEngine::Impl {
         G4_LAUNCH(i2k::k_conv_res, dim3((unsigned) ((E + 127) / 128), (unsigned) Tn), dim3(g4k::kThreads), st, in, E, w, hp.n_conv, cring, hp.conv_channels(), seg_off, pos0, resid, out);
     }
 
+    template <int NU, int KVQ>
+    void attention_nu(const DevLayer& dl, const Visit& V, int Tn, int pos0, int window, int extent, int nsplit) {
+        const dim3 grid((unsigned) Tn, (unsigned) hp.n_head, (unsigned) nsplit), block(g4k::kThreads);
+        G4_LAUNCH(G4_K((i2k::k_attn<NU, KVQ>)), grid, block, st, q, r, dl.rel_bias, sink, gate, (const uint16_t*) V.kc, (const uint16_t*) V.vc, (const uint8_t*) V.kq, (const uint8_t*) V.vq,
+                  (const uint16_t*) V.ks, (const uint16_t*) V.vs, att, hp.n_head, hp.n_kv, hp.n_rel, extent, pos0, V.cells, window, nsplit, pm_, pl_, pacc_);
+        if (nsplit > 1) G4_LAUNCH(G4_K(i2k::k_attn_merge<NU>), dim3((unsigned) hp.n_head), dim3(g4k::kThreads), st, (const float*) gate, (const float*) pm_, (const float*) pl_, (const float*) pacc_, att, nsplit);
+    }
+    template <int KVQ>
+    void attention_kvq(const DevLayer& dl, const Visit& V, int Tn, int pos0, int window, int extent, int nsplit) {
+        switch (hp.hd / 32) {
+            case 1: attention_nu<1, KVQ>(dl, V, Tn, pos0, window, extent, nsplit); break;
+            case 2: attention_nu<2, KVQ>(dl, V, Tn, pos0, window, extent, nsplit); break;
+            case 3: attention_nu<3, KVQ>(dl, V, Tn, pos0, window, extent, nsplit); break;
+            default: attention_nu<4, KVQ>(dl, V, Tn, pos0, window, extent, nsplit); break;
+        }
+    }
     void attention(int ip, const Visit& V, int Tn, int pos0) {
         const DevLayer& dl = L[(size_t) ip];
         const bool swa = hp.swa[(size_t) ip] != 0;
         const int window = swa ? hp.window : 0, extent = swa ? hp.window : hp.rel_extent;
-        const dim3 grid((unsigned) Tn, (unsigned) hp.n_head), block(g4k::kThreads);
-        switch (hp.hd / 32) {
-            case 1: G4_LAUNCH(G4_K(i2k::k_attn<1>), grid, block, st, q, r, dl.rel_bias, sink, gate, V.kc, V.vc, att, hp.n_head, hp.n_kv, hp.n_rel, extent, pos0, V.cells, window); break;
-            case 2: G4_LAUNCH(G4_K(i2k::k_attn<2>), grid, block, st, q, r, dl.rel_bias, sink, gate, V.kc, V.vc, att, hp.n_head, hp.n_kv, hp.n_rel, extent, pos0, V.cells, window); break;
-            case 3: G4_LAUNCH(G4_K(i2k::k_attn<3>), grid, block, st, q, r, dl.rel_bias, sink, gate, V.kc, V.vc, att, hp.n_head, hp.n_kv, hp.n_rel, extent, pos0, V.cells, window); break;
-            default: G4_LAUNCH(G4_K(i2k::k_attn<4>), grid, block, st, q, r, dl.rel_bias, sink, gate, V.kc, V.vc, att, hp.n_head, hp.n_kv, hp.n_rel, extent, pos0, V.cells, window); break;
+        // one decoded token over many keys: the keys are cut into parts, a block each (24 blocks alone cannot fill a card), then merged
+        int nsplit = 1;
+        if (Tn == 1) {
+            const int nkeys = window > 0 ? std::min(window, pos0 + 1) : pos0 + 1;
+            nsplit = std::max(1, std::min(opt.attn_max_split, nkeys / std::max(1, opt.attn_split_keys)));
+        }
+        switch (V.kvq) {
+            case 0: attention_kvq<0>(dl, V, Tn, pos0, window, extent, nsplit); break;
+            case 1: attention_kvq<1>(dl, V, Tn, pos0, window, extent, nsplit); break;
+            default: attention_kvq<2>(dl, V, Tn, pos0, window, extent, nsplit); break;
         }
     }
+    float *pm_ = nullptr, *pl_ = nullptr, *pacc_ = nullptr;     // the parts of a split attention (per head and part)
 
     // ------------------------------------------------------------------------------------------------------------------------ experts
     const float* cur_gu_scale = nullptr;                 // the layer's per-expert scalar on its gate+up product (null: none)
@@ -870,7 +912,7 @@ struct GpuEngine::Impl {
         }
         lap_(prof, 1, dl.streamed);                               // (the q, k, v, relative, sink and gate projections)
         G4_LAUNCH(i2k::k_prep, dim3((unsigned) Tn, (unsigned) (2 * hp.n_head + 2 * hp.n_kv)), b1, st, q, (const float*) kraw, (const float*) vraw, r, (const float*) ktap, (const float*) vtap,
-                  (const float*) dl.kconv, (const float*) dl.vconv, (const float*) dl.q_clip, (const float*) dl.rel_clip, (const float*) V.cring, hp.conv_channels(), V.kc, V.vc, hp.n_head, hp.n_kv,
+                  (const float*) dl.kconv, (const float*) dl.vconv, (const float*) dl.q_clip, (const float*) dl.rel_clip, (const float*) V.cring, hp.conv_channels(), V.kc, V.vc, V.kq, V.vq, V.ks, V.vs, V.kvq, hp.n_head, hp.n_kv,
                   hp.hd, hp.n_rel, hp.n_conv, pos0, V.cells, !swa, hp.qk_clip, hp.rel_clip, hp.eps, hp.log_alpha, hp.log_floor);
         ring_store(kraw, kd, V.cring, 0, Tn, pos0);
         ring_store(vraw, kd, V.cring, kd, Tn, pos0);
@@ -1068,7 +1110,14 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
         else if (a == "--bench-pp") bench_pp = std::atoi(val().c_str());
         else if (a == "--bench-tg") bench_tg = std::atoi(val().c_str());
         else if (a == "--bench-warmup") bench_warm = std::max(0, std::atoi(val().c_str()));
-        else if (a == "--kv") { const std::string v = val(); if (v != "f16") std::fprintf(stderr, "strata-inkling2: --kv %s: this engine keeps K / V as f16\n", v.c_str()); }
+        else if (a == "--kv") {                         // the K / V of the global layers (the long ones); the sliding-window layers' rings stay halves
+            const std::string v = val();
+            if (v == "f16") o.kvq = 0;
+            else if (v == "q8_0" || v == "q8") o.kvq = 1;
+            else if (v == "q4_0" || v == "q4") o.kvq = 2;
+            else std::fprintf(stderr, "strata-inkling2: --kv %s: f16, q8_0 or q4_0 (kept f16)\n", v.c_str());
+        }
+        else if (a == "--attn-split-keys") o.attn_split_keys = std::max(1, std::atoi(val().c_str()));
         else std::fprintf(stderr, "strata-inkling2: ignoring %s (not an option of this engine)\n", a.c_str());
     }
     GpuEngine eng(m, ctx, o);

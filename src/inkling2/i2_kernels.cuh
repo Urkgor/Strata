@@ -133,7 +133,8 @@ G4_DEV float conv_in(const float* buf, int ld, int c, int t, int back, const flo
 /// tau = 1 + alpha log(max(1, (pos + 1) / floor)).
 __global__ void __launch_bounds__(kThreads)
 k_prep(float* q, const float* kraw, const float* vraw, float* r, const float* ktap, const float* vtap, const float* kconv, const float* vconv,
-       const float* q_clip, const float* rel_clip, const float* cring, int ch, uint16_t* kc, uint16_t* vc, int n_head, int n_kv, int hd, int n_rel, int n_conv,
+       const float* q_clip, const float* rel_clip, const float* cring, int ch, uint16_t* kc, uint16_t* vc, uint8_t* kq, uint8_t* vq, uint16_t* ks, uint16_t* vs, int kvq,
+       int n_head, int n_kv, int hd, int n_rel, int n_conv,
        int pos0, int ring, bool global, float qk_clip, float rel_thr, float eps, float alpha, float floor_) {
     __shared__ float sh[32];
     const int t = (int) blockIdx.x, part = (int) blockIdx.y, i = (int) threadIdx.x;
@@ -172,9 +173,24 @@ k_prep(float* q, const float* kraw, const float* vraw, float* r, const float* kt
         } else {
             y = x * (1.0f / sqrtf(block_sum(x * x, sh) / (float) hd + eps));
         }
-        if (i < hd) {
-            uint16_t* dst = (is_k ? kc : vc) + ((size_t) kvh * (size_t) ring + (size_t) (pos % ring)) * (size_t) hd + (size_t) i;
-            *dst = g4::float_to_half(y);
+        const size_t cellno = (size_t) kvh * (size_t) ring + (size_t) (pos % ring);
+        if (kvq == 0) {
+            if (i < hd) (is_k ? kc : vc)[cellno * (size_t) hd + (size_t) i] = g4::float_to_half(y);
+        } else if ((i >> 5) * 32 < hd) {                   // quantized K / V: blocks of 32 values (a warp), a half scale each: q8_0 (scale amax / 127) or 4 bits (amax / 7)
+            const int lane = i & 31, blk = i >> 5;
+            const float qmax = kvq == 1 ? 127.f : 7.f;
+            const uint16_t dh = g4::float_to_half(g4k::warp_max(fabsf(y)) / qmax);
+            const float d = g4::half_to_float(dh);
+            int qi = d > 0.f ? (int) rintf(y / d) : 0;
+            if (kvq == 1) {
+                qi = max(-127, min(127, qi));
+                (is_k ? kq : vq)[cellno * (size_t) hd + (size_t) i] = (uint8_t) (int8_t) qi;
+            } else {
+                qi = max(-8, min(7, qi)) + 8;
+                const int other = __shfl_xor_sync(0xffffffffu, qi, 16);
+                if (lane < 16) (is_k ? kq : vq)[cellno * (size_t) (hd / 2) + (size_t) (blk * 16 + lane)] = (uint8_t) (qi | (other << 4));
+            }
+            if (lane == 0) (is_k ? ks : vs)[cellno * (size_t) (hd / 32) + (size_t) blk] = dh;
         }
         return;
     }
@@ -205,21 +221,35 @@ k_conv_res(const float* in, int n, const float* w, int n_conv, const float* crin
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------
+/// One element of a cached K / V vector: lane + 32 s of the cell's head vector, in f16 (KVQ 0), q8_0 (1) or 4 bits (2) with a half scale per 32 values.
+template <int KVQ, int NU>
+__device__ __forceinline__ float kv_at(const uint16_t* h, const uint8_t* qv, const uint16_t* sc, size_t cell, int s, int lane) {
+    if constexpr (KVQ == 0) {
+        return g4::half_to_float(h[cell * (size_t) (NU * 32) + (size_t) (lane + 32 * s)]);
+    } else if constexpr (KVQ == 1) {
+        return (float) (int) (int8_t) qv[cell * (size_t) (NU * 32) + (size_t) (lane + 32 * s)] * g4::half_to_float(sc[cell * (size_t) NU + (size_t) s]);
+    } else {
+        const int b = qv[cell * (size_t) (NU * 16) + (size_t) (s * 16 + (lane & 15))];
+        return (float) ((lane < 16 ? (b & 0xF) : (b >> 4)) - 8) * g4::half_to_float(sc[cell * (size_t) NU + (size_t) s]);
+    }
+}
+
 /// Attention of the T tokens at positions pos0 .. pos0 + T - 1, a block per (token, query head): grid (T, n_head), 4 warps.  Each warp takes every
 /// fourth key of the token's window (the last `window` cells on a local layer, every cell on a global one), keeps an online softmax and the weighted sum
-/// of V (lane l holds the elements l + 32 s); the four are merged at the end.  logit = q.k / sqrt(hd) + bias(distance) - sink, the bias a learned row per
-/// distance (zero past `extent`) dotted with the head's r; the sink is one more key of logit 0 without a value (it starts warp 0's softmax).  The output
-/// is multiplied by sigmoid(gate).  NU = hd / 32.
-template <int NU>
+/// of the values; the sink is a first key of logit 0 and value 0 (warp 0 starts with it).  The relative-position bias of a key at distance d < extent
+/// comes from a table of the block's, a key further away has the table's last, zero row: -sink only.  The caches hold halves, q8_0 or 4-bit values.
+/// With nsplit > 1 (one token, a long window) the keys are cut into nsplit parts, a block (grid z) each, whose (max, sum, weighted values) go to pm / pl /
+/// pacc for k_attn_merge; the sink belongs to part 0.
+template <int NU, int KVQ>
 __global__ void __launch_bounds__(kThreads)
-k_attn(const float* q, const float* r, const float* rel_bias, const float* sink, const float* gate, const uint16_t* kc, const uint16_t* vc, float* out,
-       int n_head, int n_kv, int n_rel, int extent, int pos0, int ring, int window) {
+k_attn(const float* q, const float* r, const float* rel_bias, const float* sink, const float* gate, const uint16_t* kc, const uint16_t* vc, const uint8_t* kq, const uint8_t* vq,
+       const uint16_t* ks, const uint16_t* vs, float* out, int n_head, int n_kv, int n_rel, int extent, int pos0, int ring, int window, int nsplit, float* pm, float* pl, float* pacc) {
     constexpr int HD = NU * 32;
     __shared__ float tbl[kMaxExtent];
     __shared__ float wm[4], wl[4];
     __shared__ float wacc[4][HD];
     const int tid = (int) threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const int t = (int) blockIdx.x, hh = (int) blockIdx.y;
+    const int t = (int) blockIdx.x, hh = (int) blockIdx.y, sp = (int) blockIdx.z;
     const int kk = hh / (n_head / n_kv);
     const int p = pos0 + t;
     const int lo = window > 0 ? max(0, p - window + 1) : 0;
@@ -237,15 +267,26 @@ k_attn(const float* q, const float* r, const float* rel_bias, const float* sink,
 #pragma unroll
     for (int s = 0; s < NU; ++s) { qv[s] = qh[lane + 32 * s]; acc[s] = 0.f; }
     const float scale = 1.0f / sqrtf((float) HD);
-    float m = warp == 0 ? 0.f : -INFINITY, l = warp == 0 ? 1.f : 0.f;
-    const uint16_t* kbase = kc + (size_t) kk * (size_t) ring * (size_t) HD;
-    const uint16_t* vbase = vc + (size_t) kk * (size_t) ring * (size_t) HD;
-    for (int j = lo + warp; j <= p; j += 4) {
+    const bool first = sp == 0;                                         // the sink is part 0's
+    float m = (warp == 0 && first) ? 0.f : -INFINITY, l = (warp == 0 && first) ? 1.f : 0.f;
+    const size_t cells = (size_t) kk * (size_t) ring;
+    const uint16_t* kh = kc ? kc + cells * (size_t) HD : nullptr;
+    const uint16_t* vh = vc ? vc + cells * (size_t) HD : nullptr;
+    const uint8_t* kqb = kq ? kq + cells * (size_t) (KVQ == 2 ? HD / 2 : HD) : nullptr;
+    const uint8_t* vqb = vq ? vq + cells * (size_t) (KVQ == 2 ? HD / 2 : HD) : nullptr;
+    const uint16_t* ksb = ks ? ks + cells * (size_t) NU : nullptr;
+    const uint16_t* vsb = vs ? vs + cells * (size_t) NU : nullptr;
+    int j0 = lo, j1 = p;
+    if (nsplit > 1) {
+        const int per = (p - lo + 1 + nsplit - 1) / nsplit;
+        j0 = lo + sp * per;
+        j1 = min(p, j0 + per - 1);
+    }
+    for (int j = j0 + warp; j <= j1; j += 4) {
         const size_t cell = (size_t) (j % ring);
-        const uint16_t* kr = kbase + cell * (size_t) HD;
         float sc = 0.f;
 #pragma unroll
-        for (int s = 0; s < NU; ++s) sc += qv[s] * g4::half_to_float(kr[lane + 32 * s]);
+        for (int s = 0; s < NU; ++s) sc += qv[s] * kv_at<KVQ, NU>(kh, kqb, ksb, cell, s, lane);
         sc = warp_sum(sc);
         const int dist = p - j;
         sc = sc * scale + (dist < extent ? tbl[dist] : -sk);
@@ -253,9 +294,8 @@ k_attn(const float* q, const float* r, const float* rel_bias, const float* sink,
         const float a = m == -INFINITY ? 0.f : expf(m - mn);
         const float b = expf(sc - mn);
         l = l * a + b;
-        const uint16_t* vr = vbase + cell * (size_t) HD;
 #pragma unroll
-        for (int s = 0; s < NU; ++s) acc[s] = acc[s] * a + b * g4::half_to_float(vr[lane + 32 * s]);
+        for (int s = 0; s < NU; ++s) acc[s] = acc[s] * a + b * kv_at<KVQ, NU>(vh, vqb, vsb, cell, s, lane);
         m = mn;
     }
     if (lane == 0) { wm[warp] = m; wl[warp] = l; }
@@ -266,6 +306,16 @@ k_attn(const float* q, const float* r, const float* rel_bias, const float* sink,
     for (int w = 1; w < 4; ++w) M = fmaxf(M, wm[w]);
     float L = 0.f;
     for (int w = 0; w < 4; ++w) L += wm[w] == -INFINITY ? 0.f : wl[w] * expf(wm[w] - M);
+    if (nsplit > 1) {                                                   // a part: its state, not yet divided by the sum
+        const size_t pi = (size_t) hh * (size_t) nsplit + (size_t) sp;
+        if (tid == 0) { pm[pi] = M; pl[pi] = L; }
+        for (int e = tid; e < HD; e += (int) blockDim.x) {
+            float a = 0.f;
+            for (int w = 0; w < 4; ++w) a += wm[w] == -INFINITY ? 0.f : wacc[w][e] * expf(wm[w] - M);
+            pacc[pi * (size_t) HD + (size_t) e] = a;
+        }
+        return;
+    }
     const float inv = 1.0f / L;
     float* o = out + (size_t) t * (size_t) (n_head * HD) + (size_t) hh * (size_t) HD;
     const float* gt = gate + (size_t) t * (size_t) (n_head * HD) + (size_t) hh * (size_t) HD;
@@ -274,6 +324,26 @@ k_attn(const float* q, const float* r, const float* rel_bias, const float* sink,
         for (int w = 0; w < 4; ++w) a += wm[w] == -INFINITY ? 0.f : wacc[w][e] * expf(wm[w] - M);
         o[e] = a * inv * sigmoidf(gt[e]);
     }
+}
+
+/// The parts of one token's attention put together: per query head, the parts' states merged (grid n_head, HD threads), times the output gate.
+template <int NU>
+__global__ void __launch_bounds__(kThreads)
+k_attn_merge(const float* gate, const float* pm, const float* pl, const float* pacc, float* out, int nsplit) {
+    constexpr int HD = NU * 32;
+    const int hh = (int) blockIdx.x, e = (int) threadIdx.x;
+    if (e >= HD) return;
+    float M = -INFINITY;
+    for (int s = 0; s < nsplit; ++s) M = fmaxf(M, pm[(size_t) hh * (size_t) nsplit + (size_t) s]);
+    float L = 0.f, a = 0.f;
+    for (int s = 0; s < nsplit; ++s) {
+        const size_t pi = (size_t) hh * (size_t) nsplit + (size_t) s;
+        if (pm[pi] == -INFINITY) continue;
+        const float w = expf(pm[pi] - M);
+        L += pl[pi] * w;
+        a += pacc[pi * (size_t) HD + (size_t) e] * w;
+    }
+    out[(size_t) hh * (size_t) HD + (size_t) e] = a / L * sigmoidf(gate[(size_t) hh * (size_t) HD + (size_t) e]);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------
