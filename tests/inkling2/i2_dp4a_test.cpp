@@ -89,9 +89,9 @@ int main() {
         G4_LAUNCH(i2k::k_quant_x, dim3((unsigned) ((n_in / 32 + 7) / 8), (unsigned) ntok), dim3(256), 0, dx, n_in, dxq, dxd);
         auto run = [&](auto tag, bool dense) {
             constexpr int TY = decltype(tag)::value;
-            if (dense) G4_LAUNCH((i2k::k_mmq<TY, 16>), dim3((unsigned) ((n_out + 7) / 8), (unsigned) ((ntok + 15) / 16)), dim3(256), 0, dw, (long long) eb, (long long) rb, n_in, n_out, (const int8_t*) dxq,
+            if (dense) G4_LAUNCH((i2k::k_mmq<TY, 16>), dim3((unsigned) ((n_out + 15) / 16), (unsigned) ((ntok + 15) / 16)), dim3(256), 0, dw, (long long) eb, (long long) rb, n_in, n_out, (const int8_t*) dxq,
                                  (const float*) dxd, (const int*) nullptr, (const int*) nullptr, (const int*) nullptr, (const int*) nullptr, (const int*) nullptr, ntok, dy, n_out, 0);
-            else G4_LAUNCH((i2k::k_mmq<TY, 16>), dim3((unsigned) ((n_out + 7) / 8), 3u), dim3(256), 0, dw, (long long) eb, (long long) rb, n_in, n_out, (const int8_t*) dxq, (const float*) dxd,
+            else G4_LAUNCH((i2k::k_mmq<TY, 16>), dim3((unsigned) ((n_out + 15) / 16), 3u), dim3(256), 0, dw, (long long) eb, (long long) rb, n_in, n_out, (const int8_t*) dxq, (const float*) dxd,
                            (const int*) dge, (const int*) dgf, (const int*) dgn, (const int*) dei, (const int*) deo, ntok, dy, n_out, 0);
         };
         std::vector<float> y((size_t) ntok * (size_t) n_out), wrow((size_t) n_in);

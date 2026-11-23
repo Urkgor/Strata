@@ -232,8 +232,9 @@ k_mv(const uint8_t* __restrict__ w, long long expert_bytes, long long row_bytes,
     if (lane == 0) y[(size_t) entry * (size_t) ldy + (size_t) y_off + (size_t) row] = acc;
 }
 
-/// Reading a prompt by the same integer arithmetic: NT tokens (or (token, expert) pairs of one expert) a block, a warp a row, the weights decoded once per row and
-/// slice and used for all NT.  The activations of the group are staged in shared memory in slices of 512 values.  Grid (ceil(n_out / 8), groups), 256 threads.
+/// Reading a prompt by the same integer arithmetic: NT tokens (or (token, expert) pairs of one expert) a block, a warp two rows, the weights of both decoded once per slice
+/// and used for all NT tokens (the activations of a token read from shared memory once for both rows).  The activations of the group are staged in slices of 512 values.
+/// Grid (ceil(n_out / 16), groups), 256 threads.
 ///   dense matrix (grp_exp null): group g = tokens g * NT .. of ntok, rows of x and y the token's own;
 ///   experts: group g of grp_exp[g] / grp_first[g] / grp_cnt[g] (the tables mm_exp reads): entry i reads row ent_in[first + i] of the activations and writes row
 ///   ent_out[first + i] of y.
@@ -252,11 +253,13 @@ k_mmq(const uint8_t* __restrict__ w, long long expert_bytes, long long row_bytes
     else { first = g * NT; cnt = min(NT, ntok - first); }
     if (tid < NT) rows_in[tid] = tid < cnt ? (ent_in ? ent_in[first + tid] : first + tid) : 0;
     __syncthreads();
-    const int row = (int) blockIdx.x * 8 + (tid >> 5);
-    const uint8_t* rp = w + (size_t) e * (size_t) expert_bytes + (size_t) (row < n_out ? row : 0) * (size_t) row_bytes;
-    float acc[NT];
+    const int rowA = ((int) blockIdx.x * 8 + (tid >> 5)) * 2, rowB = rowA + 1;
+    const uint8_t* wbase = w + (size_t) e * (size_t) expert_bytes;
+    const uint8_t* rpA = wbase + (size_t) (rowA < n_out ? rowA : 0) * (size_t) row_bytes;
+    const uint8_t* rpB = wbase + (size_t) (rowB < n_out ? rowB : (rowA < n_out ? rowA : 0)) * (size_t) row_bytes;
+    float accA[NT], accB[NT];
 #pragma unroll
-    for (int i = 0; i < NT; ++i) acc[i] = 0.f;
+    for (int i = 0; i < NT; ++i) { accA[i] = 0.f; accB[i] = 0.f; }
     for (int k0 = 0; k0 < n_in; k0 += KS) {
         const int kn = min(KS, n_in - k0);
         for (int idx = tid; idx < cnt * (kn / 4); idx += 256) {
@@ -271,36 +274,49 @@ k_mmq(const uint8_t* __restrict__ w, long long expert_bytes, long long row_bytes
         if constexpr (T == g4::T_Q8_0) {
             const int nb = kn / 32, part = lane & 3;
             for (int b = lane >> 2; b < nb; b += 8) {
-                const uint8_t* blk = rp + (size_t) (k0 / 32 + b) * 34;
-                const int w0 = i2_ld32_b2(blk + 2 + part * 8), w1 = i2_ld32_b2(blk + 2 + part * 8 + 4);
-                const float dw = g4::half_to_float((uint16_t) i2_ld16(blk));
+                const uint8_t* ba = rpA + (size_t) (k0 / 32 + b) * 34;
+                const uint8_t* bb = rpB + (size_t) (k0 / 32 + b) * 34;
+                const int a0 = i2_ld32_b2(ba + 2 + part * 8), a1 = i2_ld32_b2(ba + 2 + part * 8 + 4);
+                const int c0 = i2_ld32_b2(bb + 2 + part * 8), c1 = i2_ld32_b2(bb + 2 + part * 8 + 4);
+                const float da = g4::half_to_float((uint16_t) i2_ld16(ba)), db = g4::half_to_float((uint16_t) i2_ld16(bb));
 #pragma unroll
                 for (int i = 0; i < NT; ++i) {
                     if (i < cnt) {
                         const int* xv = xs_i + i * (KS / 4) + b * 8 + part * 2;
-                        const int s = i2_dp4a(w1, xv[1], i2_dp4a(w0, xv[0], 0));
-                        acc[i] += (float) s * dw * ds[i * (KS / 32) + b];
+                        const int x0 = xv[0], x1 = xv[1];
+                        const float dx = ds[i * (KS / 32) + b];
+                        accA[i] += (float) i2_dp4a(a1, x1, i2_dp4a(a0, x0, 0)) * da * dx;
+                        accB[i] += (float) i2_dp4a(c1, x1, i2_dp4a(c0, x0, 0)) * db * dx;
                     }
                 }
             }
         } else {
             const int nb = kn / 64, sub = lane & 3;
             for (int b = lane >> 2; b < nb; b += 8) {
-                const uint8_t* blk = rp + (size_t) (k0 / 64 + b) * 36;
-                const uint32_t w0 = *reinterpret_cast<const uint32_t*>(blk + 4 + sub * 8), w1 = *reinterpret_cast<const uint32_t*>(blk + 8 + sub * 8);
-                int a0, a1, b0, b1;
-                i2_table16(w0, 0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu, a0, a1);
-                i2_table16(w1, 0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu, b0, b1);
-                const float dw = g4::ue4m3_half((int) blk[sub]);
+                const uint8_t* ba = rpA + (size_t) (k0 / 64 + b) * 36;
+                const uint8_t* bb = rpB + (size_t) (k0 / 64 + b) * 36;
+                int a0, a1, b0, b1, c0, c1, d0, d1;
+                i2_table16(*reinterpret_cast<const uint32_t*>(ba + 4 + sub * 8), 0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu, a0, a1);
+                i2_table16(*reinterpret_cast<const uint32_t*>(ba + 8 + sub * 8), 0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu, b0, b1);
+                i2_table16(*reinterpret_cast<const uint32_t*>(bb + 4 + sub * 8), 0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu, c0, c1);
+                i2_table16(*reinterpret_cast<const uint32_t*>(bb + 8 + sub * 8), 0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu, d0, d1);
+                const float da = g4::ue4m3_half((int) ba[sub]), db = g4::ue4m3_half((int) bb[sub]);
 #pragma unroll
                 for (int i = 0; i < NT; ++i) {
                     if (i < cnt) {
                         const int* xv = xs_i + i * (KS / 4) + b * 16 + sub * 4;
-                        int s = i2_dp4a(a0, xv[0], 0);
-                        s = i2_dp4a(b0, xv[1], s);
-                        s = i2_dp4a(a1, xv[2], s);
-                        s = i2_dp4a(b1, xv[3], s);
-                        acc[i] += (float) s * dw * ds[i * (KS / 32) + b * 2 + (sub >> 1)];
+                        const int x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+                        const float dx = ds[i * (KS / 32) + b * 2 + (sub >> 1)];
+                        int sa = i2_dp4a(a0, x0, 0);
+                        sa = i2_dp4a(b0, x1, sa);
+                        sa = i2_dp4a(a1, x2, sa);
+                        sa = i2_dp4a(b1, x3, sa);
+                        int sb = i2_dp4a(c0, x0, 0);
+                        sb = i2_dp4a(d0, x1, sb);
+                        sb = i2_dp4a(c1, x2, sb);
+                        sb = i2_dp4a(d1, x3, sb);
+                        accA[i] += (float) sa * da * dx;
+                        accB[i] += (float) sb * db * dx;
                     }
                 }
             }
@@ -310,8 +326,12 @@ k_mmq(const uint8_t* __restrict__ w, long long expert_bytes, long long row_bytes
 #pragma unroll
     for (int i = 0; i < NT; ++i) {
         if (i < cnt) {
-            const float v = g4k::warp_sum(acc[i]);
-            if (lane == 0 && row < n_out) y[(size_t) (ent_out ? ent_out[first + i] : first + i) * (size_t) ldy + (size_t) y_off + (size_t) row] = v;
+            const float va = g4k::warp_sum(accA[i]), vb = g4k::warp_sum(accB[i]);
+            if (lane == 0) {
+                float* yr = y + (size_t) (ent_out ? ent_out[first + i] : first + i) * (size_t) ldy + (size_t) y_off;
+                if (rowA < n_out) yr[rowA] = va;
+                if (rowB < n_out) yr[rowB] = vb;
+            }
         }
     }
 }

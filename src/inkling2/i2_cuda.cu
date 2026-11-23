@@ -726,7 +726,7 @@ struct GpuEngine::Impl {
     template <int T>
     void mmq_t(const DevMat& W, const int8_t* xq, const float* xd, int ng, const int* ge, const int* gf, const int* gn, const int* ei, const int* eo, int ntok, float* y, int ldy, int y_off,
                long long expert_bytes) {
-        G4_LAUNCH(G4_K((i2k::k_mmq<T, 16>)), dim3((unsigned) ((W.n_out + 7) / 8), (unsigned) ng), dim3(256), st, W.d, expert_bytes, (long long) W.row_bytes, (int) W.n_in, (int) W.n_out, xq, xd, ge, gf, gn, ei, eo,
+        G4_LAUNCH(G4_K((i2k::k_mmq<T, 16>)), dim3((unsigned) ((W.n_out + 15) / 16), (unsigned) ng), dim3(256), st, W.d, expert_bytes, (long long) W.row_bytes, (int) W.n_in, (int) W.n_out, xq, xd, ge, gf, gn, ei, eo,
                   ntok, y, ldy, y_off);
     }
     void mmq(const DevMat& W, const int8_t* xq, const float* xd, int ng, const int* ge, const int* gf, const int* gn, const int* ei, const int* eo, int ntok, float* y, int ldy, int y_off,
