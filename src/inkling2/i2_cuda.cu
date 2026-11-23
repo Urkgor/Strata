@@ -509,6 +509,10 @@ struct GpuEngine::Impl {
         r = alloc<float>(T * (size_t) H * (size_t) R);
         sink = alloc<float>(T * (size_t) H);
         mixstat = alloc<float>(T * (size_t) i2k::kMaxStates * (size_t) (1 + i2k::kMaxQueries));
+        n_qw = ((std::max(qd, E) + 255) / 256) * 256;                                   // the integer kernels' activations: 4 slots of one input, then the experts' F-wide rows
+        const size_t qe = (size_t) std::max(8, hp.n_used) * (size_t) hp.n_ff_exp;
+        xq_ = alloc<int8_t>((size_t) 4 * (size_t) n_qw + std::max<size_t>(qe, (size_t) n_qw) + 64);
+        xd_ = alloc<float>(((size_t) 4 * (size_t) n_qw + std::max<size_t>(qe, (size_t) n_qw)) / 32 + 16);
         ctrl_gate = alloc<float>(T * (size_t) std::max(hp.gate_rank, 1));
         pm_ = alloc<float>((size_t) H * (size_t) std::max(1, opt.attn_max_split));
         pl_ = alloc<float>((size_t) H * (size_t) std::max(1, opt.attn_max_split));
@@ -583,6 +587,7 @@ struct GpuEngine::Impl {
             CK(cudaMemGetInfo(&fr, &tot));
             std::fprintf(stderr, "strata-inkling2: 1 CUDA device [device %d: %d layers (%d visits), %.2f GiB free after loading]; context %d, chunk %d\n", opt.device, hp.n_layer, hp.visits(),
                          (double) fr / (1 << 30), ctx, chunk);
+            if (opt.dp4a) std::fprintf(stderr, "strata-inkling2: decode: integer kernels for Q8_0 and NVFP4 matrices (--dp4a off: float kernels)\n");
             if (ns && ec.slots)
                 std::fprintf(stderr, "strata-inkling2: expert cache: %d slots (%.2f GiB, %.0f%% of the streamed layers' experts), decayed use count (x%.2f a token)\n", ec.slots,
                              (double) ec.slots * (double) per_expert_bytes() / (1 << 30), 100.0 * ec.slots / std::max(1, streamed_layers_count() * hp.n_expert), opt.cache_decay);
@@ -596,6 +601,29 @@ struct GpuEngine::Impl {
 
     // ------------------------------------------------------------------------------------------------------------------------ launches
     static int tile_of(int Tn) { return Tn <= 1 ? 1 : Tn <= 4 ? 4 : Tn <= 8 ? 8 : 16; }
+
+    // ---- integer decode kernels (Q8_0 and NVFP4 matrices, one token): the activations quantized once per input, then dp4a rows
+    int8_t* xq_ = nullptr;                                // [5 slots of n_qw values] + the experts' activation rows
+    float* xd_ = nullptr;
+    int n_qw = 0;
+    bool dp_type(int t) const { return opt.dp4a && (t == g4::T_Q8_0 || t == g4::T_NVFP4); }
+    int8_t* qslot(int i) const { return xq_ + (size_t) i * (size_t) n_qw; }
+    float* dslot(int i) const { return xd_ + (size_t) i * (size_t) (n_qw / 32); }
+    void prep(const float* x, int n, int slot) {         // x[n] -> slot `slot`
+        G4_LAUNCH(i2k::k_quant_x, dim3((unsigned) ((n / 32 + 7) / 8), 1u), dim3(256), st, x, n, qslot(slot), dslot(slot));
+    }
+    void mv(const DevMat& W, const int8_t* xq, const float* xd, long long x_stride, const int* ge, int entries, float* y, int ldy, int y_off, long long expert_bytes) {
+        const dim3 grid((unsigned) ((W.n_out + 7) / 8), (unsigned) entries), block(256);
+        if (W.type == g4::T_Q8_0)
+            G4_LAUNCH(G4_K(i2k::k_mv<g4::T_Q8_0>), grid, block, st, W.d, expert_bytes, (long long) W.row_bytes, (int) W.n_in, (int) W.n_out, xq, xd, x_stride, ge, y, ldy, y_off);
+        else
+            G4_LAUNCH(G4_K(i2k::k_mv<g4::T_NVFP4>), grid, block, st, W.d, expert_bytes, (long long) W.row_bytes, (int) W.n_in, (int) W.n_out, xq, xd, x_stride, ge, y, ldy, y_off);
+    }
+    /// y = W x for the Tn tokens of x (ldx); one token whose activations are in `slot` and a matrix of a type with an integer kernel: that kernel, else the float one
+    void mmd(const DevMat& W, const float* x, int ldx, int Tn, float* y, int ldy, int slot, int y_off = 0) {
+        if (Tn == 1 && slot >= 0 && dp_type(W.type)) mv(W, qslot(slot), dslot(slot), 0, nullptr, 1, y, ldy, y_off, 0);
+        else mm(W, x, ldx, Tn, y, ldy, y_off);
+    }
 
     /// y[t][y_off + r] = W row r . x[t] for t < T
     void mm(const DevMat& W, const float* x, int ldx, int Tn, float* y, int ldy, int y_off = 0) {
@@ -694,6 +722,17 @@ struct GpuEngine::Impl {
     void exp_ffn(const DevMat& gu_m, const DevMat& dn, int ng, bool decode, const int* ge, const int* gf, const int* gn, const int* et, const int* er, int rows,
                  const int* situ_rows) {
         const int E = hp.n_embd, F = hp.n_ff_exp;
+        if (decode && dp_type(gu_m.type) && dp_type(dn.type) && F % 32 == 0) {    // one token: the experts' rows by integer arithmetic (group g is entry g: the tables are identities)
+            prep(n0, E, 0);
+            mv(gu_m, qslot(0), dslot(0), 0, ge, ng, gu, 2 * F, 0, (long long) gu_m.expert_bytes);
+            G4_LAUNCH(i2k::k_situ, dim3((unsigned) ((F + 127) / 128), (unsigned) rows), dim3(g4k::kThreads), st, (const float*) gu, eact, F, hp.situ_beta, hp.situ_lin, situ_rows,
+                      (const float*) cur_gu_scale, (const int*) topk_idx);
+            int8_t* eq = qslot(4);
+            float* ed_ = dslot(4);
+            G4_LAUNCH(i2k::k_quant_x, dim3((unsigned) ((F / 32 + 7) / 8), (unsigned) ng), dim3(256), st, (const float*) eact, F, eq, ed_);
+            mv(dn, eq, ed_, (long long) F, ge, ng, ed, E, 0, (long long) dn.expert_bytes);
+            return;
+        }
         mm_exp(gu_m, n0, E, ng, decode, ge, gf, gn, et, er, gu, 2 * F);
         G4_LAUNCH(i2k::k_situ, dim3((unsigned) ((F + 127) / 128), (unsigned) rows), dim3(g4k::kThreads), st, (const float*) gu, eact, F, hp.situ_beta, hp.situ_lin, situ_rows, (const float*) cur_gu_scale, (const int*) topk_idx);
         mm_exp(dn, eact, F, ng, decode, ge, gf, gn, er, er, ed, E);
@@ -909,12 +948,20 @@ struct GpuEngine::Impl {
             nv = n2;
         }
         lap_(prof, 0, dl.streamed);                               // (the mixes, controls and norms before the projections)
-        mm(dl.wq, nq0, E, Tn, q, qd);
-        mm(dl.wk, nk, E, Tn, kraw, kd);
-        mm(dl.wv, nv, E, Tn, vraw, kd);
-        mm(dl.wrel, nq0, E, Tn, r, hp.n_head * hp.n_rel);
-        mm(dl.wsink, nq0, E, Tn, sink, hp.n_head);
-        mm(dl.wgate, nq0, E, Tn, gate, qd);
+        int sk = -1, sv = -1;                                     // the quantized-activation slots of the k and v inputs (-1: not quantized)
+        if (Tn == 1 && opt.dp4a) {
+            prep(nq0, E, 0);
+            sk = nk == nq0 ? 0 : 1;
+            if (sk == 1) prep(nk, E, 1);
+            sv = nv == nq0 ? 0 : nv == nk ? sk : 2;
+            if (sv == 2) prep(nv, E, 2);
+        }
+        mmd(dl.wq, nq0, E, Tn, q, qd, Tn == 1 && opt.dp4a ? 0 : -1);
+        mmd(dl.wk, nk, E, Tn, kraw, kd, sk);
+        mmd(dl.wv, nv, E, Tn, vraw, kd, sv);
+        mmd(dl.wrel, nq0, E, Tn, r, hp.n_head * hp.n_rel, Tn == 1 && opt.dp4a ? 0 : -1);
+        mmd(dl.wsink, nq0, E, Tn, sink, hp.n_head, Tn == 1 && opt.dp4a ? 0 : -1);
+        mmd(dl.wgate, nq0, E, Tn, gate, qd, Tn == 1 && opt.dp4a ? 0 : -1);
         if (!swa) {
             mm(dl.kconv_proj, nk, E, Tn, ktap, hp.n_conv * hp.n_kv);
             mm(dl.vconv_proj, nv, E, Tn, vtap, hp.n_conv * hp.n_kv);
@@ -927,7 +974,8 @@ struct GpuEngine::Impl {
         ring_store(vraw, kd, V.cring, kd, Tn, pos0);
         attention(ip, V, Tn, pos0);
         lap_(prof, 2, dl.streamed);                               // (the head preparation, the cache writes and the attention)
-        mm(dl.wo, att, qd, Tn, proj, E);
+        if (Tn == 1 && opt.dp4a) prep(att, qd, 3);
+        mmd(dl.wo, att, qd, Tn, proj, E, Tn == 1 && opt.dp4a ? 3 : -1);
         const bool push = ip % hp.block == 0;
         conv_res(proj, dl.post_conv, V.cring, 2 * kd, Tn, pos0, push ? nullptr : sa, cur);
         ring_store(proj, E, V.cring, 2 * kd, Tn, pos0);
@@ -1012,7 +1060,8 @@ struct GpuEngine::Impl {
             states.push_back(cur + (size_t) (Tn - 1) * (size_t) E);
             mix(states, 1, output_res_query, 1, mixh);
             rms(mixh, output_norm, xh, 1);
-            mm(head, xh, E, 1, logits, hp.n_vocab);
+            if (opt.dp4a) prep(xh, E, 0);
+            mmd(head, xh, E, 1, logits, hp.n_vocab, opt.dp4a ? 0 : -1);
             if (hp.softcap > 0.f) G4_LAUNCH(g4k::k_softcap, dim3((unsigned) ((hp.n_vocab + 127) / 128)), dim3(g4k::kThreads), st, logits, hp.n_vocab, hp.softcap);
             logits_ready = true;
         } else {
@@ -1113,6 +1162,7 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
         else if (a == "--host-experts") o.host_experts = std::max(0, std::atoi(val().c_str()));
         else if (a == "--expert-cache-mib") o.cache_mib = std::max(0, std::atoi(val().c_str()));
         else if (a == "--profile") o.profile = true;
+        else if (a == "--dp4a") o.dp4a = val() != "off";
         else if (a == "--cpu-experts") { const std::string v = val(); o.cpu_threads = v == "auto" ? -1 : std::max(0, std::atoi(v.c_str())); }
         else if (a == "--cache-decay") o.cache_decay = std::min(1.0, std::max(0.5, std::atof(val().c_str())));
         else if (a == "--swa-slack") o.slack = std::max(0, std::atoi(val().c_str()));
@@ -1205,8 +1255,9 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
         const double rel = std::sqrt(d2 / std::max(s2, 1e-30));
         const int a = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin()), b = (int) (std::max_element(rl.begin(), rl.end()) - rl.begin());
         std::printf("check: %zu tokens, GPU against the CPU reference (%.0f ms): logits differ by %.2e (rms / spread), best token %d / %d\n", ids.size(), ms_now() - t0, rel, a, b);
-        rc = (rel < 2e-3 && a == b) ? 0 : 1;
-        std::printf("check: %s\n", rc == 0 ? "ok" : "FAILED (more than 2e-3, or another best token)");
+        const double lim = o.dp4a ? 3e-2 : 2e-3;       // (with the integer kernels the activations carry 8-bit noise: --dp4a off for the exact comparison)
+        rc = (rel < lim && a == b) ? 0 : 1;
+        std::printf("check: %s\n", rc == 0 ? "ok" : o.dp4a ? "FAILED (more than 3e-2, or another best token)" : "FAILED (more than 2e-3, or another best token)");
     }
     std::printf("generated:");
     for (int i = 0; i < n_gen; ++i) {

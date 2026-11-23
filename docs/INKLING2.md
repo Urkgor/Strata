@@ -50,7 +50,14 @@ strata-inkling2 --model F.gguf --bench-pp 512 --bench-tg 64
 ```
 
 Options: `--max-context N`, `--gpu N` (one card only), `--prefill N` (512), `--swa-slack N` (1024), `--vram-reserve-mib N` (700), `--host-experts N`, `--cpu`,
-`--eos ID,...`, `--expert-cache-mib N` (VRAM for the expert cache, default: what is left; 0 = none), `--cache-decay X` (0.97), `--cpu-experts auto|N` (the CPU expert pool: auto = on if faster here, 0 = off, N threads), `--kv f16|q8_0|q4_0`, `--attn-split-keys N` (256), `--profile`, `--bench-warmup N`.
+`--eos ID,...`, `--expert-cache-mib N` (VRAM for the expert cache, default: what is left; 0 = none), `--cache-decay X` (0.97), `--cpu-experts auto|N` (the CPU expert pool: auto = on if faster here, 0 = off, N threads), `--kv f16|q8_0|q4_0`, `--dp4a on|off`, `--attn-split-keys N` (256), `--profile`, `--bench-warmup N`.
+
+## Decode speed
+
+A decoded token's Q8_0 and NVFP4 matrices (the dense projections, the head, and the experts of the NVFP4 files) are read by integer arithmetic: the activations are quantized once to int8 blocks of 32 and each
+row takes 4 products at a time (dp4a, Pascal and later), as llama.cpp's mmvq does, with the same 0.4 % of noise on the activations; every other type, and the prompt, keep the float kernels.
+`--dp4a off` turns it off, and `--check` then compares with 2e-3 instead of 3e-2. `--profile` prints where a decoded token's time goes, phase by phase, and how much of it the host spent queueing.
+The mix and the loop controller run in several blocks. Measured on a GTX 1080 Ti with UD-Q4_K_M: 9.0 tok/s before the controller change, 11.4 after it; the integer kernels are not measured yet.
 
 ## Long contexts
 

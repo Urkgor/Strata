@@ -123,6 +123,104 @@ k_ctrl_apply(float* cur, const float* msg, int n, int rk, const float* gain, con
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------
+// Decoded tokens by integer arithmetic (dp4a), for the types whose rows are blocks of small integers: Q8_0 and NVFP4.  The activations are quantized
+// once to int8 blocks of 32 (a float scale each, amax / 127) and every row of every matrix that reads them takes 4 products at a time.  This is what llama.cpp's
+// mmvq does (the same 0.5 % of noise on the activations); the float kernels above stay for every other type and for reading a prompt.
+// ---------------------------------------------------------------------------------------------------------------------------------------
+G4_DEV int i2_dp4a(int a, int b, int c) {
+#if defined(STRATA_G4_EMU) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610)
+    int r = c;
+    for (int i = 0; i < 4; ++i) r += (int) (int8_t) ((a >> (8 * i)) & 0xff) * (int) (int8_t) ((b >> (8 * i)) & 0xff);
+    return r;
+#else
+    return __dp4a(a, b, c);
+#endif
+}
+G4_DEV uint32_t i2_perm(uint32_t a, uint32_t b, uint32_t s) {      // __byte_perm without the sign mode: selector nibbles are 0 .. 7
+#ifdef STRATA_G4_EMU
+    uint32_t r = 0;
+    const uint64_t v = (uint64_t) a | ((uint64_t) b << 32);
+    for (int i = 0; i < 4; ++i) r |= (uint32_t) ((v >> (8 * ((s >> (4 * i)) & 7))) & 0xffu) << (8 * i);
+    return r;
+#else
+    return __byte_perm(a, b, s);
+#endif
+}
+G4_DEV int i2_ld16(const uint8_t* p) { return (int) (uint32_t) *reinterpret_cast<const uint16_t*>(p); }
+G4_DEV int i2_ld32_b2(const uint8_t* p) { return i2_ld16(p) | (i2_ld16(p + 2) << 16); }          // an int from a 2-byte aligned address
+
+/// The 8 nibbles of q4 (four bytes) through a 16-entry int8 table held in four registers: x = the low nibbles' values (bytes 0 .. 3), y = the high nibbles'.
+G4_DEV void i2_table16(uint32_t q4, uint32_t t0, uint32_t t1, uint32_t t2, uint32_t t3, int& x, int& y) {
+    uint32_t tmp[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const uint32_t sel = (q4 >> (16 * i)) & 0xffffu;
+        const uint32_t lo = i2_perm(t0, t1, sel & 0x7777u);
+        const uint32_t hi = i2_perm(t2, t3, sel & 0x7777u);
+        tmp[i] = i2_perm(lo, hi, 0x3210u | ((sel & 0x8888u) >> 1));
+    }
+    x = (int) i2_perm(tmp[0], tmp[1], 0x6420u);
+    y = (int) i2_perm(tmp[0], tmp[1], 0x7531u);
+}
+
+/// x[row][n] -> xq (int8) and xd (the scale of each block of 32): a warp a block, grid (ceil(n / 256), rows), 256 threads.
+__global__ void __launch_bounds__(256)
+k_quant_x(const float* x, int n, int8_t* xq, float* xd) {
+    const int row = (int) blockIdx.y, warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
+    const int b = (int) blockIdx.x * 8 + warp;
+    if (b * 32 >= n) return;
+    const float v = x[(size_t) row * (size_t) n + (size_t) b * 32 + (size_t) lane];
+    const float amax = g4k::warp_max(fabsf(v));
+    const float d = amax / 127.f;
+    int q = d > 0.f ? (int) rintf(v / d) : 0;
+    q = max(-127, min(127, q));
+    xq[(size_t) row * (size_t) n + (size_t) b * 32 + (size_t) lane] = (int8_t) q;
+    if (lane == 0) xd[(size_t) row * (size_t) (n / 32) + (size_t) b] = d;
+}
+
+/// y[entry * ldy + y_off + r] = (row r of expert grp_exp[entry]) . (entry's activations), a warp a row, 8 warps a block: grid (ceil(n_out / 8), entries).
+/// The activations of an entry are xq + entry * x_stride (x_stride 0: every entry reads the same ones); a matrix that is not an expert's: entries 1, grp_exp null.
+/// T = g4::T_Q8_0: a lane takes 8 values of a block of 32 (4 lanes a block); T = g4::T_NVFP4: a lane a sub-block of 16 (4 lanes a block of 64).
+template <int T>
+__global__ void __launch_bounds__(256)
+k_mv(const uint8_t* w, long long expert_bytes, long long row_bytes, int n_in, int n_out, const int8_t* xq, const float* xd, long long x_stride, const int* grp_exp, float* y, int ldy, int y_off) {
+    const int row = (int) blockIdx.x * 8 + (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31), entry = (int) blockIdx.y;
+    if (row >= n_out) return;
+    const int e = grp_exp ? grp_exp[entry] : 0;
+    const uint8_t* rp = w + (size_t) e * (size_t) expert_bytes + (size_t) row * (size_t) row_bytes;
+    const int8_t* xe = xq + (size_t) entry * (size_t) x_stride;
+    const float* de = xd + (size_t) entry * (size_t) (x_stride / 32);
+    float acc = 0.f;
+    if constexpr (T == g4::T_Q8_0) {
+        const int nb = n_in / 32, part = lane & 3;
+        for (int b = lane >> 2; b < nb; b += 8) {
+            const uint8_t* blk = rp + (size_t) b * 34;
+            const int* xv = reinterpret_cast<const int*>(xe + (size_t) b * 32 + (size_t) part * 8);
+            int s = i2_dp4a(i2_ld32_b2(blk + 2 + part * 8), xv[0], 0);
+            s = i2_dp4a(i2_ld32_b2(blk + 2 + part * 8 + 4), xv[1], s);
+            acc += (float) s * g4::half_to_float((uint16_t) i2_ld16(blk)) * de[b];
+        }
+    } else {
+        const int nb = n_in / 64, sub = lane & 3;
+        for (int b = lane >> 2; b < nb; b += 8) {
+            const uint8_t* blk = rp + (size_t) b * 36;
+            const uint32_t w0 = *reinterpret_cast<const uint32_t*>(blk + 4 + sub * 8), w1 = *reinterpret_cast<const uint32_t*>(blk + 8 + sub * 8);
+            const int* xv = reinterpret_cast<const int*>(xe + (size_t) b * 64 + (size_t) sub * 16);
+            int a0, a1, b0, b1;
+            i2_table16(w0, 0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu, a0, a1);      // the E2M1 values, doubled: 0 1 2 3 4 6 8 12, then their negatives
+            i2_table16(w1, 0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu, b0, b1);
+            int s = i2_dp4a(a0, xv[0], 0);                      // elements 0 .. 3
+            s = i2_dp4a(b0, xv[1], s);                          // 4 .. 7
+            s = i2_dp4a(a1, xv[2], s);                          // 8 .. 11
+            s = i2_dp4a(b1, xv[3], s);                          // 12 .. 15
+            acc += (float) s * g4::ue4m3_half((int) blk[sub]) * de[b * 2 + (sub >> 1)];
+        }
+    }
+    acc = g4k::warp_sum(acc);
+    if (lane == 0) y[(size_t) entry * (size_t) ldy + (size_t) y_off + (size_t) row] = acc;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------
 /// The raw convolution input `back` positions before token t of the chunk (back = 0: the token itself): from the chunk's own buffer, else from the
 /// ring of the visit, else zero before the first position.
 G4_DEV float conv_in(const float* buf, int ld, int c, int t, int back, const float* ring, int ch, int seg_off, int pos0) {
