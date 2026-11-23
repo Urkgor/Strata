@@ -26,9 +26,9 @@ static void fill(int type, std::vector<uint8_t>& row, std::mt19937& rng) {
 int main() {
     std::mt19937 rng(7);
     std::printf("avx2: %s\n", i2cpu::have_avx2() ? "yes" : "no (the portable path only)");
-    for (int type : {g4::T_IQ4_NL, g4::T_Q8_0, g4::T_F16}) {
+    for (int type : {g4::T_IQ4_NL, g4::T_Q8_0, g4::T_NVFP4, g4::T_F16}) {
         const int n = 2304;
-        const size_t rb = (size_t) n / 32 * (size_t) (type == g4::T_F16 ? 64 : g4::block_bytes(type));
+        const size_t rb = (size_t) g4::row_bytes(type, n);
         std::vector<uint8_t> row(rb);
         std::vector<float> x((size_t) n);
         double worst = 0;

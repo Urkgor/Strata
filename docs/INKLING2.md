@@ -7,6 +7,15 @@ engines. Text only. It is its own engine (`src/inkling2/`), built on the Gemma 4
 **Status: not run on a real card.** The CPU reference equals llama.cpp on a tiny random model (F32, F16, Q8_0); the CUDA engine equals the reference on the CPU
 emulation of CUDA. The tokenizer and the server glue match llama.cpp / the model's template on small cases. Speed, VRAM figures and the real 17.6 GB file are untested.
 
+## Which GGUF
+
+Two spellings of the same model are read: **ggml-org's** (`Inkling-2-Mini-IQ4_NL.gguf`: arch `inkling2_loop`, `block_count` 24, the loop's messages as `blk.N.loop_msg_query`) and **Unsloth's**
+(`Inkling-2-Mini-UD-*.gguf`: arch `inkling2`, `block_count` 48 = the layers as visited, `num_loops` and `loop.core_start / core_end`, tensors for the 24 physical layers, the messages as the two global tensors
+`loop_res_query` / `loop_kv_res_query` and the controllers as `blk.N.loop_attn|k|v|mlp_down|gain|forget`). The Unsloth files keep their experts in NVFP4 (ggml type 40) with a per-expert
+`ffn_gate_up_exps.scale` / `ffn_down_exps.scale`, which the engine reads (NVFP4 rows: 64 values, four E4M3 scales, E2M1 nibbles; the scalars multiply the gate+up and down products). The other types of those files
+(Q4_K, Q5_K, Q6_K, IQ4_XS, BF16, ...) were already read. Checked on a tiny model written in both spellings (identical logits) and in NVFP4 with scales (the CPU reference against llama.cpp
+reading the same values as F32: 5e-6); not on the real files.
+
 ## What the model is (llama.cpp `src/models/inkling2.cpp`)
 
 - 24 physical layers; layers 6-17 run 3 times (48 visits), each visit with its own K/V and convolution state. Hidden 2304, 24 query heads over 8 KV heads of 128.

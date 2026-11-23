@@ -67,6 +67,7 @@ void with_type(int t, F&& f) {
         case T_IQ3_XXS: f(std::integral_constant<int, T_IQ3_XXS>{}); break;
         case T_IQ3_S: f(std::integral_constant<int, T_IQ3_S>{}); break;
         case T_MXFP4: f(std::integral_constant<int, T_MXFP4>{}); break;
+        case T_NVFP4: f(std::integral_constant<int, T_NVFP4>{}); break;
         default: std::fprintf(stderr, "strata-inkling2: no kernel for the type %d\n", t); std::exit(1);
     }
 }
@@ -85,8 +86,9 @@ struct DevLayer {
     DevMat wq, wk, wv, wo, wgate, wrel, wsink, kconv_proj, vconv_proj, router, gate_up, down;
     float *attn_norm = nullptr, *q_inp = nullptr, *k_inp = nullptr, *v_inp = nullptr, *q_clip = nullptr, *rel_clip = nullptr, *rel_bias = nullptr;
     float *kconv = nullptr, *vconv = nullptr, *post_conv = nullptr, *ffn_post_conv = nullptr, *attn_res_query = nullptr, *ffn_res_query = nullptr;
-    float *ffn_norm = nullptr, *exp_bias = nullptr;
+    float *ffn_norm = nullptr, *exp_bias = nullptr, *gu_scale = nullptr, *dn_scale = nullptr;
     bool streamed = false;
+    const float* gu_scale_h = nullptr;               // the host copy of gu_scale (the CPU pool applies it; the down scale is the GPU's, in k_expert_sum)
     uint8_t *h_gu = nullptr, *h_dn = nullptr;       // the experts in pinned host memory (a streamed layer)
 };
 
@@ -345,7 +347,7 @@ struct GpuEngine::Impl {
         std::vector<i2cpu::Job> jobs;
         for (int j = 0; j < nj; ++j)
             jobs.push_back({dl.h_gu + (size_t) j * dl.gate_up.expert_bytes, dl.gate_up.type, dl.gate_up.row_bytes, dl.h_dn + (size_t) j * dl.down.expert_bytes, dl.down.type,
-                            dl.down.row_bytes, y.data() + (size_t) j * (size_t) E});
+                            dl.down.row_bytes, y.data() + (size_t) j * (size_t) E, 1.f});
         double t_cpu = 1e300, t_copy = 1e300;
         for (int rep = 0; rep < 4; ++rep) {
             const double t0 = ms_now();
@@ -412,6 +414,8 @@ struct GpuEngine::Impl {
             d.ffn_res_query = uvec(w.ffn_res_query, (size_t) E);
             d.ffn_norm = uvec(w.ffn_norm, (size_t) E);
             if (w.exp_bias) d.exp_bias = uvec(w.exp_bias, (size_t) hp.n_expert);
+            if (w.gu_scale) { d.gu_scale = uvec(w.gu_scale, (size_t) hp.n_expert); d.gu_scale_h = w.gu_scale; }
+            if (w.dn_scale) d.dn_scale = uvec(w.dn_scale, (size_t) hp.n_expert);
             {   // the router as an F32 matrix [n_expert][E]
                 d.router.type = g4::T_F32;
                 d.router.n_in = E;
@@ -625,11 +629,12 @@ struct GpuEngine::Impl {
     }
 
     // ------------------------------------------------------------------------------------------------------------------------ experts
+    const float* cur_gu_scale = nullptr;                 // the layer's per-expert scalar on its gate+up product (null: none)
     void exp_ffn(const DevMat& gu_m, const DevMat& dn, int ng, bool decode, const int* ge, const int* gf, const int* gn, const int* et, const int* er, int rows,
                  const int* situ_rows) {
         const int E = hp.n_embd, F = hp.n_ff_exp;
         mm_exp(gu_m, n0, E, ng, decode, ge, gf, gn, et, er, gu, 2 * F);
-        G4_LAUNCH(i2k::k_situ, dim3((unsigned) ((F + 127) / 128), (unsigned) rows), dim3(g4k::kThreads), st, (const float*) gu, eact, F, hp.situ_beta, hp.situ_lin, situ_rows);
+        G4_LAUNCH(i2k::k_situ, dim3((unsigned) ((F + 127) / 128), (unsigned) rows), dim3(g4k::kThreads), st, (const float*) gu, eact, F, hp.situ_beta, hp.situ_lin, situ_rows, (const float*) cur_gu_scale, (const int*) topk_idx);
         mm_exp(dn, eact, F, ng, decode, ge, gf, gn, er, er, ed, E);
     }
     void upload_groups(const std::vector<int>& gex, const std::vector<int>& gfi, const std::vector<int>& gnn, const std::vector<int>& ent_t, const std::vector<int>& ent_r) {
@@ -641,6 +646,7 @@ struct GpuEngine::Impl {
     }
     /// the experts of a layer on the card (xn = n0): gate+up, SITU, down for every (token, expert) pair, then the weighted sum into `moe`
     void experts(const DevLayer& dl, int ip, int Tn) {
+        cur_gu_scale = dl.gu_scale;
         const int nu = hp.n_used, E = hp.n_embd;
         mm(dl.router, n0, E, Tn, rlog, hp.n_expert);
         G4_LAUNCH(i2k::k_topk, dim3(Tn), dim3(g4k::kThreads), st, (const float*) rlog, (const float*) dl.exp_bias, hp.n_expert, nu, hp.route_scale, topk_idx, topk_w);
@@ -675,7 +681,7 @@ struct GpuEngine::Impl {
             exp_ffn(dl.gate_up, dl.down, (int) gex.size(), false, grp_expert, grp_first, grp_n, ent_tok, ent_row, rows, nullptr);
         }
         G4_LAUNCH(g4k::k_expert_sum, dim3((unsigned) ((E + 127) / 128), (unsigned) Tn), dim3(g4k::kThreads), st, (const float*) ed, (const int*) topk_idx, (const float*) topk_w,
-                  (const float*) nullptr, nu, E, moe);
+                  (const float*) dl.dn_scale, nu, E, moe);
     }
     /// The experts of a layer in host memory: the router's choice is read back, the experts it names are copied into the staging slots (the n_used of a decode
     /// step; for a prompt chunk the experts in batches of stage_slots, each with the groups of pairs that use it).
@@ -756,7 +762,7 @@ struct GpuEngine::Impl {
                     if (!cpu[(size_t) k]) continue;
                     const int e = idx[(size_t) k];
                     jobs.push_back({dl.h_gu + (size_t) e * dl.gate_up.expert_bytes, dl.gate_up.type, dl.gate_up.row_bytes, dl.h_dn + (size_t) e * dl.down.expert_bytes, dl.down.type,
-                                    dl.down.row_bytes, cpu_y.data() + (size_t) k * (size_t) E});
+                                    dl.down.row_bytes, cpu_y.data() + (size_t) k * (size_t) E, dl.gu_scale_h ? dl.gu_scale_h[e] : 1.f});
                     ks.push_back(k);
                 }
                 pool->run(xh_host.data(), E, hp.n_ff_exp, hp.situ_beta, hp.situ_lin, jobs.data(), (int) jobs.size());

@@ -46,6 +46,25 @@ __attribute__((target("avx2,fma"))) float dot_iq4nl_avx2(const uint8_t* row, con
     return hsum256(acc);
 }
 
+__attribute__((target("avx2,fma"))) float dot_nvfp4_avx2(const uint8_t* row, const float* x, int n) {
+    alignas(16) static const int8_t kv[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    const __m128i lut = _mm_load_si128((const __m128i*) kv), m4 = _mm_set1_epi8(0x0F);
+    __m256 acc = _mm256_setzero_ps();
+    for (int b = 0; b < n / 64; ++b) {
+        const uint8_t* p = row + (size_t) b * 36;
+        const float* xp = x + (size_t) b * 64;
+        for (int s = 0; s < 4; ++s) {                       // a sub-block: 16 values, 8 bytes (the low nibbles the first 8 values, the high nibbles the last 8)
+            const __m128i q = _mm_loadl_epi64((const __m128i*) (p + 4 + s * 8));
+            const __m128i lo = _mm_shuffle_epi8(lut, _mm_and_si128(q, m4));
+            const __m128i hi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(q, 4), m4));
+            __m256 t = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo)), _mm256_loadu_ps(xp + s * 16));
+            t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi)), _mm256_loadu_ps(xp + s * 16 + 8), t);
+            acc = _mm256_fmadd_ps(t, _mm256_set1_ps(g4::ue4m3_half(p[s])), acc);
+        }
+    }
+    return hsum256(acc);
+}
+
 __attribute__((target("avx2,fma"))) float dot_q8_0_avx2(const uint8_t* row, const float* x, int n) {
     __m256 acc = _mm256_setzero_ps();
     for (int b = 0; b < n / 32; ++b) {
@@ -91,6 +110,7 @@ float dot_row(int type, const uint8_t* row, const float* x, int n) {
     if (have_avx2()) {
         if (type == g4::T_IQ4_NL) return dot_iq4nl_avx2(row, x, n);
         if (type == g4::T_Q8_0) return dot_q8_0_avx2(row, x, n);
+        if (type == g4::T_NVFP4) return dot_nvfp4_avx2(row, x, n);
     }
 #endif
     return dot_row_generic(type, row, x, n);
@@ -177,7 +197,7 @@ void Pool::run(const float* x, int E, int F, float beta, float lin, const Job* j
     parallel_for((size_t) n * rows1, 16, [&](size_t b, size_t e) {
         for (size_t i = b; i < e; ++i) {
             const size_t j = i / rows1, r = i % rows1;
-            u[i] = dot_row(jobs[j].gu_type, jobs[j].gu + r * jobs[j].gu_row_bytes, x, E);
+            u[i] = jobs[j].gu_scale * dot_row(jobs[j].gu_type, jobs[j].gu + r * jobs[j].gu_row_bytes, x, E);
         }
     });
     parallel_for((size_t) n * (size_t) F, 256, [&](size_t b, size_t e) {

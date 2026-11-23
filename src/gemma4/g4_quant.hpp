@@ -15,7 +15,7 @@ namespace g4 {
 // ggml_type ids (GGUF's tensor types)
 enum QType : int {
     T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q4_1 = 3, T_Q5_0 = 6, T_Q5_1 = 7, T_Q8_0 = 8, T_Q2_K = 10, T_Q3_K = 11, T_Q4_K = 12, T_Q5_K = 13,
-    T_Q6_K = 14, T_IQ2_XXS = 16, T_IQ2_XS = 17, T_IQ3_XXS = 18, T_IQ4_NL = 20, T_IQ3_S = 21, T_IQ2_S = 22, T_IQ4_XS = 23, T_BF16 = 30, T_MXFP4 = 39,
+    T_Q6_K = 14, T_IQ2_XXS = 16, T_IQ2_XS = 17, T_IQ3_XXS = 18, T_IQ4_NL = 20, T_IQ3_S = 21, T_IQ2_S = 22, T_IQ4_XS = 23, T_BF16 = 30, T_MXFP4 = 39, T_NVFP4 = 40,
 };
 
 /// elements per block and bytes per block of a type, 0 when the engine's kernels do not read it
@@ -23,6 +23,7 @@ G4_HD int block_elems(int t) {
     switch (t) {
         case T_F32: case T_F16: case T_BF16: return 32;     // (no blocks: 32 values form a unit)
         case T_Q4_0: case T_Q4_1: case T_Q5_0: case T_Q5_1: case T_Q8_0: case T_IQ4_NL: case T_MXFP4: return 32;
+        case T_NVFP4: return 64;
         case T_Q2_K: case T_Q3_K: case T_Q4_K: case T_Q5_K: case T_Q6_K: case T_IQ4_XS: case T_IQ2_XXS: case T_IQ2_XS: case T_IQ3_XXS: case T_IQ3_S: case T_IQ2_S: return 256;
         default: return 0;
     }
@@ -48,6 +49,7 @@ G4_HD int block_bytes(int t) {
         case T_IQ3_S: return 110;
         case T_IQ2_S: return 82;
         case T_MXFP4: return 17;
+        case T_NVFP4: return 36;
         default: return 0;
     }
 }
@@ -61,6 +63,7 @@ inline const char* type_name(int t) {
         case T_Q4_K: return "Q4_K"; case T_Q5_K: return "Q5_K"; case T_Q6_K: return "Q6_K"; case T_IQ4_NL: return "IQ4_NL"; case T_IQ4_XS: return "IQ4_XS";
         case T_IQ2_XXS: return "IQ2_XXS"; case T_IQ2_XS: return "IQ2_XS"; case T_IQ3_XXS: return "IQ3_XXS"; case T_IQ3_S: return "IQ3_S"; case T_IQ2_S: return "IQ2_S";
         case T_MXFP4: return "MXFP4";
+        case T_NVFP4: return "NVFP4";
         default: return "?";
     }
 }
@@ -164,12 +167,27 @@ G4_HD float e8m0_half(int e) {
     std::memcpy(&f, &u, 4);
     return f;
 }
+/// NVFP4's sub-block scale: ggml_ue4m3_to_fp32 (an unsigned E4M3, 0 and 0x7F read as 0, times 0.5 because the 4-bit values are stored doubled)
+G4_HD float ue4m3_half(int x) {
+    if (x == 0 || x == 0x7F) return 0.f;
+    const int e = (x >> 3) & 0xF, m = x & 7;
+    if (e == 0) return (float) m * 0.0009765625f;                       // m * 2^-9 * 0.5
+    const uint32_t u = ((uint32_t) (e - 8 + 127) << 23) | ((uint32_t) m << 20);   // (1 + m/8) * 2^(e-7) * 0.5
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
 G4_HD int byte_of(unsigned long long g, int j) { return (int) ((g >> (8 * j)) & 0xffull); }
 
 /// The code-book formats (IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S) and MXFP4: element `l` of unit u, as ggml's dequantize_row_* gives it.
 template <int T>
 G4_HD float dequant_elem_cb(const uint8_t* row, long long u, int l) {
-    if constexpr (T == T_MXFP4) {
+    if constexpr (T == T_NVFP4) {                       // 64 values: 4 scales, then 4 sub-blocks of 16 values in 8 bytes (low nibbles the first 8, high nibbles the last 8)
+        const uint8_t* p = row + (u >> 1) * 36;
+        const int sub = (int) ((u & 1) * 2) + (l >> 4), j = l & 15;
+        const int q = p[4 + sub * 8 + (j & 7)];
+        return (float) kvalues_fp4(j < 8 ? (q & 0xF) : (q >> 4)) * ue4m3_half(p[sub]);
+    } else if constexpr (T == T_MXFP4) {
         const uint8_t* p = row + u * 17;
         const int q = p[1 + (l & 15)];
         return (float) kvalues_fp4(l < 16 ? (q & 0xF) : (q >> 4)) * e8m0_half(p[0]);
@@ -336,7 +354,7 @@ G4_HD void dequant32(const uint8_t* row, long long u, float* out) {
             out[j] = dl * (float) kv_iq4nl(qs[j] & 0xf);
             out[j + 16] = dl * (float) kv_iq4nl(qs[j] >> 4);
         }
-    } else if constexpr (T == T_MXFP4 || T == T_IQ2_XXS || T == T_IQ2_XS || T == T_IQ2_S || T == T_IQ3_XXS || T == T_IQ3_S) {
+    } else if constexpr (T == T_NVFP4 || T == T_MXFP4 || T == T_IQ2_XXS || T == T_IQ2_XS || T == T_IQ2_S || T == T_IQ3_XXS || T == T_IQ3_S) {
         for (int j = 0; j < 32; ++j) out[j] = dequant_elem_cb<T>(row, u, j);
     } else {
         for (int j = 0; j < 32; ++j) out[j] = 0.f;
@@ -427,7 +445,7 @@ G4_HD float dequant_elem(const uint8_t* row, long long u, int l) {
         const int ls = ((p[4 + (ib >> 1)] >> (4 * (ib & 1))) & 0xf) | (((rd16(p + 2) >> (2 * ib)) & 3) << 4);
         const int b = p[8 + 16 * ib + (l & 15)];
         return rdh(p) * (float) (ls - 32) * (float) kv_iq4nl(l < 16 ? (b & 0xf) : (b >> 4));
-    } else if constexpr (T == T_MXFP4 || T == T_IQ2_XXS || T == T_IQ2_XS || T == T_IQ2_S || T == T_IQ3_XXS || T == T_IQ3_S) {
+    } else if constexpr (T == T_NVFP4 || T == T_MXFP4 || T == T_IQ2_XXS || T == T_IQ2_XS || T == T_IQ2_S || T == T_IQ3_XXS || T == T_IQ3_S) {
         return dequant_elem_cb<T>(row, u, l);
     } else {
         return 0.f;
@@ -458,6 +476,7 @@ G4_HD void dequant32_t(int t, const uint8_t* row, long long u, float* out) {
         case T_IQ3_XXS: dequant32<T_IQ3_XXS>(row, u, out); break;
         case T_IQ3_S: dequant32<T_IQ3_S>(row, u, out); break;
         case T_MXFP4: dequant32<T_MXFP4>(row, u, out); break;
+        case T_NVFP4: dequant32<T_NVFP4>(row, u, out); break;
         default: for (int j = 0; j < 32; ++j) out[j] = 0.f;
     }
 }

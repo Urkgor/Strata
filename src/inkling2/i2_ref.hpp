@@ -354,13 +354,15 @@ private:
             const int e = order[(size_t) i];
             const float wt = probs[(size_t) e] / wsum * hp_.route_scale;
             matvec(w.gate_up, e, xn.data(), gu.data());
+            if (w.gu_scale) for (float& v : gu) v *= w.gu_scale[e];
             for (int j = 0; j < F; ++j) {
                 const float g = gu[(size_t) j], u = gu[(size_t) F + (size_t) j];
                 const float a = hp_.situ_beta * tanhf(g / hp_.situ_beta) * sigmoid(g);
                 act[(size_t) j] = a * (hp_.situ_lin * tanhf(u / hp_.situ_lin));
             }
             matvec(w.down, e, act.data(), y.data());
-            for (int j = 0; j < E; ++j) moe[(size_t) j] += wt * y[(size_t) j];
+            const float dsc = w.dn_scale ? w.dn_scale[e] : 1.f;
+            for (int j = 0; j < E; ++j) moe[(size_t) j] += wt * dsc * y[(size_t) j];
         }
         std::vector<float> fo;
         convolve(visit, 2 * kd + E, moe.data(), E, w.ffn_post_conv, nullptr, 1, fo);

@@ -24,7 +24,8 @@ struct Job {
     const uint8_t* dn = nullptr;     // [E rows][F columns]
     int dn_type = 0;
     size_t dn_row_bytes = 0;
-    float* y = nullptr;              // [E], the expert's output (without the router's weight)
+    float* y = nullptr;              // [E], the expert's output (without the router's weight, and without the down scalar: the GPU's sum applies it)
+    float gu_scale = 1.f;            // the expert's scalar on the gate+up product (NVFP4 files)
 };
 
 /// the dot product of one weight row of `n` values (type `type`) with x

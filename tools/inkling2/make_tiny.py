@@ -9,6 +9,7 @@ a window of 6, 8 experts with 2 used, a vocabulary of 300 byte-level tokens padd
 llama.cpp runs it (tools/inkling2/llama_ref.cpp), so it is the common ground of the engine's checks.
 """
 import argparse
+import os
 import sys
 
 import numpy as np
@@ -31,6 +32,27 @@ def byte_tokens():
     return [m[b] for b in range(256)]
 
 
+def quantize_nvfp4(arr):
+    """ggml's quantize_row_nvfp4_ref in numpy (gguf-py has the dequantizer only): rows of 64 values -> 36 bytes a block"""
+    import gguf
+    Q = gguf.quants.NVFP4
+    kv = np.array(Q.kvalues, dtype=np.float32)
+    flat = arr.reshape(-1, 16).astype(np.float32)
+    amax = np.abs(flat).max(axis=1)
+    ue = Q.fp32_to_ue4m3(amax / 6.0)
+    d = Q.ue4m3_to_fp32(ue).astype(np.float32)
+    def best(v):
+        # the nearest of kvalues * d (the code book is doubled; d carries the 0.5)
+        cand = kv[None, :] * d[:, None]
+        return np.abs(cand - v[:, None]).argmin(axis=1).astype(np.uint8)
+    lo = np.stack([best(flat[:, j]) for j in range(8)], axis=1)
+    hi = np.stack([best(flat[:, 8 + j]) for j in range(8)], axis=1)
+    qs = (lo | (hi << 4)).astype(np.uint8)                              # [subblocks, 8]
+    nb = flat.shape[0] // 4
+    out = np.concatenate([ue.reshape(nb, 4), qs.reshape(nb, 32)], axis=1).astype(np.uint8)   # [blocks, 36]
+    return out.reshape(*arr.shape[:-1], arr.shape[-1] // 64 * 36)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
@@ -39,6 +61,13 @@ def main():
     ap.add_argument("--gguf-py", default="/tmp/claude-0/ll2/src/gguf-py")
     ap.add_argument("--passes", type=int, default=None)
     ap.add_argument("--mixed", action="store_true", help="experts in F16, those of the last 2 layers in Q8_0 (the real IQ4_NL file mixes types per layer)")
+    ap.add_argument("--layout", default="ggml-org", choices=["ggml-org", "unsloth"], help="unsloth: arch inkling2, block_count counting the visits, num_loops / loop.core_*, the loop's messages as two global tensors")
+    ap.add_argument("--nvfp4", default=None, choices=["nvfp4", "nvfp4rt"], help="experts in NVFP4 with a per-expert .scale tensor (nvfp4rt: the same values written back as F32, for llama.cpp)")
+    ap.add_argument("--no-scale", action="store_true", help="with --nvfp4: leave the per-expert .scale tensors out")
+    ap.add_argument("--scale-only", default=None, choices=["gu", "dn"], help="with --nvfp4: only one of the two .scale tensors (a check of each)")
+    ap.add_argument("--scale-const", type=float, default=None, help="with --nvfp4: every .scale value is this one")
+    ap.add_argument("--fold-scale", action="store_true", help="with --nvfp4rt: the .scale values multiplied into the F32 expert weights, no .scale tensors (the same model as the NVFP4 file with scales, for llama.cpp)")
+    ap.add_argument("--ff", type=int, default=None, help="expert width (default 32; 64 with --nvfp4)")
     ap.add_argument("--pre", default="gpt-2", help="tokenizer.ggml.pre (inkling2: the o200k-style pre-tokenizer of the real model)")
     a = ap.parse_args()
     sys.path.insert(0, a.gguf_py)
@@ -47,18 +76,31 @@ def main():
     c = dict(CFG)
     if a.passes:
         c["passes"] = a.passes
+    if a.ff:
+        c["n_ff_exp"] = a.ff
+    if a.nvfp4:
+        c["n_ff_exp"] = 64                          # NVFP4 blocks hold 64 values: the down matrices' rows (n_ff_exp wide) need it
     rng = np.random.default_rng(a.seed)
     E, H, KV, hd, R, C = c["n_embd"], c["n_head"], c["n_kv"], c["hd"], c["n_rel"], c["n_conv"]
     qd, kd, NE, F = H * hd, KV * hd, c["n_expert"], c["n_ff_exp"]
-    arch = "inkling2_loop"
+    unsloth = a.layout == "unsloth"
+    arch = "inkling2" if unsloth else "inkling2_loop"
     w = gguf.GGUFWriter(a.out, arch)
     swa = [(i % c["block"]) != c["block"] - 1 for i in range(c["n_layer"])]
+    core = c["loop_end"] - c["loop_start"]
+    n_meta = c["n_layer"] + (c["passes"] - 1) * core if unsloth else c["n_layer"]
+    # the layer of each visit (the physical layer a visit runs)
+    phys = list(range(c["loop_end"]))
+    for pss in range(c["passes"] - 1):
+        phys += list(range(c["loop_start"], c["loop_end"]))
+    phys += list(range(c["loop_end"], c["n_layer"]))
+    swa_meta = [swa[ph] for ph in phys] if unsloth else swa
     w.add_name("tiny-inkling2")
-    w.add_block_count(c["n_layer"])
+    w.add_block_count(n_meta)
     w.add_context_length(4096)
     w.add_embedding_length(E)
-    w.add_head_count([H] * c["n_layer"])
-    w.add_head_count_kv([KV] * c["n_layer"])
+    w.add_head_count([H] * n_meta)
+    w.add_head_count_kv([KV] * n_meta)
     w.add_key_length(hd)
     w.add_value_length(hd)
     w.add_key_length_swa(hd)
@@ -71,7 +113,7 @@ def main():
     w.add_expert_used_count(c["n_used"])
     w.add_expert_feed_forward_length(F)
     w.add_sliding_window(c["window"])
-    w.add_sliding_window_pattern(swa)
+    w.add_sliding_window_pattern(swa_meta)
     w.add_shortconv_l_cache(C)
     w.add_expert_weights_scale(c["route_scale"])
     w.add_activation_situ_beta(c["situ_beta"])
@@ -84,11 +126,17 @@ def main():
     w.add_relative_clip(c["rel_clip"])
     w.add_log_scale_floor(int(c["log_floor"]))
     w.add_log_scale_alpha(c["log_alpha"])
-    w.add_loop_start(c["loop_start"])
-    w.add_loop_end(c["loop_end"])
-    w.add_loop_count(c["passes"])
-    w.add_loop_gate_rank(c["rank"])
-    w.add_loop_varying(False)
+    if unsloth:
+        w.add_uint32(arch + ".num_loops", c["passes"])
+        w.add_uint32(arch + ".loop.core_start", c["loop_start"])
+        w.add_uint32(arch + ".loop.core_end", c["loop_end"])
+        w.add_uint32(arch + ".loop.gate_rank", c["rank"])
+    else:
+        w.add_loop_start(c["loop_start"])
+        w.add_loop_end(c["loop_end"])
+        w.add_loop_count(c["passes"])
+        w.add_loop_gate_rank(c["rank"])
+        w.add_loop_varying(False)
     # a byte-level BPE vocabulary: the 256 byte tokens, a few merges, specials
     toks = byte_tokens()
     merges = []
@@ -113,8 +161,27 @@ def main():
     def rnd(*shape, s=0.05):
         return (rng.standard_normal(shape) * s).astype(np.float32)
 
+    def expert_scales(il):
+        sr = np.random.default_rng(a.seed * 7919 + il)
+        sg, sd = (0.5 + sr.random(NE)).astype(np.float32), (0.5 + sr.random(NE)).astype(np.float32)
+        if a.scale_const is not None:
+            sg = np.full(NE, a.scale_const, dtype=np.float32); sd = sg.copy()
+        return sg, sd
+
     def put(name, arr, big=True):
         """big: a weight matrix that takes the chosen type (the rest is F32)"""
+        if a.nvfp4 and "_exps.weight" in name:
+            q = quantize_nvfp4(arr)
+            if a.nvfp4 == "nvfp4rt":                  # the values the engine reads from the NVFP4 file, as F32
+                dq = gguf.quants.dequantize(q, gguf.GGMLQuantizationType.NVFP4).astype(np.float32)
+                if a.fold_scale:
+                    sg, sd = expert_scales(int(name.split(".")[1]))
+                    f = (sg if "gate_up" in name else sd)
+                    dq = dq * (1.0 / f if os.environ.get("I2_FOLD_INV") else f)[:, None, None]
+                w.add_tensor(name, dq)
+            else:
+                w.add_tensor(name, q, raw_dtype=gguf.GGMLQuantizationType.NVFP4)
+            return
         if a.mixed and "_exps" in name:
             if int(name.split(".")[1]) >= c["n_layer"] - 2:
                 w.add_tensor(name, gguf.quants.quantize(arr, gguf.GGMLQuantizationType.Q8_0), raw_dtype=gguf.GGMLQuantizationType.Q8_0)
@@ -169,13 +236,31 @@ def main():
         put(b + "exp_probs_b.bias", rnd(NE, s=0.1), False)
         put(b + "ffn_gate_up_exps.weight", rnd(NE, 2 * F, E))
         put(b + "ffn_down_exps.weight", rnd(NE, E, F))
+        if a.nvfp4 and not a.no_scale and not a.fold_scale:      # per-expert scalars on the products (drawn apart so that the other tensors are the same with or without)
+            sg, sd = expert_scales(il)
+            if a.scale_only != "dn":
+                w.add_tensor(b + "ffn_gate_up_exps.scale", sg)
+            if a.scale_only != "gu":
+                w.add_tensor(b + "ffn_down_exps.scale", sd)
+    msgs = []
     for il in range(c["loop_start"], c["loop_end"]):
         b = f"blk.{il}."
-        put(b + "loop_msg_query.weight", rnd(4, E, s=0.5), False)
-        for k in ("q", "k", "v", "ffn"):
-            put(b + f"loop_{k}_ctrl_down.weight", rnd(c["rank"], 2 * E, s=0.2), False)
-            put(b + f"loop_{k}_ctrl_gain.weight", rnd(E, c["rank"], s=0.4), False)
-            put(b + f"loop_{k}_ctrl_forget.weight", rnd(E, c["rank"], s=0.4), False)
+        msg = rnd(4, E, s=0.5)
+        msgs.append(msg)
+        if not unsloth:
+            put(b + "loop_msg_query.weight", msg, False)
+        for k, ku in zip(("q", "k", "v", "ffn"), ("attn", "k", "v", "mlp")):
+            nm = (lambda t: b + f"loop_{ku}_{t}.weight") if unsloth else (lambda t: b + f"loop_{k}_ctrl_{t}.weight")
+            put(nm("down"), rnd(c["rank"], 2 * E, s=0.2), False)
+            put(nm("gain"), rnd(E, c["rank"], s=0.4), False)
+            put(nm("forget"), rnd(E, c["rank"], s=0.4), False)
+    if unsloth:                                     # core layer i's messages are q[2i], kv[2i], kv[2i+1], q[2i+1] of the two global tensors
+        q = np.zeros((2 * core, E), dtype=np.float32)
+        kv = np.zeros((2 * core, E), dtype=np.float32)
+        for i, m in enumerate(msgs):
+            q[2 * i], kv[2 * i], kv[2 * i + 1], q[2 * i + 1] = m[0], m[1], m[2], m[3]
+        put("loop_res_query.weight", q, False)
+        put("loop_kv_res_query.weight", kv, False)
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()

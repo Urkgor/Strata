@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "llama.h"
+#include "ggml-backend.h"
 
 static std::string unhex(const std::string& h) {
     std::string out;
@@ -61,6 +62,21 @@ int main(int argc, char** argv) {
             while (p < line.size() && (line[p] == ',' || line[p] == ' ')) ++p;
         }
         llama_context_params cp = llama_context_default_params();
+        if (std::getenv("LLAMA_REF_DUMP")) {          // print the first values of the named tensors (a substring, layer 0) of the graph: a debugging aid
+            cp.cb_eval = [](struct ggml_tensor* t, bool ask, void*) -> bool {
+                const std::string want = std::getenv("LLAMA_REF_DUMP");
+                if (std::string(t->name).find(want) == std::string::npos) return false;
+                if (ask) return true;
+                std::vector<float> v((size_t) ggml_nelements(t));
+                if (t->type == GGML_TYPE_F32) ggml_backend_tensor_get(t, v.data(), 0, v.size() * 4);
+                else if (t->type == GGML_TYPE_I32) { std::vector<int32_t> iv(v.size()); ggml_backend_tensor_get(t, iv.data(), 0, iv.size() * 4); for (size_t i = 0; i < v.size(); ++i) v[i] = (float) iv[i]; }
+                else return true;
+                std::fprintf(stderr, "%s [%lld %lld %lld]:", t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2]);
+                for (size_t i = 0; i < std::min<size_t>(v.size(), 6); ++i) std::fprintf(stderr, " %.5g", v[i]);
+                std::fprintf(stderr, "\n");
+                return true;
+            };
+        }
         cp.n_ctx = (uint32_t) std::max<size_t>(512, ids.size() + 8);
         cp.n_batch = cp.n_ubatch = (uint32_t) ids.size();
         cp.type_k = GGML_TYPE_F32;

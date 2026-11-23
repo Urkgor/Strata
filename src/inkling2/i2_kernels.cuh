@@ -280,11 +280,12 @@ k_attn(const float* q, const float* r, const float* rel_bias, const float* sink,
 /// out[r][i] = situ(gate[r][i], up[r][i]) for gu rows [gate | up] of 2 n floats; situ(g, u) = beta tanh(g / beta) sigmoid(g) * lb tanh(u / lb).
 /// The rows r = rows[blockIdx.y] (or blockIdx.y when rows is null).
 __global__ void __launch_bounds__(kThreads)
-k_situ(const float* gu, float* act, int n, float beta, float lb, const int* rows) {
+k_situ(const float* gu, float* act, int n, float beta, float lb, const int* rows, const float* gscale, const int* topk_idx) {
     const int i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= n) return;
     const size_t r = rows ? (size_t) rows[blockIdx.y] : (size_t) blockIdx.y;
-    const float g = gu[r * (size_t) 2 * (size_t) n + (size_t) i], u = gu[r * (size_t) 2 * (size_t) n + (size_t) n + (size_t) i];
+    const float sc = gscale ? gscale[topk_idx[r]] : 1.f;       // the expert's scalar on the gate+up product (NVFP4 files)
+    const float g = sc * gu[r * (size_t) 2 * (size_t) n + (size_t) i], u = sc * gu[r * (size_t) 2 * (size_t) n + (size_t) n + (size_t) i];
     const float a = beta * tanhf(g / beta) * sigmoidf(g);
     act[r * (size_t) n + (size_t) i] = a * (lb * tanhf(u / lb));
 }

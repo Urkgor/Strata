@@ -71,6 +71,7 @@ struct LayerW {
     const float *kconv = nullptr, *vconv = nullptr, *post_conv = nullptr, *ffn_post_conv = nullptr;   // [channels][n_conv]
     const float *attn_res_query = nullptr, *ffn_res_query = nullptr;             // [1 or 3][n_embd], [n_embd]
     const float *ffn_norm = nullptr, *router = nullptr, *exp_bias = nullptr;       // router [n_expert][n_embd]
+    const float *gu_scale = nullptr, *dn_scale = nullptr;                          // per-expert scalars of the gate+up and down products (NVFP4 files; null: 1)
 };
 
 struct Model {
@@ -103,8 +104,21 @@ inline std::string read_hparams(const strata::GgufFile& f, Hparams& hp) {
     if (!arch || (arch->s != "inkling2_loop" && arch->s != "inkling2"))
         return "general.architecture is " + (arch ? "\"" + arch->s + "\"" : std::string("missing")) + ", expected \"inkling2_loop\" (Inkling 2 Mini)";
     const std::string p = arch->s + ".";
-    const bool loop = arch->s == "inkling2_loop";
+    // Two spellings of the same model: ggml-org's (arch inkling2_loop: block_count 24 physical layers, loop.start / end / count) and Unsloth's (arch inkling2: block_count
+    // 48 = the layers as visited, num_loops and loop.core_start / core_end, tensors for the 24 physical layers, the loop's messages as two global tensors)
+    const bool unsloth = arch->s == "inkling2" && f.get(p + "num_loops") != nullptr;
+    const bool loop = arch->s == "inkling2_loop" || unsloth;
     hp.n_layer = (int) meta_int(f, p + "block_count", 0);
+    int n_meta = hp.n_layer;                                  // entries of the per-layer arrays
+    if (unsloth) {
+        hp.loop_start = (int) meta_int(f, p + "loop.core_start", 0);
+        hp.loop_end = (int) meta_int(f, p + "loop.core_end", 0);
+        hp.passes = (int) meta_int(f, p + "num_loops", 0);
+        const int core = hp.loop_end - hp.loop_start;
+        n_meta = hp.n_layer;
+        hp.n_layer = n_meta - (hp.passes - 1) * core;
+        if (core <= 0 || hp.passes < 2 || hp.n_layer <= hp.loop_end) return "invalid loop core / num_loops in the Unsloth spelling (block_count counts the layers as visited)";
+    }
     hp.n_embd = (int) meta_int(f, p + "embedding_length", 0);
     hp.hd = (int) meta_int(f, p + "attention.key_length", 0);
     hp.n_expert = (int) meta_int(f, p + "expert_count", 0);
@@ -140,13 +154,15 @@ inline std::string read_hparams(const strata::GgufFile& f, Hparams& hp) {
         const strata::MetaValue* v = f.get(p + k);
         if (!v) return false;
         out.assign((size_t) hp.n_layer, 0);
-        for (int i = 0; i < hp.n_layer; ++i) {
+        for (int i = 0; i < n_meta; ++i) {                    // (every entry is read: the engine needs them all alike)
+            long long x;
             if (v->type == strata::MetaType::ARRAY) {
-                if ((int) v->count != hp.n_layer || (int) v->items.size() != hp.n_layer) return false;
-                out[(size_t) i] = (long long) v->items[(size_t) i].u;
+                if ((int) v->count != n_meta || (int) v->items.size() != n_meta) return false;
+                x = (long long) v->items[(size_t) i].u;
             } else {
-                out[(size_t) i] = (long long) v->u;
+                x = (long long) v->u;
             }
+            if (i < hp.n_layer) out[(size_t) i] = x;                   // (the visited copies past the physical layers: read, not kept)
         }
         return true;
     };
@@ -165,11 +181,19 @@ inline std::string read_hparams(const strata::GgufFile& f, Hparams& hp) {
     for (long long v : ffe)
         if (v != ffe[0]) return "the engine takes one expert width for every layer";
     const strata::MetaValue* pat = f.get(p + "attention.sliding_window_pattern");
-    if (!pat || pat->type != strata::MetaType::ARRAY || (int) pat->count != hp.n_layer || (int) pat->items.size() != hp.n_layer)
+    if (!pat || pat->type != strata::MetaType::ARRAY || (int) pat->count != n_meta || (int) pat->items.size() != n_meta)
         return "attention.sliding_window_pattern is missing or does not have one entry per layer";
     hp.swa.assign((size_t) hp.n_layer, 0);
-    for (int i = 0; i < hp.n_layer; ++i) hp.swa[(size_t) i] = pat->items[(size_t) i].u ? 1 : 0;
-    if (loop) {
+    const int core_len = hp.loop_end - hp.loop_start;
+    for (int i = 0; i < hp.n_layer; ++i) {
+        const int v = (unsloth && i >= hp.loop_end) ? i + (hp.passes - 1) * core_len : i;      // the first visit of physical layer i
+        hp.swa[(size_t) i] = pat->items[(size_t) v].u ? 1 : 0;
+    }
+    if (unsloth) {
+        hp.gate_rank = (int) meta_int(f, p + "loop.gate_rank", 0);
+        hp.varying = false;
+        if (hp.gate_rank <= 0 || hp.loop_start <= 0 || hp.loop_start % hp.block || hp.loop_end % hp.block) return "invalid loop gate rank / core in the Unsloth spelling";
+    } else if (loop) {
         hp.loop_start = (int) meta_int(f, p + "loop.start", 0);
         hp.loop_end = (int) meta_int(f, p + "loop.end", 0);
         hp.passes = (int) meta_int(f, p + "loop.count", 0);
@@ -192,7 +216,7 @@ inline std::string bind_tensors(Model& m) {
         const strata::TensorInfo* t = find(n);
         if (!t) return required ? "missing tensor " + n : "";
         if (g4::block_elems((int) t->type) == 0)
-            return "tensor " + n + " is " + t->type_name() + ", a type the engine does not read (supported: F32 F16 BF16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K..Q6_K IQ2..IQ4 MXFP4)";
+            return "tensor " + n + " is " + t->type_name() + ", a type the engine does not read (supported: F32 F16 BF16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K..Q6_K IQ2..IQ4 MXFP4 NVFP4)";
         const size_t nd = t->shape.size();
         if (nd > 3 || (long long) t->shape[0] != n_in || (nd > 1 ? (long long) t->shape[1] : 1) != n_out || (nd > 2 ? (long long) t->shape[2] : 1) != n_exp)
             return "tensor " + n + " has another shape than [" + std::to_string(n_in) + ", " + std::to_string(n_out) + (n_exp > 1 ? ", " + std::to_string(n_exp) : "") + "]";
@@ -267,16 +291,37 @@ inline std::string bind_tensors(Model& m) {
         if (!(err = vec(b + "exp_probs_b.bias", hp.n_expert, w.exp_bias, false)).empty()) return err;
         if (!(err = mat(b + "ffn_gate_up_exps.weight", E, 2LL * hp.n_ff_exp, hp.n_expert, w.gate_up, true)).empty()) return err;
         if (!(err = mat(b + "ffn_down_exps.weight", hp.n_ff_exp, E, hp.n_expert, w.down, true)).empty()) return err;
+        if (!(err = vec(b + "ffn_gate_up_exps.scale", hp.n_expert, w.gu_scale, false)).empty()) return err;
+        if (!(err = vec(b + "ffn_down_exps.scale", hp.n_expert, w.dn_scale, false)).empty()) return err;
     }
     if (hp.has_loop()) {
         static const char* kind[4] = {"q", "k", "v", "ffn"};
+        static const char* kind_unsloth[4] = {"attn", "k", "v", "mlp"};          // the Unsloth names of the q, k, v and ffn controllers
         m.loop.assign((size_t) (hp.loop_end - hp.loop_start), LoopW());
+        const int core = hp.loop_end - hp.loop_start;
+        const float *gq = nullptr, *gkv = nullptr;                              // Unsloth: the messages' queries of the whole loop, [2 core][n_embd] each
+        const bool per_block = find("blk." + std::to_string(hp.loop_start) + ".loop_msg_query.weight") != nullptr;
+        if (!per_block) {
+            if (!(err = vec("loop_res_query.weight", 2LL * core * E, gq, true)).empty()) return err;
+            if (!(err = vec("loop_kv_res_query.weight", 2LL * core * E, gkv, true)).empty()) return err;
+        }
         for (int il = hp.loop_start; il < hp.loop_end; ++il) {
             LoopW& l = m.loop[(size_t) (il - hp.loop_start)];
             const std::string b = "blk." + std::to_string(il) + ".";
-            if (!(err = vec(b + "loop_msg_query.weight", 4 * E, l.msg_query, true)).empty()) return err;
+            if (per_block) {
+                if (!(err = vec(b + "loop_msg_query.weight", 4 * E, l.msg_query, true)).empty()) return err;
+            } else {                                                            // core layer i mixes its q, k, v and ffn messages with q[2i], kv[2i], kv[2i+1], q[2i+1]
+                const int i = il - hp.loop_start;
+                m.owned.emplace_back((size_t) (4 * E));
+                float* d = m.owned.back().data();
+                std::copy(gq + (size_t) (2 * i) * E, gq + (size_t) (2 * i + 1) * E, d);
+                std::copy(gkv + (size_t) (2 * i) * E, gkv + (size_t) (2 * i + 1) * E, d + E);
+                std::copy(gkv + (size_t) (2 * i + 1) * E, gkv + (size_t) (2 * i + 2) * E, d + 2 * E);
+                std::copy(gq + (size_t) (2 * i + 1) * E, gq + (size_t) (2 * i + 2) * E, d + 3 * E);
+                l.msg_query = d;
+            }
             for (int c = 0; c < 4; ++c) {
-                const std::string k = b + "loop_" + kind[c] + "_ctrl_";
+                const std::string k = per_block ? b + "loop_" + kind[c] + "_ctrl_" : b + "loop_" + kind_unsloth[c] + "_";
                 if (!(err = vec(k + "down.weight", 2 * E * hp.gate_rank, l.down[c], true)).empty()) return err;
                 if (!(err = vec(k + "gain.weight", E * hp.gate_rank, l.gain[c], true)).empty()) return err;
                 if (!(err = vec(k + "forget.weight", E * hp.gate_rank, l.forget[c], true)).empty()) return err;
