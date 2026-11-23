@@ -141,6 +141,7 @@ void Pool::worker() {
 #ifdef I2_X86
                 _mm_pause();
 #endif
+                if ((spins & 255) == 0) std::this_thread::yield();      // (on a machine with no spare core this lets the thread that launches the GPU's kernels run)
                 continue;
             }
             std::unique_lock<std::mutex> lk(mu_);
