@@ -367,12 +367,12 @@ struct GpuEngine::Impl {
             float* out = gu;
             prep(n0, E, 0);
             auto timed = [&](auto fn) {
-                for (int i = 0; i < 3; ++i) fn();
+                for (int i = 0; i < 300; ++i) fn();                  // (a warm-up long enough for the card to leave its idle clocks)
                 CK(cudaStreamSynchronize(st));
                 const double t0 = ms_now();
-                for (int i = 0; i < 30; ++i) fn();
+                for (int i = 0; i < 100; ++i) fn();
                 CK(cudaStreamSynchronize(st));
-                return (ms_now() - t0) / 30.0;
+                return (ms_now() - t0) / 100.0;
             };
             *t_f = timed([&] { mm(W, n0, E, 1, out, (int) W.n_out); });
             *t_i = timed([&] { mv(W, qslot(0), dslot(0), 0, nullptr, 1, out, (int) W.n_out, 0, 0); });
@@ -647,7 +647,7 @@ struct GpuEngine::Impl {
     int n_qw = 0;
     bool dp_ok[2] = {false, false};                       // Q8_0, NVFP4: the integer kernel is used (a speed check at start decides, --dp4a on|off forces)
     bool dp_any = false;
-    bool dp_type(int t) const { return (t == g4::T_Q8_0 && dp_ok[0]) || (t == g4::T_NVFP4 && dp_ok[1]); }
+    bool dp_type(int t) const { return hp.n_embd <= 4096 && hp.q_dim() <= 4096 && ((t == g4::T_Q8_0 && dp_ok[0]) || (t == g4::T_NVFP4 && dp_ok[1])); }
     int8_t* qslot(int i) const { return xq_ + (size_t) i * (size_t) n_qw; }
     float* dslot(int i) const { return xd_ + (size_t) i * (size_t) (n_qw / 32); }
     void prep(const float* x, int n, int slot) {         // x[n] -> slot `slot`

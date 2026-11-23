@@ -183,13 +183,25 @@ k_quant_x(const float* x, int n, int8_t* xq, float* xd) {
 /// T = g4::T_Q8_0: a lane takes 8 values of a block of 32 (4 lanes a block); T = g4::T_NVFP4: a lane a sub-block of 16 (4 lanes a block of 64).
 template <int T>
 __global__ void __launch_bounds__(256)
-k_mv(const uint8_t* w, long long expert_bytes, long long row_bytes, int n_in, int n_out, const int8_t* xq, const float* xd, long long x_stride, const int* grp_exp, float* y, int ldy, int y_off) {
-    const int row = (int) blockIdx.x * 8 + (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31), entry = (int) blockIdx.y;
+k_mv(const uint8_t* __restrict__ w, long long expert_bytes, long long row_bytes, int n_in, int n_out, const int8_t* __restrict__ xq, const float* __restrict__ xd, long long x_stride,
+     const int* __restrict__ grp_exp, float* __restrict__ y, int ldy, int y_off) {
+    // the entry's activations, once per block into shared memory (every row of the block reads all of them: from the L2, with no L1 on Pascal, that was twice the weights' traffic)
+    __shared__ int xs_i[1024];                                  // up to 4096 int8 values
+    __shared__ float ds[128];
+    const int entry = (int) blockIdx.y;
+    {
+        const int* xg = reinterpret_cast<const int*>(xq + (size_t) entry * (size_t) x_stride);
+        for (int i = (int) threadIdx.x; i < n_in / 4; i += 256) xs_i[i] = xg[i];
+        const float* dg = xd + (size_t) entry * (size_t) (x_stride / 32);
+        for (int i = (int) threadIdx.x; i < n_in / 32; i += 256) ds[i] = dg[i];
+    }
+    __syncthreads();
+    const int row = (int) blockIdx.x * 8 + (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
     if (row >= n_out) return;
     const int e = grp_exp ? grp_exp[entry] : 0;
     const uint8_t* rp = w + (size_t) e * (size_t) expert_bytes + (size_t) row * (size_t) row_bytes;
-    const int8_t* xe = xq + (size_t) entry * (size_t) x_stride;
-    const float* de = xd + (size_t) entry * (size_t) (x_stride / 32);
+    const int8_t* xe = reinterpret_cast<const int8_t*>(xs_i);
+    const float* de = ds;
     float acc = 0.f;
     if constexpr (T == g4::T_Q8_0) {
         const int nb = n_in / 32, part = lane & 3;
