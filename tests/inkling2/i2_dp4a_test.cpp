@@ -63,6 +63,60 @@ int main() {
             cudaFree(dw); cudaFree(dx); cudaFree(dxq); cudaFree(dxd); cudaFree(dy); cudaFree(dge);
         }
     }
+    // reading a prompt: k_mmq, a dense matrix over a ragged number of tokens, and expert groups with gathered rows
+    for (int type : {g4::T_Q8_0, g4::T_NVFP4}) {
+        const int n_in = 2304, n_out = 24, ntok = 37, n_exp = 3;
+        const size_t rb = (size_t) g4::row_bytes(type, n_in), eb = rb * (size_t) n_out;
+        std::vector<uint8_t> w(eb * (size_t) n_exp);
+        for (auto& b : w) b = (uint8_t) rng();
+        const int bb = g4::block_bytes(type);
+        for (size_t o = 0; o + (size_t) bb <= w.size(); o += (size_t) bb) {
+            if (type == g4::T_Q8_0) { const uint16_t h = (uint16_t) (0x2000 | (rng() & 0x3ff)); w[o] = (uint8_t) (h & 0xff); w[o + 1] = (uint8_t) (h >> 8); }
+            else for (int s = 0; s < 4; ++s) w[o + (size_t) s] = (uint8_t) (0x20 + (rng() % 40));
+        }
+        std::vector<float> x((size_t) ntok * (size_t) n_in);
+        for (auto& v : x) v = (float) ((int) (rng() % 2001) - 1000) / 500.f;
+        // experts: 3 groups: expert 2 reads the tokens 5, 9, 30; expert 0 the tokens 0 .. 15; expert 1 the token 36
+        std::vector<int> ge = {2, 0, 1}, gf = {0, 3, 19}, gn = {3, 16, 1}, ein, eout;
+        for (int t : {5, 9, 30}) ein.push_back(t);
+        for (int t = 0; t < 16; ++t) ein.push_back(t);
+        ein.push_back(36);
+        for (int i = 0; i < (int) ein.size(); ++i) eout.push_back(ntok - 1 - i);                // (the outputs go to other rows than the inputs came from)
+        uint8_t* dw; float *dx, *dxd, *dy; int8_t* dxq; int *dge, *dgf, *dgn, *dei, *deo;
+        auto up = [&](auto*& d, const auto& v) { cudaMalloc((void**) &d, v.size() * sizeof(v[0])); cudaMemcpy(d, v.data(), v.size() * sizeof(v[0]), cudaMemcpyHostToDevice); };
+        up(dw, w); up(dx, x); up(dge, ge); up(dgf, gf); up(dgn, gn); up(dei, ein); up(deo, eout);
+        cudaMalloc((void**) &dxq, x.size()); cudaMalloc((void**) &dxd, x.size() / 8 + 64); cudaMalloc((void**) &dy, (size_t) ntok * (size_t) n_out * 4);
+        G4_LAUNCH(i2k::k_quant_x, dim3((unsigned) ((n_in / 32 + 7) / 8), (unsigned) ntok), dim3(256), 0, dx, n_in, dxq, dxd);
+        auto run = [&](auto tag, bool dense) {
+            constexpr int TY = decltype(tag)::value;
+            if (dense) G4_LAUNCH((i2k::k_mmq<TY, 16>), dim3((unsigned) ((n_out + 7) / 8), (unsigned) ((ntok + 15) / 16)), dim3(256), 0, dw, (long long) eb, (long long) rb, n_in, n_out, (const int8_t*) dxq,
+                                 (const float*) dxd, (const int*) nullptr, (const int*) nullptr, (const int*) nullptr, (const int*) nullptr, (const int*) nullptr, ntok, dy, n_out, 0);
+            else G4_LAUNCH((i2k::k_mmq<TY, 16>), dim3((unsigned) ((n_out + 7) / 8), 3u), dim3(256), 0, dw, (long long) eb, (long long) rb, n_in, n_out, (const int8_t*) dxq, (const float*) dxd,
+                           (const int*) dge, (const int*) dgf, (const int*) dgn, (const int*) dei, (const int*) deo, ntok, dy, n_out, 0);
+        };
+        std::vector<float> y((size_t) ntok * (size_t) n_out), wrow((size_t) n_in);
+        for (int dense = 1; dense >= 0; --dense) {
+            cudaMemset(dy, 0, y.size() * 4);
+            if (type == g4::T_Q8_0) run(std::integral_constant<int, g4::T_Q8_0>{}, dense); else run(std::integral_constant<int, g4::T_NVFP4>{}, dense);
+            cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost);
+            double d2 = 0, s2 = 0;
+            const int n_ent = dense ? ntok : (int) ein.size();
+            for (int k = 0; k < n_ent; ++k) {
+                const int xr = dense ? k : ein[(size_t) k], yr = dense ? k : eout[(size_t) k];
+                const int e = dense ? 0 : (k < 3 ? 2 : k < 19 ? 0 : 1);
+                for (int r = 0; r < n_out; ++r) {
+                    g4::dequant_row(type, w.data() + (size_t) e * eb + (size_t) r * rb, n_in, wrow.data());
+                    double dot = 0;
+                    for (int i = 0; i < n_in; ++i) dot += (double) wrow[(size_t) i] * x[(size_t) xr * (size_t) n_in + (size_t) i];
+                    const double got = y[(size_t) yr * (size_t) n_out + (size_t) r];
+                    d2 += (got - dot) * (got - dot);
+                    s2 += dot * dot;
+                }
+            }
+            const double rel = std::sqrt(d2 / std::max(s2, 1e-30));
+            EXPECT(rel < 1.5e-2, "type %d, k_mmq %s (%d entries): rms error against the float dot %.2e", type, dense ? "dense over 37 tokens" : "expert groups with gathered rows", n_ent, rel);
+        }
+    }
     std::printf(fails ? "%d FAILED\n" : "i2_dp4a_test: all pass\n", fails);
     return fails ? 1 : 0;
 }

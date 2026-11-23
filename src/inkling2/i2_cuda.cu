@@ -354,6 +354,7 @@ struct GpuEngine::Impl {
     /// The integer decode kernels, where they are faster: a Q8_0 dense matrix and an NVFP4 expert matrix of the model timed with the float kernel and the integer one.
     void setup_dp() {
         dp_ok[0] = dp_ok[1] = dp_any = false;
+        pf_ok[0] = pf_ok[1] = pf_any = false;
         if (opt.dp4a == 0) return;
         const DevMat *m8 = nullptr, *m4 = nullptr;
         bool m4_streamed = false;
@@ -378,14 +379,40 @@ struct GpuEngine::Impl {
             *t_f = timed([&] { mm(W, n0, E, 1, out, (int) W.n_out); });
             *t_i = timed([&] { mv(W, qslot(0), dslot(0), 0, nullptr, 1, out, (int) W.n_out, 0, 0); });
         };
-        double f8 = 0, i8 = 0, f4 = 0, i4 = 0;
+        // reading a prompt: 16 tokens through the float kernel and through k_mmq
+        auto bench_pf = [&](const DevMat& W0, bool staged, double* t_f, double* t_i) {
+            DevMat W = W0;
+            if (staged) W.d = stgA;
+            const int Tn = std::min(16, chunk);
+            float* out = gu;
+            if (Tn < 2) { *t_f = *t_i = 0; return; }
+            G4_LAUNCH(i2k::k_quant_x, dim3((unsigned) ((E / 32 + 7) / 8), (unsigned) Tn), dim3(256), st, (const float*) n0, E, pslot(0), pdslot(0));
+            auto timed = [&](auto fn) {
+                for (int i = 0; i < 60; ++i) fn();
+                CK(cudaStreamSynchronize(st));
+                const double t0 = ms_now();
+                for (int i = 0; i < 30; ++i) fn();
+                CK(cudaStreamSynchronize(st));
+                return (ms_now() - t0) / 30.0;
+            };
+            *t_f = timed([&] { mm(W, n0, E, Tn, out, (int) W.n_out); });
+            *t_i = timed([&] { mmq(W, pslot(0), pdslot(0), 1, nullptr, nullptr, nullptr, nullptr, nullptr, Tn, out, (int) W.n_out, 0, 0); });
+        };
+        double f8 = 0, i8 = 0, f4 = 0, i4 = 0, pf8 = 0, pi8 = 0, pf4 = 0, pi4 = 0;
         if (m8 && (int) m8->n_in == E) { bench(*m8, false, &f8, &i8); dp_ok[0] = opt.dp4a == 1 || i8 < 0.9 * f8; }
         if (m4 && (int) m4->n_in == E && !(m4_streamed && !stgA)) { bench(*m4, m4_streamed, &f4, &i4); dp_ok[1] = opt.dp4a == 1 || i4 < 0.9 * f4; }
+        if (m8 && (int) m8->n_in == E) { bench_pf(*m8, false, &pf8, &pi8); pf_ok[0] = std::min(16, chunk) >= 2 && (opt.dp4a == 1 || pi8 < 0.9 * pf8); }
+        if (m4 && (int) m4->n_in == E && !(m4_streamed && !stgA)) { bench_pf(*m4, m4_streamed, &pf4, &pi4); pf_ok[1] = std::min(16, chunk) >= 2 && (opt.dp4a == 1 || pi4 < 0.9 * pf4); }
         dp_any = dp_ok[0] || dp_ok[1];
+        pf_any = pf_ok[0] || pf_ok[1];
         if (opt.verbose && (m8 || m4)) {
             std::fprintf(stderr, "strata-inkling2: integer decode kernels (--dp4a on|off|auto):");
             if (m8) std::fprintf(stderr, " Q8_0 matrix %.3f ms (float kernel %.3f): %s;", i8, f8, dp_ok[0] ? "used" : "not used");
             if (m4) std::fprintf(stderr, " NVFP4 expert matrix %.3f ms (float kernel %.3f): %s;", i4, f4, dp_ok[1] ? "used" : "not used");
+            std::fprintf(stderr, "\n");
+            std::fprintf(stderr, "strata-inkling2: integer prompt kernels, 16 tokens:");
+            if (m8) std::fprintf(stderr, " Q8_0 matrix %.3f ms (float kernel %.3f): %s;", pi8, pf8, pf_ok[0] ? "used" : "not used");
+            if (m4) std::fprintf(stderr, " NVFP4 expert matrix %.3f ms (float kernel %.3f): %s;", pi4, pf4, pf_ok[1] ? "used" : "not used");
             std::fprintf(stderr, "\n");
         }
     }
@@ -553,6 +580,13 @@ struct GpuEngine::Impl {
         const size_t qe = (size_t) std::max(8, hp.n_used) * (size_t) hp.n_ff_exp;
         xq_ = alloc<int8_t>((size_t) 4 * (size_t) n_qw + std::max<size_t>(qe, (size_t) n_qw) + 64);
         xd_ = alloc<float>(((size_t) 4 * (size_t) n_qw + std::max<size_t>(qe, (size_t) n_qw)) / 32 + 16);
+        {   // a prompt chunk's: 4 slots of chunk rows, and the experts' pair rows
+            const size_t sl = (size_t) chunk * (size_t) n_qw, pe = (size_t) chunk * (size_t) hp.n_used * (size_t) hp.n_ff_exp;
+            pxq_ = alloc<int8_t>(4 * sl + 64);
+            pxd_ = alloc<float>(4 * sl / 32 + 16);
+            pxe_ = alloc<int8_t>(pe + 64);
+            pxed_ = alloc<float>(pe / 32 + 16);
+        }
         ctrl_gate = alloc<float>(T * (size_t) std::max(hp.gate_rank, 1));
         pm_ = alloc<float>((size_t) H * (size_t) std::max(1, opt.attn_max_split));
         pl_ = alloc<float>((size_t) H * (size_t) std::max(1, opt.attn_max_split));
@@ -660,6 +694,16 @@ struct GpuEngine::Impl {
     bool dp_ok[2] = {false, false};                       // Q8_0, NVFP4: the integer kernel is used (a speed check at start decides, --dp4a on|off forces)
     bool dp_any = false;
     bool dp_type(int t) const { return hp.n_embd <= 4096 && hp.q_dim() <= 4096 && ((t == g4::T_Q8_0 && dp_ok[0]) || (t == g4::T_NVFP4 && dp_ok[1])); }
+    bool pf_ok[2] = {false, false};                       // the same for reading a prompt (k_mmq): Q8_0, NVFP4
+    bool pf_any = false;
+    bool pf_type(int t) const { return hp.n_embd <= 4096 && hp.q_dim() <= 4096 && ((t == g4::T_Q8_0 && pf_ok[0]) || (t == g4::T_NVFP4 && pf_ok[1])); }
+    int8_t* pxq_ = nullptr;                               // a prompt chunk's quantized activations: 4 slots of chunk * n_qw values, then the experts' pair rows
+    float* pxd_ = nullptr;
+    int cur_Tn = 1;
+    int8_t* pxe_ = nullptr;                               // the experts' activation rows of a prompt chunk (one per pair)
+    float* pxed_ = nullptr;
+    int8_t* pslot(int i) const { return pxq_ + (size_t) i * (size_t) chunk * (size_t) n_qw; }
+    float* pdslot(int i) const { return pxd_ + (size_t) i * (size_t) chunk * (size_t) (n_qw / 32); }
     int8_t* qslot(int i) const { return xq_ + (size_t) i * (size_t) n_qw; }
     float* dslot(int i) const { return xd_ + (size_t) i * (size_t) (n_qw / 32); }
     void prep(const float* x, int n, int slot) {         // x[n] -> slot `slot`
@@ -672,9 +716,26 @@ struct GpuEngine::Impl {
         else
             G4_LAUNCH(G4_K(i2k::k_mv<g4::T_NVFP4>), grid, block, st, W.d, expert_bytes, (long long) W.row_bytes, (int) W.n_in, (int) W.n_out, xq, xd, x_stride, ge, y, ldy, y_off);
     }
-    /// y = W x for the Tn tokens of x (ldx); one token whose activations are in `slot` and a matrix of a type with an integer kernel: that kernel, else the float one
+    void prep_any(const float* x, int n, int Tn, int slot) {      // the Tn tokens of x into slot `slot` of the decode or the prompt buffers
+        if (Tn == 1) prep(x, n, slot);
+        else G4_LAUNCH(i2k::k_quant_x, dim3((unsigned) ((n / 32 + 7) / 8), (unsigned) Tn), dim3(256), st, x, n, pslot(slot), pdslot(slot));
+    }
+    bool q_on(int Tn) const { return Tn == 1 ? dp_any : pf_any; }
+    template <int T>
+    void mmq_t(const DevMat& W, const int8_t* xq, const float* xd, int ng, const int* ge, const int* gf, const int* gn, const int* ei, const int* eo, int ntok, float* y, int ldy, int y_off,
+               long long expert_bytes) {
+        G4_LAUNCH(G4_K((i2k::k_mmq<T, 16>)), dim3((unsigned) ((W.n_out + 7) / 8), (unsigned) ng), dim3(256), st, W.d, expert_bytes, (long long) W.row_bytes, (int) W.n_in, (int) W.n_out, xq, xd, ge, gf, gn, ei, eo,
+                  ntok, y, ldy, y_off);
+    }
+    void mmq(const DevMat& W, const int8_t* xq, const float* xd, int ng, const int* ge, const int* gf, const int* gn, const int* ei, const int* eo, int ntok, float* y, int ldy, int y_off,
+             long long expert_bytes) {
+        if (W.type == g4::T_Q8_0) mmq_t<g4::T_Q8_0>(W, xq, xd, ng, ge, gf, gn, ei, eo, ntok, y, ldy, y_off, expert_bytes);
+        else mmq_t<g4::T_NVFP4>(W, xq, xd, ng, ge, gf, gn, ei, eo, ntok, y, ldy, y_off, expert_bytes);
+    }
+    /// y = W x for the Tn tokens of x (ldx), whose activations are in `slot` (-1: not quantized): one token and a type with an integer kernel: that; a prompt chunk and k_mmq: that; else the float kernel
     void mmd(const DevMat& W, const float* x, int ldx, int Tn, float* y, int ldy, int slot, int y_off = 0) {
-        if (Tn == 1 && slot >= 0 && dp_type(W.type)) mv(W, qslot(slot), dslot(slot), 0, nullptr, 1, y, ldy, y_off, 0);
+        if (slot >= 0 && Tn == 1 && dp_type(W.type)) mv(W, qslot(slot), dslot(slot), 0, nullptr, 1, y, ldy, y_off, 0);
+        else if (slot >= 0 && Tn > 1 && pf_type(W.type)) mmq(W, pslot(slot), pdslot(slot), (Tn + 15) / 16, nullptr, nullptr, nullptr, nullptr, nullptr, Tn, y, ldy, y_off, 0);
         else mm(W, x, ldx, Tn, y, ldy, y_off);
     }
 
@@ -786,6 +847,15 @@ struct GpuEngine::Impl {
             mv(dn, eq, ed_, (long long) F, ge, ng, ed, E, 0, (long long) dn.expert_bytes);
             return;
         }
+        if (!decode && pf_type(gu_m.type) && pf_type(dn.type) && F % 32 == 0) {          // a prompt chunk: the experts' groups by k_mmq
+            prep_any(n0, E, cur_Tn, 0);
+            mmq(gu_m, pslot(0), pdslot(0), ng, ge, gf, gn, et, er, cur_Tn, gu, 2 * F, 0, (long long) gu_m.expert_bytes);
+            G4_LAUNCH(i2k::k_situ, dim3((unsigned) ((F + 127) / 128), (unsigned) rows), dim3(g4k::kThreads), st, (const float*) gu, eact, F, hp.situ_beta, hp.situ_lin, situ_rows,
+                      (const float*) cur_gu_scale, (const int*) topk_idx);
+            G4_LAUNCH(i2k::k_quant_x, dim3((unsigned) ((F / 32 + 7) / 8), (unsigned) (cur_Tn * hp.n_used)), dim3(256), st, (const float*) eact, F, pxe_, pxed_);
+            mmq(dn, pxe_, pxed_, ng, ge, gf, gn, er, er, cur_Tn * hp.n_used, ed, E, 0, (long long) dn.expert_bytes);
+            return;
+        }
         mm_exp(gu_m, n0, E, ng, decode, ge, gf, gn, et, er, gu, 2 * F);
         G4_LAUNCH(i2k::k_situ, dim3((unsigned) ((F + 127) / 128), (unsigned) rows), dim3(g4k::kThreads), st, (const float*) gu, eact, F, hp.situ_beta, hp.situ_lin, situ_rows, (const float*) cur_gu_scale, (const int*) topk_idx);
         mm_exp(dn, eact, F, ng, decode, ge, gf, gn, er, er, ed, E);
@@ -800,6 +870,7 @@ struct GpuEngine::Impl {
     /// the experts of a layer on the card (xn = n0): gate+up, SITU, down for every (token, expert) pair, then the weighted sum into `moe`
     void experts(const DevLayer& dl, int ip, int Tn) {
         cur_gu_scale = dl.gu_scale;
+        cur_Tn = Tn;
         const int nu = hp.n_used, E = hp.n_embd;
         mm(dl.router, n0, E, Tn, rlog, hp.n_expert);
         G4_LAUNCH(i2k::k_topk, dim3(Tn), dim3(g4k::kThreads), st, (const float*) rlog, (const float*) dl.exp_bias, hp.n_expert, nu, hp.route_scale, topk_idx, topk_w);
@@ -1003,19 +1074,20 @@ struct GpuEngine::Impl {
         }
         lap_(prof, 0, dl.streamed);                               // (the mixes, controls and norms before the projections)
         int sk = -1, sv = -1;                                     // the quantized-activation slots of the k and v inputs (-1: not quantized)
-        if (Tn == 1 && dp_any) {
-            prep(nq0, E, 0);
+        const bool qon = q_on(Tn);
+        if (qon) {
+            prep_any(nq0, E, Tn, 0);
             sk = nk == nq0 ? 0 : 1;
-            if (sk == 1) prep(nk, E, 1);
+            if (sk == 1) prep_any(nk, E, Tn, 1);
             sv = nv == nq0 ? 0 : nv == nk ? sk : 2;
-            if (sv == 2) prep(nv, E, 2);
+            if (sv == 2) prep_any(nv, E, Tn, 2);
         }
-        mmd(dl.wq, nq0, E, Tn, q, qd, Tn == 1 && dp_any ? 0 : -1);
+        mmd(dl.wq, nq0, E, Tn, q, qd, qon ? 0 : -1);
         mmd(dl.wk, nk, E, Tn, kraw, kd, sk);
         mmd(dl.wv, nv, E, Tn, vraw, kd, sv);
-        mmd(dl.wrel, nq0, E, Tn, r, hp.n_head * hp.n_rel, Tn == 1 && dp_any ? 0 : -1);
-        mmd(dl.wsink, nq0, E, Tn, sink, hp.n_head, Tn == 1 && dp_any ? 0 : -1);
-        mmd(dl.wgate, nq0, E, Tn, gate, qd, Tn == 1 && dp_any ? 0 : -1);
+        mmd(dl.wrel, nq0, E, Tn, r, hp.n_head * hp.n_rel, qon ? 0 : -1);
+        mmd(dl.wsink, nq0, E, Tn, sink, hp.n_head, qon ? 0 : -1);
+        mmd(dl.wgate, nq0, E, Tn, gate, qd, qon ? 0 : -1);
         if (!swa) {
             mm(dl.kconv_proj, nk, E, Tn, ktap, hp.n_conv * hp.n_kv);
             mm(dl.vconv_proj, nv, E, Tn, vtap, hp.n_conv * hp.n_kv);
@@ -1028,8 +1100,8 @@ struct GpuEngine::Impl {
         ring_store(vraw, kd, V.cring, kd, Tn, pos0);
         attention(ip, V, Tn, pos0);
         lap_(prof, 2, dl.streamed);                               // (the head preparation, the cache writes and the attention)
-        if (Tn == 1 && dp_any) prep(att, qd, 3);
-        mmd(dl.wo, att, qd, Tn, proj, E, Tn == 1 && dp_any ? 3 : -1);
+        if (qon) prep_any(att, qd, Tn, 3);
+        mmd(dl.wo, att, qd, Tn, proj, E, qon ? 3 : -1);
         const bool push = ip % hp.block == 0;
         conv_res(proj, dl.post_conv, V.cring, 2 * kd, Tn, pos0, push ? nullptr : sa, cur);
         ring_store(proj, E, V.cring, 2 * kd, Tn, pos0);
@@ -1134,7 +1206,7 @@ std::string GpuEngine::init() { return p_->init(); }
 int GpuEngine::ctx() const { return p_->ctx; }
 int GpuEngine::n_vocab() const { return p_->hp.n_vocab; }
 int64_t GpuEngine::pos() const { return p_->pos; }
-bool GpuEngine::dp_active() const { return p_->dp_any; }
+bool GpuEngine::dp_active() const { return p_->dp_any || p_->pf_any; }
 void GpuEngine::profile_reset() { p_->pf = Impl::Prof(); }
 std::string GpuEngine::profile_report() const {
     const auto& f = p_->pf;

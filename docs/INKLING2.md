@@ -57,7 +57,8 @@ Options: `--max-context N`, `--gpu N` (one card only), `--prefill N` (512), `--s
 A decoded token's Q8_0 and NVFP4 matrices (the dense projections, the head, and the experts of the NVFP4 files) are read by integer arithmetic: the activations are quantized once to int8 blocks of 32 and each
 row takes 4 products at a time (dp4a, Pascal and later), as llama.cpp's mmvq does, with the same 0.4 % of noise on the activations; every other type, and the prompt, keep the float kernels.
 `--dp4a off` turns it off, and `--check` then compares with 2e-3 instead of 3e-2. `--profile` prints where a decoded token's time goes, phase by phase, and how much of it the host spent queueing.
-The mix and the loop controller run in several blocks. Measured on a GTX 1080 Ti with UD-Q4_K_M: 9.0 tok/s before the controller change, 11.4 after it; the integer kernels are not measured yet.
+A prompt chunk takes the same road for Q8_0 and NVFP4: the weights of a row are decoded once and used for 16 tokens (or 16 (token, expert) pairs of one expert) at a time, the activations staged in shared
+memory in slices (`k_mmq`); the speed check at start times it against the float kernel too. The mix and the loop controller run in several blocks. Measured on a GTX 1080 Ti with UD-Q4_K_M: 9.0 tok/s before the controller change, 11.4 after it; the integer kernels are not measured yet.
 
 ## Long contexts
 

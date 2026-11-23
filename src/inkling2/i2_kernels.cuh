@@ -232,6 +232,90 @@ k_mv(const uint8_t* __restrict__ w, long long expert_bytes, long long row_bytes,
     if (lane == 0) y[(size_t) entry * (size_t) ldy + (size_t) y_off + (size_t) row] = acc;
 }
 
+/// Reading a prompt by the same integer arithmetic: NT tokens (or (token, expert) pairs of one expert) a block, a warp a row, the weights decoded once per row and
+/// slice and used for all NT.  The activations of the group are staged in shared memory in slices of 512 values.  Grid (ceil(n_out / 8), groups), 256 threads.
+///   dense matrix (grp_exp null): group g = tokens g * NT .. of ntok, rows of x and y the token's own;
+///   experts: group g of grp_exp[g] / grp_first[g] / grp_cnt[g] (the tables mm_exp reads): entry i reads row ent_in[first + i] of the activations and writes row
+///   ent_out[first + i] of y.
+template <int T, int NT>
+__global__ void __launch_bounds__(256)
+k_mmq(const uint8_t* __restrict__ w, long long expert_bytes, long long row_bytes, int n_in, int n_out, const int8_t* __restrict__ xq, const float* __restrict__ xd,
+      const int* __restrict__ grp_exp, const int* __restrict__ grp_first, const int* __restrict__ grp_cnt, const int* __restrict__ ent_in, const int* __restrict__ ent_out,
+      int ntok, float* __restrict__ y, int ldy, int y_off) {
+    constexpr int KS = 512;
+    __shared__ int xs_i[NT * KS / 4];
+    __shared__ float ds[NT * (KS / 32)];
+    __shared__ int rows_in[NT];
+    const int g = (int) blockIdx.y, tid = (int) threadIdx.x, lane = tid & 31;
+    int e = 0, first, cnt;
+    if (grp_exp) { e = grp_exp[g]; first = grp_first[g]; cnt = grp_cnt[g]; }
+    else { first = g * NT; cnt = min(NT, ntok - first); }
+    if (tid < NT) rows_in[tid] = tid < cnt ? (ent_in ? ent_in[first + tid] : first + tid) : 0;
+    __syncthreads();
+    const int row = (int) blockIdx.x * 8 + (tid >> 5);
+    const uint8_t* rp = w + (size_t) e * (size_t) expert_bytes + (size_t) (row < n_out ? row : 0) * (size_t) row_bytes;
+    float acc[NT];
+#pragma unroll
+    for (int i = 0; i < NT; ++i) acc[i] = 0.f;
+    for (int k0 = 0; k0 < n_in; k0 += KS) {
+        const int kn = min(KS, n_in - k0);
+        for (int idx = tid; idx < cnt * (kn / 4); idx += 256) {
+            const int i = idx / (kn / 4), j = idx % (kn / 4);
+            xs_i[i * (KS / 4) + j] = reinterpret_cast<const int*>(xq + (size_t) rows_in[i] * (size_t) n_in + (size_t) k0)[j];
+        }
+        for (int idx = tid; idx < cnt * (kn / 32); idx += 256) {
+            const int i = idx / (kn / 32), j = idx % (kn / 32);
+            ds[i * (KS / 32) + j] = xd[(size_t) rows_in[i] * (size_t) (n_in / 32) + (size_t) (k0 / 32) + (size_t) j];
+        }
+        __syncthreads();
+        if constexpr (T == g4::T_Q8_0) {
+            const int nb = kn / 32, part = lane & 3;
+            for (int b = lane >> 2; b < nb; b += 8) {
+                const uint8_t* blk = rp + (size_t) (k0 / 32 + b) * 34;
+                const int w0 = i2_ld32_b2(blk + 2 + part * 8), w1 = i2_ld32_b2(blk + 2 + part * 8 + 4);
+                const float dw = g4::half_to_float((uint16_t) i2_ld16(blk));
+#pragma unroll
+                for (int i = 0; i < NT; ++i) {
+                    if (i < cnt) {
+                        const int* xv = xs_i + i * (KS / 4) + b * 8 + part * 2;
+                        const int s = i2_dp4a(w1, xv[1], i2_dp4a(w0, xv[0], 0));
+                        acc[i] += (float) s * dw * ds[i * (KS / 32) + b];
+                    }
+                }
+            }
+        } else {
+            const int nb = kn / 64, sub = lane & 3;
+            for (int b = lane >> 2; b < nb; b += 8) {
+                const uint8_t* blk = rp + (size_t) (k0 / 64 + b) * 36;
+                const uint32_t w0 = *reinterpret_cast<const uint32_t*>(blk + 4 + sub * 8), w1 = *reinterpret_cast<const uint32_t*>(blk + 8 + sub * 8);
+                int a0, a1, b0, b1;
+                i2_table16(w0, 0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu, a0, a1);
+                i2_table16(w1, 0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu, b0, b1);
+                const float dw = g4::ue4m3_half((int) blk[sub]);
+#pragma unroll
+                for (int i = 0; i < NT; ++i) {
+                    if (i < cnt) {
+                        const int* xv = xs_i + i * (KS / 4) + b * 16 + sub * 4;
+                        int s = i2_dp4a(a0, xv[0], 0);
+                        s = i2_dp4a(b0, xv[1], s);
+                        s = i2_dp4a(a1, xv[2], s);
+                        s = i2_dp4a(b1, xv[3], s);
+                        acc[i] += (float) s * dw * ds[i * (KS / 32) + b * 2 + (sub >> 1)];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < NT; ++i) {
+        if (i < cnt) {
+            const float v = g4k::warp_sum(acc[i]);
+            if (lane == 0 && row < n_out) y[(size_t) (ent_out ? ent_out[first + i] : first + i) * (size_t) ldy + (size_t) y_off + (size_t) row] = v;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------------------
 /// The raw convolution input `back` positions before token t of the chunk (back = 0: the token itself): from the chunk's own buffer, else from the
 /// ring of the visit, else zero before the first position.
