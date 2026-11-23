@@ -78,8 +78,13 @@ class Translator(unittest.TestCase):
         got = translate('<|message_model|>f<|content_invoke_tool_json|>{"name":"f","args":{"a":"par', False)
         self.assertTrue(got.endswith("par\n</parameter>\n</function>\n</tool_call>\n"), got)
 
-    def test_a_call_that_is_not_json_is_left_out(self):
-        self.assertEqual(translate("<|message_model|>f<|content_invoke_tool_json|>nonsense<|end_message|><|message_model|><|content_text|>ok<|end_message|>", False), "ok")
+    def test_a_call_that_is_not_json_is_text(self):
+        self.assertEqual(translate("<|message_model|>f<|content_invoke_tool_json|>nonsense<|end_message|><|message_model|><|content_text|>ok<|end_message|>", False), "nonsenseok")
+        self.assertEqual(translate("<|message_model|>f<|content_invoke_tool_json|>cut off", False), "cut off")
+
+    def test_broken_json_is_a_call_with_the_raw_text(self):
+        got = translate('<|message_model|>f<|content_invoke_tool_json|>{"nom":"f","args":{"a": tru<|end_message|>', False)
+        self.assertEqual(got, '<tool_call>\n<function=f>\n<parameter=raw>\n{"nom":"f","args":{"a": tru\n</parameter>\n</function>\n</tool_call>\n')
 
 
 class Parser(unittest.TestCase):

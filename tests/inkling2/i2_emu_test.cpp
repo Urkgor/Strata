@@ -165,9 +165,9 @@ int main(int argc, char** argv) {
             worst = std::max(worst, rel_rms(lg, row(t)));
         }
         int slots = 0;
-        long long hits = 0, misses = 0, cpu = 0;
-        e->cache_stats(&slots, &hits, &misses, &cpu);
-        EXPECT(worst < tol && cpu > 0 && cpu < misses, "CPU expert pool over %d decoded tokens: worst %.2e, %lld experts on the CPU of %lld misses", n - 6, worst, cpu, misses);
+        long long hits = 0, misses = 0, cpu = 0, shared = 0;
+        e->cache_stats(&slots, &hits, &misses, &cpu, &shared);
+        EXPECT(worst < tol && cpu > 0 && shared > 0 && cpu + shared < misses, "CPU pool and PCIe sharing the cold experts over %d decoded tokens: worst %.2e, %lld on the CPU, %lld over PCIe, of %lld misses", n - 6, worst, cpu, shared, misses);
     }
     std::printf(fails ? "%d FAILED\n" : "i2_emu_test: all scenarios pass\n", fails);
     return fails ? 1 : 0;

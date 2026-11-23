@@ -155,7 +155,8 @@ struct GpuEngine::Impl {
     std::vector<double> freq;
     std::unique_ptr<i2cpu::Pool> pool;
     bool cpu_on = false;
-    long long cpu_evals = 0;
+    long long cpu_evals = 0, shared_evals = 0;
+    double t_cpu_ms = 1.0, t_copy_ms = 1.0;      // an expert on the CPU pool / over PCIe, measured at start
     std::vector<float> xh_host, cpu_y;
     size_t cache_budget = 0;
     int* cache_slot_dev = nullptr;
@@ -356,6 +357,8 @@ struct GpuEngine::Impl {
             t_copy = std::min(t_copy, ms_now() - t1);
         }
         cpu_on = opt.cpu_force || t_cpu < t_copy;
+        t_cpu_ms = opt.cpu_force ? 1.0 : t_cpu;
+        t_copy_ms = opt.cpu_force ? 1.0 : t_copy;
         if (opt.verbose)
             std::fprintf(stderr, "strata-inkling2: CPU expert pool (%d threads%s): an expert takes %.2f ms on the CPU, %.2f ms to copy to the card: %s\n", nt,
                          have_avx2_s() ? ", AVX2" : ", portable code", t_cpu, t_copy, cpu_on ? "cold experts are computed on the CPU" : "off, the copy is faster here");
@@ -511,8 +514,8 @@ struct GpuEngine::Impl {
             want = std::min(want, streamed_experts);
             if (want >= hp.n_used) {                       // (fewer slots than one step needs: no cache)
                 ec.slots = want;
-                ec.a = alloc<uint8_t>(max_gu_bytes() * (size_t) want);
-                ec.c = alloc<uint8_t>(max_dn_bytes() * (size_t) want);
+                ec.a = alloc<uint8_t>(max_gu_bytes() * (size_t) (want + hp.n_used));       // (+ n_used transient slots: cold experts the PCIe takes its share of)
+                ec.c = alloc<uint8_t>(max_dn_bytes() * (size_t) (want + hp.n_used));
                 ec.key.assign((size_t) want, -1);
                 freq.assign((size_t) hp.n_layer * (size_t) hp.n_expert, 0.0);
                 ec.where.assign((size_t) hp.n_layer * (size_t) hp.n_expert, -1);
@@ -700,7 +703,7 @@ struct GpuEngine::Impl {
                 ec.hits += sl[(size_t) k] >= 0;
             }
             auto taken = [&](int j) { for (int q = 0; q < nu; ++q) if (sl[(size_t) q] == j && !cpu[(size_t) q]) return true; return false; };
-            int ncpu = 0;
+            int ncpu = 0, nprom = 0, nshare = 0;
             for (int k = 0; k < nu; ++k) {
                 if (sl[(size_t) k] >= 0) continue;
                 ++ec.misses;
@@ -713,6 +716,15 @@ struct GpuEngine::Impl {
                     if (sc < best) { best = sc; s = j; }
                 }
                 if (cpu_on && s >= 0 && freq[(size_t) key] <= best) {   // not used more than the one it would replace: not worth a place
+                    if ((double) (nprom + nshare + 1) * t_copy_ms < (double) (ncpu + 1) * t_cpu_ms) {
+                        // the PCIe finishes it sooner than the CPU would (its queue counted): it takes this one, into a transient slot, outside the cache's books
+                        const int ts = ec.slots + nshare++;
+                        CK(cudaMemcpyAsync(ec.a + (size_t) ts * max_gu_bytes(), dl.h_gu + (size_t) e * dl.gate_up.expert_bytes, dl.gate_up.expert_bytes, cudaMemcpyHostToDevice, st));
+                        CK(cudaMemcpyAsync(ec.c + (size_t) ts * max_dn_bytes(), dl.h_dn + (size_t) e * dl.down.expert_bytes, dl.down.expert_bytes, cudaMemcpyHostToDevice, st));
+                        sl[(size_t) k] = ts;
+                        ++shared_evals;
+                        continue;
+                    }
                     cpu[(size_t) k] = 1;
                     sl[(size_t) k] = 0;                                  // (the kernels compute something for it; its row is overwritten by the CPU's)
                     ++ncpu;
@@ -725,6 +737,7 @@ struct GpuEngine::Impl {
                 CK(cudaMemcpyAsync(ec.a + (size_t) s * max_gu_bytes(), dl.h_gu + (size_t) e * dl.gate_up.expert_bytes, dl.gate_up.expert_bytes, cudaMemcpyHostToDevice, st));
                 CK(cudaMemcpyAsync(ec.c + (size_t) s * max_dn_bytes(), dl.h_dn + (size_t) e * dl.down.expert_bytes, dl.down.expert_bytes, cudaMemcpyHostToDevice, st));
                 sl[(size_t) k] = s;
+                ++nprom;
             }
             if (ncpu) {
                 xh_host.resize((size_t) E);
@@ -931,9 +944,10 @@ std::string GpuEngine::init() { return p_->init(); }
 int GpuEngine::ctx() const { return p_->ctx; }
 int GpuEngine::n_vocab() const { return p_->hp.n_vocab; }
 int64_t GpuEngine::pos() const { return p_->pos; }
-void GpuEngine::cache_stats(int* slots, long long* hits, long long* misses, long long* cpu) const {
+void GpuEngine::cache_stats(int* slots, long long* hits, long long* misses, long long* cpu, long long* shared) const {
     *slots = p_->ec.slots; *hits = p_->ec.hits; *misses = p_->ec.misses;
     if (cpu) *cpu = p_->cpu_evals;
+    if (shared) *shared = p_->shared_evals;
 }
 void GpuEngine::set_trace(std::vector<std::vector<float>>* t, std::vector<std::vector<int>>* s) { p_->trace = t; p_->sel_trace = s; }
 void GpuEngine::reset() { p_->pos = 0; p_->logits_ready = false; }
@@ -1032,9 +1046,10 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
             const double ms = ms_now() - t0;
             std::printf("generation: %d tokens in %.0f ms: %.1f tok/s\n", n, ms, 1000.0 * n / ms);
             int cs = 0;
-            long long ch = 0, cm = 0, cc = 0;
-            eng.cache_stats(&cs, &ch, &cm, &cc);
-            if (cs) std::printf("expert cache: %d slots, %lld hits, %lld misses (%.1f%% hits), %lld experts computed on the CPU\n", cs, ch, cm, 100.0 * (double) ch / (double) std::max<long long>(1, ch + cm), cc);
+            long long ch = 0, cm = 0, cc = 0, csh = 0;
+            eng.cache_stats(&cs, &ch, &cm, &cc, &csh);
+            if (cs) std::printf("expert cache: %d slots, %lld hits, %lld misses (%.1f%% hits); of the cold ones, %lld computed on the CPU, %lld copied by PCIe without a place in the cache\n", cs, ch, cm,
+                                100.0 * (double) ch / (double) std::max<long long>(1, ch + cm), cc, csh);
         }
         return 0;
     }

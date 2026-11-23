@@ -208,9 +208,19 @@ class Inkling2Translator:
         m = _CALL_OPEN.match(self.buf)
         if m is None:
             i = self.buf.find(END)
-            if i >= 0 or final or len(self.buf) > _TAG_MAX:      # not a call in this form: left out up to the message's end
+            if i >= 0 or final or len(self.buf) > _TAG_MAX:      # not a call in this form
+                raw = (self.buf[:i] if i >= 0 else self.buf).strip()
                 self.buf = self.buf[i + len(END):] if i >= 0 else ""
                 self.state = "between"
+                name = self.head_name.strip()
+                if raw.startswith("{") or not raw:                # JSON that does not parse, or nothing: the call with the text as its one argument, so that the client sees
+                    if name and raw:                              # a call it can refuse (and the model try again) rather than a silence
+                        out.append("<tool_call>\n<function=%s>\n<parameter=raw>\n%s\n</parameter>\n</function>\n</tool_call>\n" % (name, raw))
+                elif raw:                                         # prose where a call was due (a cut or confused reply): text
+                    if self.think:
+                        out.append("</think>")
+                        self.think = False
+                    out.append(raw)
                 return None
             return "wait"
         self.buf = self.buf[m.end():]

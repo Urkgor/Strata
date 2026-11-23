@@ -43,6 +43,11 @@ strata-inkling2 --model F.gguf --bench-pp 512 --bench-tg 64
 Options: `--max-context N`, `--gpu N` (one card only), `--prefill N` (512), `--swa-slack N` (1024), `--vram-reserve-mib N` (700), `--host-experts N`, `--cpu`,
 `--eos ID,...`, `--expert-cache-mib N` (VRAM for the expert cache, default: what is left; 0 = none), `--cache-decay X` (0.97), `--cpu-experts auto|N` (the CPU expert pool: auto = on if faster here, 0 = off, N threads).
 
+## Memory of the machine
+
+The streamed layers' experts are copied once into pinned host memory (about 9 GiB of the 17.6 GiB file with an 11 GB card), next to the file's page cache (which the system gives back when it needs it): 32 GB of RAM is enough.
+The engine prints the size of the host copy at start. If the pinning fails (a locked-memory limit) it falls back to ordinary memory and says so (slower copies).
+
 ## Serve it
 
 ```sh
@@ -80,7 +85,7 @@ decoded token multiplies all counts by 0.97). The design is that of the official
 **CPU expert pool.** A decode step's expert that is not in the cache and not used more than the cache's least used one is not copied: it is computed on the CPU from the host copy
 (`src/inkling2/i2_cpu_pool.cpp`: AVX2 + FMA rows for IQ4_NL and Q8_0 chosen at run time, any other type through the portable dequantization, same float arithmetic as the GPU kernels)
 while the GPU runs the others; only the 2304 input activations go down and the expert's 2304 outputs come back. At start the engine times an expert on the pool and the same bytes over PCIe,
-and uses the pool only if it is faster on this machine (it says so). The idea is the official engine's CPU expert pool (`ink_hybrid.cuh`, `hybrid_doorbell.cu`); that one runs inside a CUDA graph through
+and uses the pool only if it is faster on this machine (it says so). The cold experts of a step are then shared between the CPU and the PCIe (into a few transient slots outside the cache's books), each one going to whichever would finish it first given the measured times and what is already queued (the official engine's "miss-sharing"). The idea is the official engine's CPU expert pool (`ink_hybrid.cuh`, `hybrid_doorbell.cu`); that one runs inside a CUDA graph through
 a mapped-memory doorbell, this one is plain host code between the layers' kernels. Prompt reading does not use the cache or the pool (it streams through the staging slots). `strata-inkling2 --bench-tg 64` prints the hit rate. The real speed is unmeasured.
 No CUDA graphs yet.
 

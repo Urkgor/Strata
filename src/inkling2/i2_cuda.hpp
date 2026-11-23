@@ -42,7 +42,7 @@ public:
     /// the number of physical layers whose experts stay in host memory (valid after init())
     int streamed_layers() const;
     /// the expert cache of the streamed layers: its slots, and the hits / misses of the decode steps so far
-    void cache_stats(int* slots, long long* hits, long long* misses, long long* cpu_experts = nullptr) const;
+    void cache_stats(int* slots, long long* hits, long long* misses, long long* cpu_experts = nullptr, long long* shared = nullptr) const;
     /// Append n tokens; the logits of the last one are made at the end.  on_piece(done) after each chunk (false: stop reading).
     bool process(const int32_t* ids, int64_t n, const std::function<bool(int64_t)>& on_piece, int64_t* done);
     void logits(std::vector<float>& out);
