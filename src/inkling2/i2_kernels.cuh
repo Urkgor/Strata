@@ -633,6 +633,99 @@ k_attn(const float* q, const float* r, const float* rel_bias, const float* sink,
     }
 }
 
+/// Attention for a prompt chunk: 8 queries (tokens) of one head a block, a warp a query, the keys taken 32 at a time (a lane a key) from tiles staged once in shared memory as floats
+/// for the 8 queries.  Same arithmetic as k_attn up to the order of the sums: logit = q.k / sqrt(hd) + bias(distance) - sink (the bias row of the distance dotted with the query's r, computed here
+/// rather than tabulated), the sink a first key of logit 0 and no value, the output times sigmoid(gate).  Grid (ceil(T / 8), n_head), 256 threads; n_rel <= 32.
+template <int NU, int KVQ>
+__global__ void __launch_bounds__(256)
+k_attn_pf(const float* q, const float* r, const float* rel_bias, const float* sink, const float* gate, const uint16_t* kc, const uint16_t* vc, const uint8_t* kq, const uint8_t* vq,
+          const uint16_t* ks, const uint16_t* vs, float* out, int n_head, int n_kv, int n_rel, int extent, int pos0, int ring, int window, int T) {
+    constexpr int HD = NU * 32, KT = 32, QT = 8;
+    __shared__ float kt[KT][HD + 1];
+    __shared__ float vt[KT][HD];
+    __shared__ float rq[QT][32];
+    __shared__ float qs[QT][HD];
+    const int tid = (int) threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int hh = (int) blockIdx.y, kk = hh / (n_head / n_kv);
+    const int t0 = (int) blockIdx.x * QT, t = t0 + warp;
+    const bool live = t < T;
+    const int p = pos0 + t;
+    const int lo = window > 0 ? max(0, p - window + 1) : 0;
+    if (tid < QT * 32) {
+        const int qi = tid / 32, k = tid % 32;
+        rq[qi][k] = (t0 + qi < T && k < n_rel) ? r[(size_t) (t0 + qi) * (size_t) (n_head * n_rel) + (size_t) hh * (size_t) n_rel + (size_t) k] : 0.f;
+    }
+    float acc[NU];
+#pragma unroll
+    for (int s = 0; s < NU; ++s) { qs[warp][lane + 32 * s] = live ? q[(size_t) t * (size_t) (n_head * HD) + (size_t) hh * (size_t) HD + (size_t) (lane + 32 * s)] : 0.f; acc[s] = 0.f; }
+    const float sk = live ? sink[(size_t) t * (size_t) n_head + (size_t) hh] : 0.f;
+    const float scale = 1.0f / sqrtf((float) HD);
+    float m = 0.f, l = 1.f;                                             // the sink: logit 0, no value
+    // the keys the block's queries read: from the first query's window start to the last query's position
+    const int plast = pos0 + min(T - 1, t0 + QT - 1);
+    const int kfirst = window > 0 ? max(0, pos0 + t0 - window + 1) : 0;
+    const size_t cells = (size_t) kk * (size_t) ring;
+    const uint16_t* kh = kc ? kc + cells * (size_t) HD : nullptr;
+    const uint16_t* vh = vc ? vc + cells * (size_t) HD : nullptr;
+    const uint8_t* kqb = kq ? kq + cells * (size_t) (KVQ == 2 ? HD / 2 : HD) : nullptr;
+    const uint8_t* vqb = vq ? vq + cells * (size_t) (KVQ == 2 ? HD / 2 : HD) : nullptr;
+    const uint16_t* ksb = ks ? ks + cells * (size_t) NU : nullptr;
+    const uint16_t* vsb = vs ? vs + cells * (size_t) NU : nullptr;
+    for (int j0 = kfirst; j0 <= plast; j0 += KT) {
+        __syncthreads();
+        for (int idx = tid; idx < KT * HD; idx += 256) {
+            const int kj = idx / HD, e = idx % HD, j = j0 + kj;
+            float kv = 0.f, vv = 0.f;
+            if (j <= plast) {
+                const size_t cell = (size_t) (j % ring);
+                kv = kv_at<KVQ, NU>(kh, kqb, ksb, cell, e / 32, e % 32);
+                vv = kv_at<KVQ, NU>(vh, vqb, vsb, cell, e / 32, e % 32);
+            }
+            kt[kj][e] = kv;
+            vt[kj][e] = vv;
+        }
+        __syncthreads();
+        if (!live) continue;
+        const int j = j0 + lane;
+        const bool valid = j >= lo && j <= p;
+        float sc = -INFINITY;
+        if (valid) {
+            float d = 0.f;
+#pragma unroll 8
+            for (int e = 0; e < HD; ++e) d += qs[warp][e] * kt[lane][e];
+            const int dist = p - j;
+            float bias = -sk;
+            if (dist < extent) {
+                float b = 0.f;
+                for (int k = 0; k < n_rel; ++k) b += rel_bias[(size_t) dist * (size_t) n_rel + (size_t) k] * rq[warp][k];
+                bias = b - sk;
+            }
+            sc = d * scale + bias;
+        }
+        const float tmax = g4k::warp_max(sc);
+        const float mn = fmaxf(m, tmax);
+        const float corr = expf(m - mn);
+        const float pj = valid ? expf(sc - mn) : 0.f;
+        l = l * corr + g4k::warp_sum(pj);
+#pragma unroll
+        for (int s = 0; s < NU; ++s) acc[s] *= corr;
+        for (int kj = 0; kj < KT; ++kj) {
+            const float pk = __shfl_sync(0xffffffffu, pj, kj);
+#pragma unroll
+            for (int s = 0; s < NU; ++s) acc[s] += pk * vt[kj][lane + 32 * s];
+        }
+        m = mn;
+    }
+    if (live) {
+        const float inv = 1.0f / l;
+#pragma unroll
+        for (int s = 0; s < NU; ++s) {
+            const size_t at = (size_t) t * (size_t) (n_head * HD) + (size_t) hh * (size_t) HD + (size_t) (lane + 32 * s);
+            out[at] = acc[s] * inv * sigmoidf(gate[at]);
+        }
+    }
+}
+
 /// The parts of one token's attention put together: per query head, the parts' states merged (grid n_head, HD threads), times the output gate.
 template <int NU>
 __global__ void __launch_bounds__(kThreads)

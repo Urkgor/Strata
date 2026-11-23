@@ -834,6 +834,11 @@ struct GpuEngine::Impl {
 
     template <int NU, int KVQ>
     void attention_nu(const DevLayer& dl, const Visit& V, int Tn, int pos0, int window, int extent, int nsplit) {
+        if (Tn > 1 && hp.n_rel <= 32) {                                 // a prompt chunk: 8 queries a block share the staged keys
+            G4_LAUNCH(G4_K((i2k::k_attn_pf<NU, KVQ>)), dim3((unsigned) ((Tn + 7) / 8), (unsigned) hp.n_head), dim3(256), st, q, r, dl.rel_bias, sink, gate, (const uint16_t*) V.kc, (const uint16_t*) V.vc,
+                      (const uint8_t*) V.kq, (const uint8_t*) V.vq, (const uint16_t*) V.ks, (const uint16_t*) V.vs, att, hp.n_head, hp.n_kv, hp.n_rel, extent, pos0, V.cells, window, Tn);
+            return;
+        }
         const dim3 grid((unsigned) Tn, (unsigned) hp.n_head, (unsigned) nsplit), block(g4k::kThreads);
         G4_LAUNCH(G4_K((i2k::k_attn<NU, KVQ>)), grid, block, st, q, r, dl.rel_bias, sink, gate, (const uint16_t*) V.kc, (const uint16_t*) V.vc, (const uint8_t*) V.kq, (const uint8_t*) V.vq,
                   (const uint16_t*) V.ks, (const uint16_t*) V.vs, att, hp.n_head, hp.n_kv, hp.n_rel, extent, pos0, V.cells, window, nsplit, pm_, pl_, pacc_);
