@@ -164,12 +164,14 @@ struct GpuEngine::Impl {
     double t_cpu_ms = 1.0, t_copy_ms = 1.0;      // an expert on the CPU pool / over PCIe, measured at start
     std::vector<float> xh_host, cpu_y;
     // --profile: where a decoded token's time goes (the stream is synchronized at each boundary, so the total is a little more than without)
-    struct Prof { double res = 0, str = 0, wait = 0, host = 0, cpu = 0, total = 0; long long nres = 0, nstr = 0, tokens = 0; double lap[2][6] = {}; } pf;
+    struct Prof { double res = 0, str = 0, wait = 0, host = 0, cpu = 0, total = 0; long long nres = 0, nstr = 0, tokens = 0; double lap[2][6] = {}, enq[2][6] = {}; } pf;
     double lap_t = 0;
     void lap_(bool prof, int i, bool streamed) {          // --profile: the time since the last lap, into phase i of a resident / streamed visit
         if (!prof) return;
+        const double t_enq = ms_now();                        // (the host has queued the phase's work: how long that took, against how long the card took)
         CK(cudaStreamSynchronize(st));
         const double t = ms_now();
+        pf.enq[streamed ? 1 : 0][i] += t_enq - lap_t;
         pf.lap[streamed ? 1 : 0][i] += t - lap_t;
         lap_t = t;
     }
@@ -1040,6 +1042,8 @@ std::string GpuEngine::profile_report() const {
         if (vn <= 0) continue;
         out += k ? "  a streamed visit:" : "  a resident visit:";
         for (int i = 0; i < 6; ++i) { std::snprintf(b, sizeof b, " %s %.3f", ph[i], f.lap[k][i] / vn); out += b; }
+        out += " (ms)\n  ... of which the host spent queueing it:";
+        for (int i = 0; i < 6; ++i) { std::snprintf(b, sizeof b, " %.3f", f.enq[k][i] / vn); out += b; }
         out += " (ms)\n";
     }
     return out;
