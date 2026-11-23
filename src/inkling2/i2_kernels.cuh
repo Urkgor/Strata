@@ -336,6 +336,92 @@ k_mmq(const uint8_t* __restrict__ w, long long expert_bytes, long long row_bytes
     }
 }
 
+/// The same controller for a prompt chunk, 16 tokens a block so that the 2.4 MB of weights are read once for 16 tokens instead of once for each.
+/// k_ctrl_scale (a block a token): 1 / rms of cur and of msg -> sc[t][2].  k_ctrl_gate_t: grid (ceil(rk / 16), ceil(T / 16)), 8 warps of two rank rows, the tokens' activations staged
+/// in slices of 512 -> gate[t][rk].  k_ctrl_apply_t: grid (ceil(n / 128), ceil(T / 16)), 128 threads an output each -> cur in place.
+__global__ void __launch_bounds__(kMixThreads)
+k_ctrl_scale(const float* cur, const float* msg, int n, float* sc, float eps) {
+    __shared__ float sh[32];
+    const int t = (int) blockIdx.x;
+    float a = 0.f, b = 0.f;
+    for (int i = (int) threadIdx.x; i < n; i += (int) blockDim.x) { const float c = cur[(size_t) t * (size_t) n + (size_t) i], m = msg[(size_t) t * (size_t) n + (size_t) i]; a += c * c; b += m * m; }
+    const float sa = 1.0f / sqrtf(block_sum(a, sh) / (float) n + eps);
+    const float sb = 1.0f / sqrtf(block_sum(b, sh) / (float) n + eps);
+    if (threadIdx.x == 0) { sc[2 * t] = sa; sc[2 * t + 1] = sb; }
+}
+
+__global__ void __launch_bounds__(256)
+k_ctrl_gate_t(const float* cur, const float* msg, int n, int rk, const float* down, const float* sc, float* gate, int T) {
+    constexpr int KS = 512, TT = 16;
+    __shared__ float xs[TT * KS];
+    const int tid = (int) threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int t0 = (int) blockIdx.y * TT, cnt = min(TT, T - t0);
+    const int rA = ((int) blockIdx.x * 8 + warp) * 2, rB = rA + 1;
+    const float* dA = down + (size_t) (rA < rk ? rA : 0) * (size_t) 2 * (size_t) n;
+    const float* dB = down + (size_t) (rB < rk ? rB : (rA < rk ? rA : 0)) * (size_t) 2 * (size_t) n;
+    float accA[TT], accB[TT];
+#pragma unroll
+    for (int i = 0; i < TT; ++i) { accA[i] = 0.f; accB[i] = 0.f; }
+    for (int k0 = 0; k0 < 2 * n; k0 += KS) {
+        const int kn = min(KS, 2 * n - k0);
+        for (int idx = tid; idx < cnt * kn; idx += 256) {
+            const int i = idx / kn, j = idx % kn, k = k0 + j, t = t0 + i;
+            xs[i * KS + j] = k < n ? cur[(size_t) t * (size_t) n + (size_t) k] * sc[2 * t] : msg[(size_t) t * (size_t) n + (size_t) (k - n)] * sc[2 * t + 1];
+        }
+        __syncthreads();
+        for (int j = lane; j < kn; j += 32) {
+            const float wa = dA[k0 + j], wb = dB[k0 + j];
+#pragma unroll
+            for (int i = 0; i < TT; ++i) {
+                if (i < cnt) {
+                    const float x = xs[i * KS + j];
+                    accA[i] += wa * x;
+                    accB[i] += wb * x;
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < TT; ++i) {
+        if (i < cnt) {
+            const float va = warp_sum(accA[i]), vb = warp_sum(accB[i]);
+            if (lane == 0) {
+                if (rA < rk) gate[(size_t) (t0 + i) * (size_t) rk + (size_t) rA] = va;
+                if (rB < rk) gate[(size_t) (t0 + i) * (size_t) rk + (size_t) rB] = vb;
+            }
+        }
+    }
+}
+
+__global__ void __launch_bounds__(128)
+k_ctrl_apply_t(float* cur, const float* msg, int n, int rk, const float* gain, const float* forget, const float* gate, int T) {
+    constexpr int TT = 16;
+    __shared__ float g[TT * 256];
+    const int tid = (int) threadIdx.x, i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    const int t0 = (int) blockIdx.y * TT, cnt = min(TT, T - t0);
+    for (int idx = tid; idx < cnt * rk; idx += 128) g[(idx / rk) * 256 + (idx % rk)] = gate[(size_t) (t0 + idx / rk) * (size_t) rk + (size_t) (idx % rk)];
+    __syncthreads();
+    if (i >= n) return;
+    float ga[TT], fo[TT];
+#pragma unroll
+    for (int q = 0; q < TT; ++q) { ga[q] = 0.f; fo[q] = 0.f; }
+    const float* gr = gain + (size_t) i * (size_t) rk;
+    const float* fr = forget + (size_t) i * (size_t) rk;
+    for (int r = 0; r < rk; ++r) {
+        const float a = gr[r], b = fr[r];
+#pragma unroll
+        for (int q = 0; q < TT; ++q) { ga[q] += a * g[q * 256 + r]; fo[q] += b * g[q * 256 + r]; }
+    }
+#pragma unroll
+    for (int q = 0; q < TT; ++q) {
+        if (q < cnt) {
+            const size_t at = (size_t) (t0 + q) * (size_t) n + (size_t) i;
+            cur[at] = cur[at] - tanhf(fo[q]) * cur[at] + tanhf(ga[q]) * msg[at];
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------------------
 /// The raw convolution input `back` positions before token t of the chunk (back = 0: the token itself): from the chunk's own buffer, else from the
 /// ring of the visit, else zero before the first position.

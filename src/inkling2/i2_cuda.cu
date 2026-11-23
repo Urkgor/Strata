@@ -596,6 +596,7 @@ struct GpuEngine::Impl {
             pxed_ = alloc<float>(pe / 32 + 16);
         }
         ctrl_gate = alloc<float>(T * (size_t) std::max(hp.gate_rank, 1));
+        ctrl_sc = alloc<float>(T * 2);
         pm_ = alloc<float>((size_t) H * (size_t) std::max(1, opt.attn_max_split));
         pl_ = alloc<float>((size_t) H * (size_t) std::max(1, opt.attn_max_split));
         pacc_ = alloc<float>((size_t) H * (size_t) std::max(1, opt.attn_max_split) * (size_t) hd);
@@ -808,7 +809,16 @@ struct GpuEngine::Impl {
                   (const float*) mixstat, out, Tn, 1e-6f);
     }
     float *mixstat = nullptr, *ctrl_gate = nullptr;            // the mix's per-state sums, the controller's gate (per token)
+    float* ctrl_sc = nullptr;                                  // 1 / rms of cur and msg per token (a prompt chunk's controller)
     void control(float* c, const float* msg, int Tn, const DevLoop& lw, int k) {
+        if (Tn > 1 && hp.gate_rank <= 256) {                    // a prompt chunk: 16 tokens a block (the weights are read once for 16 tokens)
+            G4_LAUNCH(i2k::k_ctrl_scale, dim3((unsigned) Tn), dim3(i2k::kMixThreads), st, (const float*) c, msg, hp.n_embd, ctrl_sc, 1e-6f);
+            G4_LAUNCH(i2k::k_ctrl_gate_t, dim3((unsigned) ((hp.gate_rank + 15) / 16), (unsigned) ((Tn + 15) / 16)), dim3(256), st, (const float*) c, msg, hp.n_embd, hp.gate_rank, (const float*) lw.down[k],
+                      (const float*) ctrl_sc, ctrl_gate, Tn);
+            G4_LAUNCH(i2k::k_ctrl_apply_t, dim3((unsigned) ((hp.n_embd + 127) / 128), (unsigned) ((Tn + 15) / 16)), dim3(128), st, c, msg, hp.n_embd, hp.gate_rank, (const float*) lw.gain[k],
+                      (const float*) lw.forget[k], (const float*) ctrl_gate, Tn);
+            return;
+        }
         G4_LAUNCH(i2k::k_ctrl_gate, dim3((unsigned) ((hp.gate_rank + 3) / 4), (unsigned) Tn), dim3(128), st, (const float*) c, msg, hp.n_embd, hp.gate_rank, (const float*) lw.down[k], ctrl_gate,
                   1e-6f);
         G4_LAUNCH(i2k::k_ctrl_apply, dim3((unsigned) ((hp.n_embd + 255) / 256), (unsigned) Tn), dim3(i2k::kMixThreads), st, c, msg, hp.n_embd, hp.gate_rank, (const float*) lw.gain[k],
