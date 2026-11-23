@@ -160,6 +160,8 @@ struct GpuEngine::Impl {
     long long cpu_evals = 0, shared_evals = 0;
     double t_cpu_ms = 1.0, t_copy_ms = 1.0;      // an expert on the CPU pool / over PCIe, measured at start
     std::vector<float> xh_host, cpu_y;
+    // --profile: where a decoded token's time goes (the stream is synchronized at each boundary, so the total is a little more than without)
+    struct Prof { double res = 0, str = 0, wait = 0, host = 0, cpu = 0, total = 0; long long nres = 0, nstr = 0, tokens = 0; } pf;
     size_t cache_budget = 0;
     int* cache_slot_dev = nullptr;
     float *logits = nullptr, *pv = nullptr;
@@ -689,7 +691,10 @@ struct GpuEngine::Impl {
         const int nu = hp.n_used;
         const int rows = Tn * nu;
         std::vector<int> idx((size_t) rows);
+        const double tw0 = opt.profile ? ms_now() : 0.0;
         CK(cudaMemcpy(idx.data(), topk_idx, (size_t) rows * 4, cudaMemcpyDeviceToHost));       // (also the barrier: the router has run)
+        const double tw1 = opt.profile ? ms_now() : 0.0;
+        if (opt.profile && Tn == 1) pf.wait += tw1 - tw0;
         auto copy_in = [&](int slot, int e) {
             CK(cudaMemcpyAsync(stgA + (size_t) slot * dl.gate_up.expert_bytes, dl.h_gu + (size_t) e * dl.gate_up.expert_bytes, dl.gate_up.expert_bytes, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(stgC + (size_t) slot * dl.down.expert_bytes, dl.h_dn + (size_t) e * dl.down.expert_bytes, dl.down.expert_bytes, cudaMemcpyHostToDevice, st));
@@ -765,7 +770,9 @@ struct GpuEngine::Impl {
                                     dl.down.row_bytes, cpu_y.data() + (size_t) k * (size_t) E, dl.gu_scale_h ? dl.gu_scale_h[e] : 1.f});
                     ks.push_back(k);
                 }
+                const double tc0 = opt.profile ? ms_now() : 0.0;
                 pool->run(xh_host.data(), E, hp.n_ff_exp, hp.situ_beta, hp.situ_lin, jobs.data(), (int) jobs.size());
+                if (opt.profile) pf.cpu += ms_now() - tc0;
                 for (int k : ks) CK(cudaMemcpyAsync(ed + (size_t) k * (size_t) E, cpu_y.data() + (size_t) k * (size_t) E, (size_t) E * 4, cudaMemcpyHostToDevice, st));
             }
             return;
@@ -809,6 +816,9 @@ struct GpuEngine::Impl {
         const int E = hp.n_embd, qd = hp.q_dim(), kd = hp.kv_dim();
         const size_t TE = (size_t) Tn * (size_t) E;
         const bool swa = hp.swa[(size_t) ip] != 0;
+        const bool prof = opt.profile && Tn == 1;
+        double tv0 = 0.0;
+        if (prof) { CK(cudaStreamSynchronize(st)); tv0 = ms_now(); }
         const dim3 b1(g4k::kThreads);
         copy_f(sa, cur, TE);
         float* in[3] = {cur, cur, cur};
@@ -874,6 +884,11 @@ struct GpuEngine::Impl {
         experts(dl, ip, Tn);
         conv_res(moe, dl.ffn_post_conv, V.cring, 2 * kd + E, Tn, pos0, cur, cur);
         ring_store(moe, E, V.cring, 2 * kd + E, Tn, pos0);
+        if (prof) {
+            CK(cudaStreamSynchronize(st));
+            (dl.streamed ? pf.str : pf.res) += ms_now() - tv0;
+            ++(dl.streamed ? pf.nstr : pf.nres);
+        }
         if (trace) {
             CK(cudaStreamSynchronize(st));
             std::vector<float> h(TE);
@@ -884,6 +899,7 @@ struct GpuEngine::Impl {
 
     // ------------------------------------------------------------------------------------------------------------------------ a chunk
     void forward_chunk(const int32_t* ids, int Tn, bool want_logits) {
+        const double tf0 = (opt.profile && Tn == 1) ? ms_now() : 0.0;
         if (ec.slots && Tn == 1) {                                 // a decoded token: the use counts age by one step
             ec.inc /= opt.cache_decay;
             if (ec.inc > 1e50) { for (double& x : freq) x /= ec.inc; ec.inc = 1.0; }
@@ -939,6 +955,7 @@ struct GpuEngine::Impl {
             logits_ready = false;
         }
         CK(cudaStreamSynchronize(st));
+        if (opt.profile && Tn == 1) { pf.total += ms_now() - tf0; ++pf.tokens; }
         pos += Tn;
     }
 };
@@ -950,6 +967,18 @@ std::string GpuEngine::init() { return p_->init(); }
 int GpuEngine::ctx() const { return p_->ctx; }
 int GpuEngine::n_vocab() const { return p_->hp.n_vocab; }
 int64_t GpuEngine::pos() const { return p_->pos; }
+std::string GpuEngine::profile_report() const {
+    const auto& f = p_->pf;
+    if (f.tokens == 0) return "";
+    const double n = (double) f.tokens;
+    char b[900];
+    std::snprintf(b, sizeof b,
+                  "profile, per decoded token (%lld tokens, %.1f ms): resident-expert visits %.1f ms (%.1f visits, %.2f ms each); streamed-expert visits %.1f ms (%.1f visits, %.2f ms each), of which waiting for the "
+                  "router's choice %.1f ms, the CPU pool %.1f ms; the rest (embedding, output head, sync) %.1f ms\n",
+                  f.tokens, f.total / n, f.res / n, (double) f.nres / n, f.nres ? f.res / (double) f.nres : 0.0, f.str / n, (double) f.nstr / n, f.nstr ? f.str / (double) f.nstr : 0.0, f.wait / n, f.cpu / n,
+                  (f.total - f.res - f.str) / n);
+    return b;
+}
 void GpuEngine::cache_stats(int* slots, long long* hits, long long* misses, long long* cpu, long long* shared) const {
     *slots = p_->ec.slots; *hits = p_->ec.hits; *misses = p_->ec.misses;
     if (cpu) *cpu = p_->cpu_evals;
@@ -1007,6 +1036,7 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
         if (a == "--prefill" || a == "--chunk") { const std::string v = val(); if (v != "auto") o.chunk = std::max(1, std::atoi(v.c_str())); }
         else if (a == "--host-experts") o.host_experts = std::max(0, std::atoi(val().c_str()));
         else if (a == "--expert-cache-mib") o.cache_mib = std::max(0, std::atoi(val().c_str()));
+        else if (a == "--profile") o.profile = true;
         else if (a == "--cpu-experts") { const std::string v = val(); o.cpu_threads = v == "auto" ? -1 : std::max(0, std::atoi(v.c_str())); }
         else if (a == "--cache-decay") o.cache_decay = std::min(1.0, std::max(0.5, std::atof(val().c_str())));
         else if (a == "--swa-slack") o.slack = std::max(0, std::atoi(val().c_str()));
@@ -1054,6 +1084,7 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
             int cs = 0;
             long long ch = 0, cm = 0, cc = 0, csh = 0;
             eng.cache_stats(&cs, &ch, &cm, &cc, &csh);
+            { const std::string rep = eng.profile_report(); if (!rep.empty()) std::printf("%s", rep.c_str()); }
             if (cs) std::printf("expert cache: %d slots, %lld hits, %lld misses (%.1f%% hits); of the cold ones, %lld computed on the CPU, %lld copied by PCIe without a place in the cache\n", cs, ch, cm,
                                 100.0 * (double) ch / (double) std::max<long long>(1, ch + cm), cc, csh);
         }

@@ -20,6 +20,7 @@ struct GpuOptions {
     int host_experts = 0;          // keep the experts of (at least) this many layers in host memory, even if they would fit (a check of the streaming path)
     int stage_slots = 32;          // experts of a streaming layer copied to the card at a time (prompt reading)
     int cache_mib = -1;            // VRAM for the cache of the streamed layers' experts (decode): -1 = what is left, 0 = none
+    bool profile = false;          // time the phases of a decoded token (--profile)
     int cache_slots = -1;          // the same in experts, for tests (-1: from cache_mib)
     int cpu_threads = -1;          // the CPU expert pool (decode: cold experts computed on the CPU instead of copied): -1 = on when a speed check says it beats the copy, 0 = off, N = N threads
     bool cpu_force = false;        // use the pool without the speed check (tests)
@@ -41,6 +42,8 @@ public:
     bool can_keep(int64_t p) const;
     /// the number of physical layers whose experts stay in host memory (valid after init())
     int streamed_layers() const;
+    /// --profile's table (empty without it)
+    std::string profile_report() const;
     /// the expert cache of the streamed layers: its slots, and the hits / misses of the decode steps so far
     void cache_stats(int* slots, long long* hits, long long* misses, long long* cpu_experts = nullptr, long long* shared = nullptr) const;
     /// Append n tokens; the logits of the last one are made at the end.  on_piece(done) after each chunk (false: stop reading).
