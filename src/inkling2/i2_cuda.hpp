@@ -44,6 +44,7 @@ public:
     int streamed_layers() const;
     /// --profile's table (empty without it)
     std::string profile_report() const;
+    void profile_reset();
     /// the expert cache of the streamed layers: its slots, and the hits / misses of the decode steps so far
     void cache_stats(int* slots, long long* hits, long long* misses, long long* cpu_experts = nullptr, long long* shared = nullptr) const;
     /// Append n tokens; the logits of the last one are made at the end.  on_piece(done) after each chunk (false: stop reading).

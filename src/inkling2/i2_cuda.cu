@@ -967,6 +967,7 @@ std::string GpuEngine::init() { return p_->init(); }
 int GpuEngine::ctx() const { return p_->ctx; }
 int GpuEngine::n_vocab() const { return p_->hp.n_vocab; }
 int64_t GpuEngine::pos() const { return p_->pos; }
+void GpuEngine::profile_reset() { p_->pf = Impl::Prof(); }
 std::string GpuEngine::profile_report() const {
     const auto& f = p_->pf;
     if (f.tokens == 0) return "";
@@ -1029,7 +1030,7 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
     GpuOptions o;
     if (!gpus.empty()) o.device = parse_list(gpus)[0];
     bool check = false;
-    int bench_pp = 0, bench_tg = 0;
+    int bench_pp = 0, bench_tg = 0, bench_warm = 0;
     for (size_t i = 0; i < extra.size(); ++i) {
         const std::string& a = extra[i];
         auto val = [&]() -> std::string { return i + 1 < extra.size() ? extra[++i] : std::string(); };
@@ -1044,6 +1045,7 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
         else if (a == "--check") check = true;
         else if (a == "--bench-pp") bench_pp = std::atoi(val().c_str());
         else if (a == "--bench-tg") bench_tg = std::atoi(val().c_str());
+        else if (a == "--bench-warmup") bench_warm = std::max(0, std::atoi(val().c_str()));
         else if (a == "--kv") { const std::string v = val(); if (v != "f16") std::fprintf(stderr, "strata-inkling2: --kv %s: this engine keeps K / V as f16\n", v.c_str()); }
         else std::fprintf(stderr, "strata-inkling2: ignoring %s (not an option of this engine)\n", a.c_str());
     }
@@ -1072,6 +1074,12 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
         if (bench_tg > 0) {
             eng.reset();
             eng.process(ids.data(), 16, noop, &done);
+            for (int w = 0; w < bench_warm && eng.pos() < ctx - bench_tg - 1; ++w) {      // decoded first, not timed: the expert cache fills up
+                const int32_t nx = eng.greedy();
+                int64_t d = 0;
+                eng.process(&nx, 1, noop, &d);
+            }
+            eng.profile_reset();
             const double t0 = ms_now();
             int n = 0;
             for (; n < bench_tg && eng.pos() < ctx; ++n) {
