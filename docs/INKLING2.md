@@ -50,7 +50,7 @@ strata-inkling2 --model F.gguf --bench-pp 512 --bench-tg 64
 ```
 
 Options: `--max-context N`, `--gpu N` (one card only), `--prefill N` (512), `--swa-slack N` (1024), `--vram-reserve-mib N` (700), `--host-experts N`, `--cpu`,
-`--eos ID,...`, `--expert-cache-mib N` (VRAM for the expert cache, default: what is left; 0 = none), `--cache-decay X` (0.97), `--cpu-experts auto|N` (the CPU expert pool: auto = on if faster here, 0 = off, N threads), `--cpu-int8 on|off|auto` (its dot products on int8 activations: auto = when a speed check says faster), `--trace-experts FILE` (writes the decoded tokens' experts in the host-memory layers; `tools/inkling2/cache_sim.py FILE` replays them under several cache policies), `--kv f16|q8_0|q4_0`, `--dp4a on|off` (integer kernels, decode and prompt: Q8_0, NVFP4, Q4_K, Q5_K, Q6_K, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S), `--attn-split-keys N` (256), `--profile`, `--bench-warmup N`.
+`--eos ID,...`, `--expert-cache-mib N` (VRAM for the expert cache, default: what is left; 0 = none), `--cache-decay X` (0.97), `--cpu-experts auto|N` (the CPU expert pool, decided per layer: auto = on where faster here, 0 = off, N threads; integer AVX2 dots for IQ4_NL, Q8_0, NVFP4, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S), `--cpu-int8 on|off|auto` (its dot products on int8 activations: auto = when a speed check says faster), `--trace-experts FILE` (writes the decoded tokens' experts in the host-memory layers; `tools/inkling2/cache_sim.py FILE` replays them under several cache policies), `--kv f16|q8_0|q4_0`, `--dp4a on|off` (integer kernels, decode and prompt: Q8_0, NVFP4, Q4_K, Q5_K, Q6_K, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S), `--attn-split-keys N` (256), `--profile`, `--bench-warmup N`.
 
 ## Decode speed
 

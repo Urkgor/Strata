@@ -146,6 +146,69 @@ __attribute__((target("avx2,fma,f16c"))) float dot_nvfp4_i8_avx2(const uint8_t* 
     }
     return hsum256(acc);
 }
+
+// ---- the code-book types (IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S): blocks of 256 values, 8 sub-blocks of 32 (4 groups of 8).  The sub-block's weights are the code-book entries gathered (8 of 4 values for IQ3,
+// 4 of 8 for IQ2), negated where the sign bytes say; the activations are the int8 blocks.
+__attribute__((target("avx2,fma,f16c"))) inline __m256i expand_signs(uint32_t sg4) {          // 4 sign bytes -> 32 bytes, 0xFF where the group's bit for the value is set
+    const __m256i v = _mm256_shuffle_epi8(_mm256_set1_epi32((int) sg4), _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3));
+    const __m256i bit = _mm256_setr_epi8(1, 2, 4, 8, 16, 32, 64, (char) 128, 1, 2, 4, 8, 16, 32, 64, (char) 128, 1, 2, 4, 8, 16, 32, 64, (char) 128, 1, 2, 4, 8, 16, 32, 64, (char) 128);
+    return _mm256_cmpeq_epi8(_mm256_and_si256(v, bit), bit);
+}
+__attribute__((target("avx2,fma,f16c"))) inline __m256i negate_by(__m256i w, __m256i m) { return _mm256_sub_epi8(_mm256_xor_si256(w, m), m); }
+
+template <int T>
+__attribute__((target("avx2,fma,f16c"))) float dot_iq_i8_avx2(const uint8_t* row, const int8_t* xq, const float* xd, int n) {
+    constexpr int BB = T == g4::T_IQ3_XXS ? 98 : T == g4::T_IQ3_S ? 110 : T == g4::T_IQ2_XS ? 74 : 82;
+    const uint8_t* ks = g4::tab::ksigns_iq2xs_h;
+    __m256 acc = _mm256_setzero_ps();
+    for (int b = 0; b < n / 256; ++b) {
+        const uint8_t* p = row + (size_t) b * BB;
+        const float d = half_at(p);
+        for (int ib = 0; ib < 8; ++ib) {
+            __m256i w;
+            __m256 sc;
+            if constexpr (T == g4::T_IQ3_XXS) {
+                uint32_t a;
+                std::memcpy(&a, p + 66 + 4 * ib, 4);
+                const __m256i idx = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) (p + 2 + 8 * ib)));
+                w = _mm256_i32gather_epi32((const int*) g4::tab::iq3xxs_grid_h, idx, 4);
+                const uint32_t sg = (uint32_t) ks[a & 127] | ((uint32_t) ks[(a >> 7) & 127] << 8) | ((uint32_t) ks[(a >> 14) & 127] << 16) | ((uint32_t) ks[(a >> 21) & 127] << 24);
+                sc = _mm256_set1_ps(d * (0.5f + (float) (a >> 28)) * 0.5f);
+                w = negate_by(w, expand_signs(sg));
+            } else if constexpr (T == g4::T_IQ3_S) {
+                const __m256i q = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) (p + 2 + 8 * ib)));
+                const __m256i hi = _mm256_and_si256(_mm256_sllv_epi32(_mm256_set1_epi32(p[66 + ib]), _mm256_setr_epi32(8, 7, 6, 5, 4, 3, 2, 1)), _mm256_set1_epi32(256));
+                w = _mm256_i32gather_epi32((const int*) g4::tab::iq3s_grid_h, _mm256_or_si256(q, hi), 4);
+                uint32_t sg;
+                std::memcpy(&sg, p + 74 + 4 * ib, 4);
+                sc = _mm256_set1_ps(d * (float) (1 + 2 * ((p[106 + (ib >> 1)] >> (4 * (ib & 1))) & 0xf)));
+                w = negate_by(w, expand_signs(sg));
+            } else if constexpr (T == g4::T_IQ2_XS) {
+                uint64_t qv;
+                std::memcpy(&qv, p + 2 + 8 * ib, 8);
+                const __m128i q16 = _mm_cvtepu16_epi32(_mm_cvtsi64_si128((long long) qv));
+                w = _mm256_i32gather_epi64((const long long*) g4::tab::iq2xs_grid_h, _mm_and_si128(q16, _mm_set1_epi32(511)), 8);
+                const __m128i si = _mm_srli_epi32(q16, 9);
+                const uint32_t sg = (uint32_t) ks[_mm_extract_epi32(si, 0)] | ((uint32_t) ks[_mm_extract_epi32(si, 1)] << 8) | ((uint32_t) ks[_mm_extract_epi32(si, 2)] << 16) | ((uint32_t) ks[_mm_extract_epi32(si, 3)] << 24);
+                const float s0 = d * (0.5f + (float) (p[66 + ib] & 0xf)) * 0.25f, s1 = d * (0.5f + (float) (p[66 + ib] >> 4)) * 0.25f;
+                sc = _mm256_set_m128(_mm_set1_ps(s1), _mm_set1_ps(s0));
+                w = negate_by(w, expand_signs(sg));
+            } else {   // IQ2_S
+                const __m128i q = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(*reinterpret_cast<const int*>(p + 2 + 4 * ib)));
+                const __m128i hi = _mm_and_si128(_mm_sllv_epi32(_mm_set1_epi32(p[66 + ib]), _mm_setr_epi32(8, 6, 4, 2)), _mm_set1_epi32(0x300));
+                w = _mm256_i32gather_epi64((const long long*) g4::tab::iq2s_grid_h, _mm_or_si128(q, hi), 8);
+                uint32_t sg;
+                std::memcpy(&sg, p + 34 + 4 * ib, 4);
+                const float s0 = d * (0.5f + (float) (p[74 + ib] & 0xf)) * 0.25f, s1 = d * (0.5f + (float) (p[74 + ib] >> 4)) * 0.25f;
+                sc = _mm256_set_m128(_mm_set1_ps(s1), _mm_set1_ps(s0));
+                w = negate_by(w, expand_signs(sg));
+            }
+            const __m256i dot = dot_i8x32(w, _mm256_loadu_si256((const __m256i*) (xq + (size_t) b * 256 + (size_t) ib * 32)));
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot), _mm256_mul_ps(sc, _mm256_set1_ps(xd[b * 8 + ib])), acc);
+        }
+    }
+    return hsum256(acc);
+}
 #endif
 
 }  // namespace
@@ -183,9 +246,11 @@ float dot_row(int type, const uint8_t* row, const float* x, int n) {
     return dot_row_generic(type, row, x, n);
 }
 
+static bool cb_type(int t) { return t == g4::T_IQ3_XXS || t == g4::T_IQ3_S || t == g4::T_IQ2_XS || t == g4::T_IQ2_S; }
+
 bool int8_type(int type) {
 #ifdef I2_X86
-    return have_avx2() && (type == g4::T_IQ4_NL || type == g4::T_Q8_0 || type == g4::T_NVFP4);
+    return have_avx2() && (type == g4::T_IQ4_NL || type == g4::T_Q8_0 || type == g4::T_NVFP4 || type == g4::T_IQ3_XXS || type == g4::T_IQ3_S || type == g4::T_IQ2_XS || type == g4::T_IQ2_S);
 #else
     (void) type;
     return false;
@@ -207,6 +272,10 @@ float dot_row_i8(int type, const uint8_t* row, const int8_t* xq, const float* xd
     if (type == g4::T_IQ4_NL) return dot_iq4nl_i8_avx2(row, xq, xd, n);
     if (type == g4::T_Q8_0) return dot_q8_0_i8_avx2(row, xq, xd, n);
     if (type == g4::T_NVFP4) return dot_nvfp4_i8_avx2(row, xq, xd, n);
+    if (type == g4::T_IQ3_XXS) return dot_iq_i8_avx2<g4::T_IQ3_XXS>(row, xq, xd, n);
+    if (type == g4::T_IQ3_S) return dot_iq_i8_avx2<g4::T_IQ3_S>(row, xq, xd, n);
+    if (type == g4::T_IQ2_XS) return dot_iq_i8_avx2<g4::T_IQ2_XS>(row, xq, xd, n);
+    if (type == g4::T_IQ2_S) return dot_iq_i8_avx2<g4::T_IQ2_S>(row, xq, xd, n);
 #endif
     (void) row; (void) xq; (void) xd; (void) n; (void) type;
     return 0.f;
@@ -292,7 +361,8 @@ void Pool::run(const float* x, int E, int F, float beta, float lin, const Job* j
     const size_t rows2 = (size_t) E;
     bool use_i8 = int8_ && E % 32 == 0 && F % 32 == 0;
     for (int j = 0; j < n && use_i8; ++j)
-        use_i8 = int8_type(jobs[j].gu_type) && int8_type(jobs[j].dn_type) && (jobs[j].gu_type != g4::T_NVFP4 || E % 64 == 0) && (jobs[j].dn_type != g4::T_NVFP4 || F % 64 == 0);
+        use_i8 = int8_type(jobs[j].gu_type) && int8_type(jobs[j].dn_type) && (jobs[j].gu_type != g4::T_NVFP4 || E % 64 == 0) && (jobs[j].dn_type != g4::T_NVFP4 || F % 64 == 0) &&
+                (cb_type(jobs[j].gu_type) ? E % 256 == 0 : true) && (cb_type(jobs[j].dn_type) ? F % 256 == 0 : true);
     const size_t nbx = (size_t) E / 32, nbf = (size_t) F / 32;
     if (use_i8) {
         // gate+up, the activation and its quantization in one phase (a task: 32 columns of one job: 64 rows, 32 products, one block of the next input), then the down rows

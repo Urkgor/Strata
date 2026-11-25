@@ -15,7 +15,7 @@ static void fill(int type, std::vector<uint8_t>& row, std::mt19937& rng) {
     for (auto& b : row) b = (uint8_t) rng();
     const int bb = g4::block_bytes(type) == 128 ? 128 : g4::block_bytes(type);
     // sane scales: the half at the start of every block
-    for (size_t o = 0; o + 2 <= row.size() && (type == g4::T_IQ4_NL || type == g4::T_Q8_0); o += (size_t) bb) {
+    for (size_t o = 0; o + 2 <= row.size() && (type == g4::T_IQ4_NL || type == g4::T_Q8_0 || type == g4::T_IQ3_XXS || type == g4::T_IQ3_S || type == g4::T_IQ2_XS || type == g4::T_IQ2_S); o += (size_t) bb) {
         const float d = 0.001f + 0.01f * (float) (rng() % 100) / 100.f;
         const uint16_t h = (uint16_t) std::lrintf(d * 1024.f * 16.f);   // not exact IEEE, but a finite positive half-ish value: only both paths' agreement matters
         row[o] = (uint8_t) (h & 0xff);
@@ -41,7 +41,7 @@ int main() {
         }
         EXPECT(worst < 1e-4, "row dot of type %d against the portable path: worst relative difference %.2e", type, worst);
     }
-    for (int type : {g4::T_IQ4_NL, g4::T_Q8_0, g4::T_NVFP4}) {      // the integer dot against the float dot of the dequantized activations (the same numbers: only the order of the sums differs), and against the exact x
+    for (int type : {g4::T_IQ4_NL, g4::T_Q8_0, g4::T_NVFP4, g4::T_IQ3_XXS, g4::T_IQ3_S, g4::T_IQ2_XS, g4::T_IQ2_S}) {      // the integer dot against the float dot of the dequantized activations (the same numbers: only the order of the sums differs), and against the exact x
         const int n = 2304;
         const size_t rb = (size_t) g4::row_bytes(type, n);
         std::vector<uint8_t> row(rb);
@@ -61,7 +61,7 @@ int main() {
         EXPECT(worst < 1e-4, "integer row dot of type %d against the float dot of the quantized activations: worst %.2e (against the exact activations %.2e)", type, worst, off);
     }
     for (int mode = 0; mode < 2; ++mode)
-    for (int type : {g4::T_IQ4_NL, g4::T_NVFP4}) {   // a whole expert, floats and integers, gate_up of `type`, down Q8_0
+    for (int type : {g4::T_IQ4_NL, g4::T_NVFP4, g4::T_IQ3_XXS, g4::T_IQ2_S}) {   // a whole expert, floats and integers, gate_up of `type`, down Q8_0
         const int E = 256, F = 128;
         const size_t rb1 = (size_t) g4::row_bytes(type, E), rb2 = (size_t) g4::row_bytes(g4::T_Q8_0, F);
         std::vector<uint8_t> gu(rb1 * 2 * (size_t) F), dn(rb2 * (size_t) E);

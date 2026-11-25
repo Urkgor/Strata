@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <map>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -165,9 +166,10 @@ struct GpuEngine::Impl {
     // every (layer, expert)'s decayed use count, in the cache or not: what decides who stays in the cache and who is computed on the CPU
     std::vector<double> freq;
     std::unique_ptr<i2cpu::Pool> pool;
-    bool cpu_on = false;
+    bool cpu_on = false;                           // some streamed layer's cold experts are computed on the CPU
+    std::vector<char> cpu_on_l, cpu_int_l;         // per layer: the pool takes its cold experts / with integer dots
+    std::vector<double> t_cpu_l, t_copy_l;         // per layer: an expert on the pool / over PCIe, measured at start
     long long cpu_evals = 0, shared_evals = 0;
-    double t_cpu_ms = 1.0, t_copy_ms = 1.0;      // an expert on the CPU pool / over PCIe, measured at start
     float *xh_host = nullptr, *cpu_y = nullptr;            // pinned: the CPU pool's input (one token) and outputs (n_used rows)
     int* slot_pin = nullptr;                               // pinned: the slots of a decode step, copied to the card without waiting
     // --profile: where a decoded token's time goes (the stream is synchronized at each boundary, so the total is a little more than without)
@@ -488,55 +490,79 @@ struct GpuEngine::Impl {
     /// expert of a streamed layer evaluated by the pool against the same bytes copied over PCIe).
     void setup_cpu_pool() {
         if (ec.slots == 0 || opt.cpu_threads == 0) return;
-        int ip = -1;
-        for (int i = 0; i < hp.n_layer && ip < 0; ++i) if (is_streamed[(size_t) i]) ip = i;
-        if (ip < 0) return;
+        bool any_streamed = false;
+        for (int i = 0; i < hp.n_layer; ++i) any_streamed = any_streamed || is_streamed[(size_t) i];
+        if (!any_streamed) return;
         const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
         const int nt = opt.cpu_threads > 0 ? opt.cpu_threads : (int) std::max(2u, std::min(8u, hw - 1));
         pool.reset(new i2cpu::Pool(nt));
-        const DevLayer& dl = L[(size_t) ip];
         const int E = hp.n_embd, nj = std::min(16, hp.n_expert);          // 16 different experts (more than the caches hold: the weights come from DRAM, as in a decode step)
         std::vector<float> x((size_t) E), y((size_t) nj * (size_t) E);
         for (int i = 0; i < E; ++i) x[(size_t) i] = std::sin(0.37f * (float) i);
-        std::vector<i2cpu::Job> jobs;
-        for (int j = 0; j < nj; ++j)
-            jobs.push_back({dl.h_gu + (size_t) j * dl.gate_up.expert_bytes, dl.gate_up.type, dl.gate_up.row_bytes, dl.h_dn + (size_t) j * dl.down.expert_bytes, dl.down.type,
-                            dl.down.row_bytes, y.data() + (size_t) j * (size_t) E, 1.f});
-        // the integer dots (the activations as int8 blocks, as on the card) when the types have them and they are faster
-        const bool int_ok = i2cpu::int8_type(dl.gate_up.type) && i2cpu::int8_type(dl.down.type) && opt.cpu_int8 != 0;
-        auto time_pool = [&](bool int8) {
-            pool->set_int8(int8);
-            double best = 1e300;
-            for (int rep = 0; rep < 3; ++rep) {
-                const double t0 = ms_now();
-                for (int j = 0; j < nj; j += 4) pool->run(x.data(), E, hp.n_ff_exp, hp.situ_beta, hp.situ_lin, jobs.data() + j, std::min(4, nj - j));     // (4 experts a step, as the router sends)
-                best = std::min(best, (ms_now() - t0) / nj);
+        cpu_on_l.assign((size_t) hp.n_layer, 0);
+        cpu_int_l.assign((size_t) hp.n_layer, 0);
+        t_cpu_l.assign((size_t) hp.n_layer, 1.0);
+        t_copy_l.assign((size_t) hp.n_layer, 1.0);
+        struct Res { bool on, use_int; double t_cpu, t_copy, t_float, t_int; bool int_ok; };
+        std::map<std::pair<int, int>, Res> done;                           // by the layer's (gate_up type, down type): the layers of a type are timed once
+        std::string report;
+        for (int ip = 0; ip < hp.n_layer; ++ip) {
+            if (!is_streamed[(size_t) ip]) continue;
+            const DevLayer& dl = L[(size_t) ip];
+            const std::pair<int, int> key{dl.gate_up.type, dl.down.type};
+            auto it = done.find(key);
+            if (it == done.end()) {
+                std::vector<i2cpu::Job> jobs;
+                for (int j = 0; j < nj; ++j)
+                    jobs.push_back({dl.h_gu + (size_t) j * dl.gate_up.expert_bytes, dl.gate_up.type, dl.gate_up.row_bytes, dl.h_dn + (size_t) j * dl.down.expert_bytes, dl.down.type,
+                                    dl.down.row_bytes, y.data() + (size_t) j * (size_t) E, 1.f});
+                // the integer dots (the activations as int8 blocks, as on the card) when the types have them and they are faster
+                const bool int_ok = i2cpu::int8_type(dl.gate_up.type) && i2cpu::int8_type(dl.down.type) && opt.cpu_int8 != 0;
+                auto time_pool = [&](bool int8) {
+                    pool->set_int8(int8);
+                    double best = 1e300;
+                    for (int rep = 0; rep < 3; ++rep) {
+                        const double t0 = ms_now();
+                        for (int j = 0; j < nj; j += 4) pool->run(x.data(), E, hp.n_ff_exp, hp.situ_beta, hp.situ_lin, jobs.data() + j, std::min(4, nj - j));     // (4 experts a step, as the router sends)
+                        best = std::min(best, (ms_now() - t0) / nj);
+                    }
+                    return best;
+                };
+                Res r{};
+                r.int_ok = int_ok;
+                r.t_float = time_pool(false);
+                r.t_cpu = r.t_float;
+                r.t_int = 1e300;
+                if (int_ok) {
+                    r.t_int = time_pool(true);
+                    r.use_int = opt.cpu_int8 == 1 || r.t_int < 0.95 * r.t_float;
+                    if (r.use_int) r.t_cpu = r.t_int;
+                }
+                r.t_copy = 1e300;
+                for (int rep = 0; rep < 3; ++rep) {
+                    const double t1 = ms_now();
+                    CK(cudaMemcpy(stgA, dl.h_gu, dl.gate_up.expert_bytes, cudaMemcpyHostToDevice));
+                    CK(cudaMemcpy(stgC, dl.h_dn, dl.down.expert_bytes, cudaMemcpyHostToDevice));
+                    r.t_copy = std::min(r.t_copy, ms_now() - t1);
+                }
+                r.on = opt.cpu_force || r.t_cpu < r.t_copy;
+                it = done.emplace(key, r).first;
+                if (opt.verbose) {
+                    char b2[240];
+                    std::snprintf(b2, sizeof b2, " %s/%s: %.2f ms on the CPU (%s dots%s) against %.2f to copy: %s;", g4::type_name(key.first), g4::type_name(key.second), r.t_cpu, r.use_int ? "integer" : "float",
+                                  r.int_ok ? (r.use_int ? "" : ", integer ones not faster") : "", r.t_copy, r.on ? "CPU" : "copy");
+                    report += b2;
+                }
             }
-            return best;
-        };
-        const double t_float = time_pool(false);
-        double t_cpu = t_float, t_int = 1e300, t_copy = 1e300;
-        bool use_int = false;
-        if (int_ok) {
-            t_int = time_pool(true);
-            use_int = opt.cpu_int8 == 1 || t_int < 0.95 * t_cpu;
-            t_cpu = use_int ? t_int : t_cpu;
+            cpu_on_l[(size_t) ip] = it->second.on;
+            cpu_int_l[(size_t) ip] = it->second.use_int;
+            t_cpu_l[(size_t) ip] = opt.cpu_force ? 1.0 : it->second.t_cpu;
+            t_copy_l[(size_t) ip] = opt.cpu_force ? 1.0 : it->second.t_copy;
+            cpu_on = cpu_on || it->second.on;
         }
-        pool->set_int8(use_int);
-        for (int rep = 0; rep < 3; ++rep) {
-            const double t1 = ms_now();
-            CK(cudaMemcpy(stgA, dl.h_gu, dl.gate_up.expert_bytes, cudaMemcpyHostToDevice));
-            CK(cudaMemcpy(stgC, dl.h_dn, dl.down.expert_bytes, cudaMemcpyHostToDevice));
-            t_copy = std::min(t_copy, ms_now() - t1);
-        }
-        cpu_on = opt.cpu_force || t_cpu < t_copy;
-        t_cpu_ms = opt.cpu_force ? 1.0 : t_cpu;
-        t_copy_ms = opt.cpu_force ? 1.0 : t_copy;
         if (opt.verbose)
-            std::fprintf(stderr, "strata-inkling2: CPU expert pool (%d threads%s): an expert takes %.2f ms on the CPU, %.2f ms to copy to the card: %s\n", nt,
-                         have_avx2_s() ? ", AVX2" : ", portable code", t_cpu, t_copy, cpu_on ? "cold experts are computed on the CPU" : "off, the copy is faster here");
-        if (opt.verbose && int_ok)
-            std::fprintf(stderr, "strata-inkling2: CPU expert pool, integer dots (--cpu-int8 on|off|auto): %.2f ms an expert (float dots %.2f): %s\n", t_int, t_float, use_int ? "used" : "not used");
+            std::fprintf(stderr, "strata-inkling2: CPU expert pool (%d threads%s), an expert of a streamed layer on the CPU or copied (the cold ones go where it is faster):%s\n", nt,
+                         have_avx2_s() ? ", AVX2" : ", portable code", report.c_str());
         if (!cpu_on) pool.reset();
     }
     static bool have_avx2_s() { return i2cpu::have_avx2(); }
@@ -1079,8 +1105,8 @@ struct GpuEngine::Impl {
                     const double sc = ec.key[(size_t) j] >= 0 ? freq[(size_t) ec.key[(size_t) j]] : 0.0;
                     if (sc < best) { best = sc; s = j; }
                 }
-                if (cpu_on && s >= 0 && freq[(size_t) key] <= best) {   // not used more than the one it would replace: not worth a place
-                    if ((double) (nprom + nshare + 1) * t_copy_ms < (double) (ncpu + 1) * t_cpu_ms) {
+                if (cpu_on && cpu_on_l[(size_t) ip] && s >= 0 && freq[(size_t) key] <= best) {   // not used more than the one it would replace: not worth a place
+                    if ((double) (nprom + nshare + 1) * t_copy_l[(size_t) ip] < (double) (ncpu + 1) * t_cpu_l[(size_t) ip]) {
                         // the PCIe finishes it sooner than the CPU would (its queue counted): it takes this one, into a transient slot, outside the cache's books
                         const int ts = ec.slots + nshare++;
                         todo.push_back({ts, e});
@@ -1124,6 +1150,7 @@ struct GpuEngine::Impl {
                     ks.push_back(k);
                 }
                 const double tc0 = opt.profile ? ms_now() : 0.0;
+                pool->set_int8(cpu_int_l[(size_t) ip] != 0);
                 pool->run(xh_host, E, hp.n_ff_exp, hp.situ_beta, hp.situ_lin, jobs.data(), (int) jobs.size());
                 if (opt.profile) pfk[0].cpu += ms_now() - tc0;
                 for (int k : ks) CK(cudaMemcpyAsync(ed + (size_t) k * (size_t) E, cpu_y + (size_t) k * (size_t) E, (size_t) E * 4, cudaMemcpyHostToDevice, st));
