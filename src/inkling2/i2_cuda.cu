@@ -722,6 +722,16 @@ struct GpuEngine::Impl {
             CK(cudaMemGetInfo(&fr, &tot));
             std::fprintf(stderr, "strata-inkling2: 1 CUDA device [device %d: %d layers (%d visits), %.2f GiB free after loading]; context %d, chunk %d\n", opt.device, hp.n_layer, hp.visits(),
                          (double) fr / (1 << 30), ctx, chunk);
+            {   // the experts' types by layer: "gate_up/down" and how many layers (a streamed layer marked *), for choosing kernels
+                std::string line, prev;
+                for (int ip = 0; ip < hp.n_layer; ++ip) {
+                    const std::string t = std::string(g4::type_name(L[(size_t) ip].gate_up.type)) + "/" + g4::type_name(L[(size_t) ip].down.type) + (is_streamed[(size_t) ip] ? "*" : "");
+                    if (t == prev) continue;
+                    line += (line.empty() ? "" : " ") + std::to_string(ip) + ":" + t;
+                    prev = t;
+                }
+                std::fprintf(stderr, "strata-inkling2: experts by layer (gate_up/down, * = in host memory; a layer is named where its types change): %s\n", line.c_str());
+            }
             if (ns && ec.slots)
                 std::fprintf(stderr, "strata-inkling2: expert cache: %d slots (%.2f GiB, %.0f%% of the streamed layers' experts), decayed use count (x%.2f a token)\n", ec.slots,
                              (double) ec.slots * (double) per_expert_bytes() / (1 << 30), 100.0 * ec.slots / std::max(1, streamed_layers_count() * hp.n_expert), opt.cache_decay);
