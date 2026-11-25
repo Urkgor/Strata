@@ -365,7 +365,8 @@ struct GpuEngine::Impl {
 
     /// The integer decode kernels, where they are faster: a Q8_0 dense matrix and an NVFP4 expert matrix of the model timed with the float kernel and the integer one.
     void setup_dp() {
-        dp_ok[0] = dp_ok[1] = dp_any = false;
+        for (bool& b : dp_ok) b = false;
+        dp_any = false;
         pf_ok[0] = pf_ok[1] = pf_any = false;
         if (opt.dp4a == 0) return;
         const DevMat *m8 = nullptr, *m4 = nullptr;
@@ -374,11 +375,21 @@ struct GpuEngine::Impl {
             if (!m8 && L[(size_t) ip].wq.type == g4::T_Q8_0) m8 = &L[(size_t) ip].wq;
             if (!m4 && L[(size_t) ip].gate_up.type == g4::T_NVFP4) { m4 = &L[(size_t) ip].gate_up; m4_streamed = L[(size_t) ip].streamed; }
         }
+        const DevMat* mk[3] = {nullptr, nullptr, nullptr};           // a Q4_K, a Q5_K, a Q6_K matrix of E inputs, the output head by preference (the biggest, read at every token)
+        {
+            auto pick = [&](const DevMat& W) {
+                if ((int) W.n_in != hp.n_embd) return;
+                const int k = W.type == g4::T_Q4_K ? 0 : W.type == g4::T_Q5_K ? 1 : W.type == g4::T_Q6_K ? 2 : -1;
+                if (k >= 0 && (!mk[k] || (&W == &head))) mk[k] = &W;
+            };
+            for (int ip = 0; ip < hp.n_layer; ++ip) { const DevLayer& dl = L[(size_t) ip]; for (const DevMat* w : {&dl.wq, &dl.wk, &dl.wv, &dl.wgate, &dl.wrel}) pick(*w); }
+            pick(head);
+        }
         const int E = hp.n_embd;
         auto bench = [&](const DevMat& W0, bool staged, double* t_f, double* t_i) {
             DevMat W = W0;
             if (staged) W.d = stgA;                                  // (a streamed layer's experts are not on the card: the staging slots hold the same shape)
-            float* out = gu;
+            float* out = W.n_out > 4096 ? logits : gu;                  // (the head's rows are the vocabulary's)
             prep(n0, E, 0);
             auto timed = [&](auto fn) {
                 for (int i = 0; i < 300; ++i) fn();                  // (a warm-up long enough for the card to leave its idle clocks)
@@ -415,12 +426,17 @@ struct GpuEngine::Impl {
         if (m4 && (int) m4->n_in == E && !(m4_streamed && !stgA)) { bench(*m4, m4_streamed, &f4, &i4); dp_ok[1] = opt.dp4a == 1 || i4 < 0.9 * f4; }
         if (m8 && (int) m8->n_in == E) { bench_pf(*m8, false, &pf8, &pi8); pf_ok[0] = std::min(16, chunk) >= 2 && (opt.dp4a == 1 || pi8 < 0.9 * pf8); }
         if (m4 && (int) m4->n_in == E && !(m4_streamed && !stgA)) { bench_pf(*m4, m4_streamed, &pf4, &pi4); pf_ok[1] = std::min(16, chunk) >= 2 && (opt.dp4a == 1 || pi4 < 0.9 * pf4); }
-        dp_any = dp_ok[0] || dp_ok[1];
+        double fk[3] = {0, 0, 0}, ik[3] = {0, 0, 0};
+        for (int k = 0; k < 3; ++k)
+            if (mk[k]) { bench(*mk[k], false, &fk[k], &ik[k]); dp_ok[2 + k] = opt.dp4a == 1 || ik[k] < 0.9 * fk[k]; }
+        dp_any = dp_ok[0] || dp_ok[1] || dp_ok[2] || dp_ok[3] || dp_ok[4];
         pf_any = pf_ok[0] || pf_ok[1];
-        if (opt.verbose && (m8 || m4)) {
+        if (opt.verbose && (m8 || m4 || mk[0] || mk[1] || mk[2])) {
             std::fprintf(stderr, "strata-inkling2: integer decode kernels (--dp4a on|off|auto):");
             if (m8) std::fprintf(stderr, " Q8_0 matrix %.3f ms (float kernel %.3f): %s;", i8, f8, dp_ok[0] ? "used" : "not used");
             if (m4) std::fprintf(stderr, " NVFP4 expert matrix %.3f ms (float kernel %.3f): %s;", i4, f4, dp_ok[1] ? "used" : "not used");
+            for (int k = 0; k < 3; ++k)
+                if (mk[k]) std::fprintf(stderr, " %s matrix (%d rows) %.3f ms (float kernel %.3f): %s;", g4::type_name(mk[k]->type), (int) mk[k]->n_out, ik[k], fk[k], dp_ok[2 + k] ? "used" : "not used");
             std::fprintf(stderr, "\n");
             std::fprintf(stderr, "strata-inkling2: integer prompt kernels, 16 tokens:");
             if (m8) std::fprintf(stderr, " Q8_0 matrix %.3f ms (float kernel %.3f): %s;", pi8, pf8, pf_ok[0] ? "used" : "not used");
@@ -750,9 +766,11 @@ struct GpuEngine::Impl {
     int8_t* xq_ = nullptr;                                // [5 slots of n_qw values] + the experts' activation rows
     float* xd_ = nullptr;
     int n_qw = 0;
-    bool dp_ok[2] = {false, false};                       // Q8_0, NVFP4: the integer kernel is used (a speed check at start decides, --dp4a on|off forces)
+    bool dp_ok[5] = {false, false, false, false, false};  // Q8_0, NVFP4, Q4_K, Q5_K, Q6_K: the integer kernel is used (a speed check at start decides, --dp4a on|off forces)
     bool dp_any = false;
-    bool dp_type(int t) const { return hp.n_embd <= 4096 && hp.q_dim() <= 4096 && ((t == g4::T_Q8_0 && dp_ok[0]) || (t == g4::T_NVFP4 && dp_ok[1])); }
+    bool dp_type(int t) const {
+        return hp.n_embd <= 4096 && hp.q_dim() <= 4096 && ((t == g4::T_Q8_0 && dp_ok[0]) || (t == g4::T_NVFP4 && dp_ok[1]) || (t == g4::T_Q4_K && dp_ok[2]) || (t == g4::T_Q5_K && dp_ok[3]) || (t == g4::T_Q6_K && dp_ok[4]));
+    }
     bool pf_ok[2] = {false, false};                       // the same for reading a prompt (k_mmq): Q8_0, NVFP4
     bool pf_any = false;
     bool pf_type(int t) const { return hp.n_embd <= 4096 && hp.q_dim() <= 4096 && ((t == g4::T_Q8_0 && pf_ok[0]) || (t == g4::T_NVFP4 && pf_ok[1])); }
@@ -770,10 +788,17 @@ struct GpuEngine::Impl {
     }
     void mv(const DevMat& W, const int8_t* xq, const float* xd, long long x_stride, const int* ge, int entries, float* y, int ldy, int y_off, long long expert_bytes) {
         const dim3 grid((unsigned) ((W.n_out + 7) / 8), (unsigned) entries), block(256);
-        if (W.type == g4::T_Q8_0)
-            G4_LAUNCH(G4_K(i2k::k_mv<g4::T_Q8_0>), grid, block, st, W.d, expert_bytes, (long long) W.row_bytes, (int) W.n_in, (int) W.n_out, xq, xd, x_stride, ge, y, ldy, y_off);
-        else
-            G4_LAUNCH(G4_K(i2k::k_mv<g4::T_NVFP4>), grid, block, st, W.d, expert_bytes, (long long) W.row_bytes, (int) W.n_in, (int) W.n_out, xq, xd, x_stride, ge, y, ldy, y_off);
+        auto go = [&](auto tag) {
+            constexpr int TY = decltype(tag)::value;
+            G4_LAUNCH(G4_K(i2k::k_mv<TY>), grid, block, st, W.d, expert_bytes, (long long) W.row_bytes, (int) W.n_in, (int) W.n_out, xq, xd, x_stride, ge, y, ldy, y_off);
+        };
+        switch (W.type) {
+            case g4::T_Q8_0: go(std::integral_constant<int, g4::T_Q8_0>{}); break;
+            case g4::T_Q4_K: go(std::integral_constant<int, g4::T_Q4_K>{}); break;
+            case g4::T_Q5_K: go(std::integral_constant<int, g4::T_Q5_K>{}); break;
+            case g4::T_Q6_K: go(std::integral_constant<int, g4::T_Q6_K>{}); break;
+            default: go(std::integral_constant<int, g4::T_NVFP4>{}); break;
+        }
     }
     void prep_any(const float* x, int n, int Tn, int slot) {      // the Tn tokens of x into slot `slot` of the decode or the prompt buffers
         if (Tn == 1) prep(x, n, slot);

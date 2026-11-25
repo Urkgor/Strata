@@ -14,14 +14,17 @@ static int fails = 0;
 
 int main() {
     std::mt19937 rng(11);
-    for (int type : {g4::T_Q8_0, g4::T_NVFP4}) {
+    for (int type : {g4::T_Q8_0, g4::T_NVFP4, g4::T_Q4_K, g4::T_Q5_K, g4::T_Q6_K}) {
         const int n_in = 2304, n_out = 40, n_exp = 3, ne = 8;       // 3 experts' worth of rows; 8 entries read experts 2, 0, 1, 2, ... with their own (or one shared) activations
         const size_t rb = (size_t) g4::row_bytes(type, n_in), eb = rb * (size_t) n_out;
         std::vector<uint8_t> w(eb * (size_t) n_exp);
         for (auto& b : w) b = (uint8_t) rng();
         const int bb = g4::block_bytes(type), be = g4::block_elems(type);
         for (size_t o = 0; o + (size_t) bb <= w.size(); o += (size_t) bb) {         // sane scales
-            if (type == g4::T_Q8_0) { const uint16_t h = (uint16_t) (0x2000 | (rng() & 0x3ff)); w[o] = (uint8_t) (h & 0xff); w[o + 1] = (uint8_t) (h >> 8); }
+            auto half_at = [&](size_t at) { const uint16_t h = (uint16_t) (0x2000 | (rng() & 0x3ff)); w[at] = (uint8_t) (h & 0xff); w[at + 1] = (uint8_t) (h >> 8); };
+            if (type == g4::T_Q8_0) half_at(o);
+            else if (type == g4::T_Q4_K || type == g4::T_Q5_K) { half_at(o); half_at(o + 2); }
+            else if (type == g4::T_Q6_K) half_at(o + 208);
             else for (int s = 0; s < 4; ++s) w[o + (size_t) s] = (uint8_t) (0x20 + (rng() % 40));
         }
         (void) be;
@@ -43,7 +46,13 @@ int main() {
                 G4_LAUNCH(G4_K(i2k::k_mv<TY>), dim3((unsigned) ((n_out + 7) / 8), (unsigned) ne), dim3(256), 0, dw, (long long) eb, (long long) rb, n_in, n_out, (const int8_t*) dxq, (const float*) dxd,
                           (long long) (shared ? 0 : n_in), (const int*) dge, dy, n_out, 0);
             };
-            if (type == g4::T_Q8_0) run(std::integral_constant<int, g4::T_Q8_0>{}); else run(std::integral_constant<int, g4::T_NVFP4>{});
+            switch (type) {
+                case g4::T_Q8_0: run(std::integral_constant<int, g4::T_Q8_0>{}); break;
+                case g4::T_Q4_K: run(std::integral_constant<int, g4::T_Q4_K>{}); break;
+                case g4::T_Q5_K: run(std::integral_constant<int, g4::T_Q5_K>{}); break;
+                case g4::T_Q6_K: run(std::integral_constant<int, g4::T_Q6_K>{}); break;
+                default: run(std::integral_constant<int, g4::T_NVFP4>{}); break;
+            }
             std::vector<float> y((size_t) ne * (size_t) n_out);
             cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost);
             double d2 = 0, s2 = 0;

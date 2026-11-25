@@ -212,6 +212,52 @@ k_mv(const uint8_t* __restrict__ w, long long expert_bytes, long long row_bytes,
             s = i2_dp4a(i2_ld32_b2(blk + 2 + part * 8 + 4), xv[1], s);
             acc += (float) s * g4::half_to_float((uint16_t) i2_ld16(blk)) * de[b];
         }
+    } else if constexpr (T == g4::T_Q4_K || T == g4::T_Q5_K) {
+        // blocks of 256 values: 8 sub-blocks of 32, each value d * sc_j * q - dmin * m_j (6-bit scales and mins packed in 12 bytes).  A lane takes 8 values of one sub-block (4 lanes a
+        // sub-block, a block a trip): the sum of q * x and the sum of x (a dot with ones), the activations' own scale per 32 being the sub-block's.
+        constexpr int BB = T == g4::T_Q4_K ? 144 : 176, QS = T == g4::T_Q4_K ? 16 : 48;
+        const int nb = n_in / 256, j = lane >> 2, part = lane & 3;
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* blk = rp + (size_t) b * BB;
+            const uint8_t* sc = blk + 4;
+            uint32_t scv, mnv;
+            if (j < 4) { scv = sc[j] & 63u; mnv = sc[j + 4] & 63u; }
+            else { scv = (sc[j + 4] & 0xFu) | ((uint32_t) (sc[j - 4] >> 6) << 4); mnv = (uint32_t) (sc[j + 4] >> 4) | ((uint32_t) (sc[j] >> 6) << 4); }
+            const uint8_t* qs = blk + QS + (j >> 1) * 32 + part * 8;
+            const int sh = (j & 1) * 4;
+            uint32_t q0 = (*reinterpret_cast<const uint32_t*>(qs) >> sh) & 0x0F0F0F0Fu, q1 = (*reinterpret_cast<const uint32_t*>(qs + 4) >> sh) & 0x0F0F0F0Fu;
+            if constexpr (T == g4::T_Q5_K) {                                           // the fifth bit: bit j of byte l of qh, for the 32 values of sub-block j
+                const uint8_t* qh = blk + 16 + part * 8;
+                q0 |= ((*reinterpret_cast<const uint32_t*>(qh) >> j) & 0x01010101u) << 4;
+                q1 |= ((*reinterpret_cast<const uint32_t*>(qh + 4) >> j) & 0x01010101u) << 4;
+            }
+            const int* xv = reinterpret_cast<const int*>(xe + (size_t) b * 256 + (size_t) j * 32 + (size_t) part * 8);
+            int s = i2_dp4a((int) q0, xv[0], 0);
+            s = i2_dp4a((int) q1, xv[1], s);
+            int sx = i2_dp4a(0x01010101, xv[0], 0);
+            sx = i2_dp4a(0x01010101, xv[1], sx);
+            const float d = g4::half_to_float((uint16_t) i2_ld16(blk)), dmin = g4::half_to_float((uint16_t) i2_ld16(blk + 2));
+            acc += de[b * 8 + j] * (d * (float) scv * (float) s - dmin * (float) mnv * (float) sx);
+        }
+    } else if constexpr (T == g4::T_Q6_K) {
+        // blocks of 256 values: two halves of 128, each four rows of 32 (r) whose 6-bit values are 4 low bits from ql (low or high nibble) and 2 from qh; 16 sub-blocks of 16 with an int8 scale
+        // each, value d * sc * (q - 32).  A lane takes 8 values of one row of one half; the 2-byte aligned blocks (210 bytes) are read in halves.
+        const int nb = n_in / 256, n = lane >> 4, r = (lane >> 2) & 3, lp = lane & 3;
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* blk = rp + (size_t) b * 210;
+            const uint8_t* ql = blk + 64 * n + (r & 1) * 32 + lp * 8;
+            const uint8_t* qh = blk + 128 + 32 * n + lp * 8;
+            const int sh = 4 * (r >> 1), hs = 2 * r;
+            const uint32_t q0 = (((uint32_t) i2_ld32_b2(ql)) >> sh & 0x0F0F0F0Fu) | ((((uint32_t) i2_ld32_b2(qh)) >> hs & 0x03030303u) << 4);
+            const uint32_t q1 = (((uint32_t) i2_ld32_b2(ql + 4)) >> sh & 0x0F0F0F0Fu) | ((((uint32_t) i2_ld32_b2(qh + 4)) >> hs & 0x03030303u) << 4);
+            const int scl = (int) (int8_t) blk[192 + 8 * n + (lp >> 1) + 2 * r];
+            const int* xv = reinterpret_cast<const int*>(xe + (size_t) b * 256 + (size_t) (128 * n + 32 * r + lp * 8));
+            int s = i2_dp4a((int) q0, xv[0], 0);
+            s = i2_dp4a((int) q1, xv[1], s);
+            int sx = i2_dp4a(0x01010101, xv[0], 0);
+            sx = i2_dp4a(0x01010101, xv[1], sx);
+            acc += de[b * 8 + 4 * n + r] * g4::half_to_float((uint16_t) i2_ld16(blk + 208)) * (float) scl * (float) (s - 32 * sx);
+        }
     } else {
         const int nb = n_in / 64, sub = lane & 3;
         for (int b = lane >> 2; b < nb; b += 8) {
