@@ -58,7 +58,7 @@ void usage() {
     std::fprintf(stderr,
                  "usage: strata-inkling2 --model GGUF [--serve | --tokens ID,ID,... [--n N]] [--max-context N] [--cpu] [--gpu 0,1] [--eos ID,ID,...]\n"
                  "                       [--dump-logits FILE [--all]] [--loop-passes N]\n"
-                 "       GPU: [--prefill N] [--swa-slack N] [--vram-reserve-mib N] [--host-experts N] [--expert-cache-mib N] [--cpu-experts auto|N] [--cpu-int8 on|off|auto] [--cache-decay X] [--profile] [--dp4a on|off] [--check] [--bench-pp N] [--bench-tg N] [--bench-warmup N]\n");
+                 "       GPU: [--prefill N] [--swa-slack N] [--vram-reserve-mib N] [--host-experts N] [--expert-cache-mib N] [--cpu-experts auto|N] [--cpu-int8 on|off|auto] [--trace-experts FILE] [--cache-decay X] [--profile] [--dp4a on|off] [--check] [--bench-pp N] [--bench-tg N] [--bench-warmup N]\n");
 }
 
 }  // namespace

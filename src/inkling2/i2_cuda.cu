@@ -199,7 +199,9 @@ struct GpuEngine::Impl {
         stage_slots = std::max(1, std::min(hp.n_expert, std::max(opt.stage_slots, 1)));
     }
 
+    std::FILE* trace_f = nullptr;
     ~Impl() {
+        if (trace_f) std::fclose(trace_f);
         for (void* p : allocs) cudaFree(p);
         if (st) cudaStreamDestroy(st);
         for (auto& h : host_allocs) {
@@ -978,6 +980,10 @@ struct GpuEngine::Impl {
         CK(cudaMemcpy(idx.data(), topk_idx, (size_t) rows * 4, cudaMemcpyDeviceToHost));       // (also the barrier: the router has run)
         const double tw1 = opt.profile ? ms_now() : 0.0;
         if (opt.profile && Tn == 1) pfk[0].wait += tw1 - tw0;
+        if (Tn == 1 && !opt.trace_experts.empty()) {
+            if (!trace_f) trace_f = std::fopen(opt.trace_experts.c_str(), "w");
+            if (trace_f) { std::fprintf(trace_f, "%d", ip); for (int k = 0; k < nu; ++k) std::fprintf(trace_f, " %d", idx[(size_t) k]); std::fputc('\n', trace_f); }
+        }
         auto copy_in = [&](int slot, int e) {
             CK(cudaMemcpyAsync(stgA + (size_t) slot * dl.gate_up.expert_bytes, dl.h_gu + (size_t) e * dl.gate_up.expert_bytes, dl.gate_up.expert_bytes, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(stgC + (size_t) slot * dl.down.expert_bytes, dl.h_dn + (size_t) e * dl.down.expert_bytes, dl.down.expert_bytes, cudaMemcpyHostToDevice, st));
@@ -1230,6 +1236,7 @@ struct GpuEngine::Impl {
     // ------------------------------------------------------------------------------------------------------------------------ a chunk
     void forward_chunk(const int32_t* ids, int Tn, bool want_logits) {
         const double tf0 = opt.profile ? ms_now() : 0.0;
+        if (Tn == 1 && trace_f) std::fputs("T\n", trace_f);
         if (ec.slots && Tn == 1) {                                 // a decoded token: the use counts age by one step
             ec.inc /= opt.cache_decay;
             if (ec.inc > 1e50) { for (double& x : freq) x /= ec.inc; ec.inc = 1.0; }
@@ -1392,6 +1399,7 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
         else if (a == "--expert-cache-mib") o.cache_mib = std::max(0, std::atoi(val().c_str()));
         else if (a == "--profile") o.profile = true;
         else if (a == "--dp4a") { const std::string v = val(); o.dp4a = v == "off" ? 0 : v == "on" ? 1 : -1; }
+        else if (a == "--trace-experts") o.trace_experts = val();
         else if (a == "--cpu-int8") { const std::string v = val(); o.cpu_int8 = v == "on" ? 1 : v == "off" ? 0 : -1; }
         else if (a == "--cpu-experts") { const std::string v = val(); o.cpu_threads = v == "auto" ? -1 : std::max(0, std::atoi(v.c_str())); }
         else if (a == "--cache-decay") o.cache_decay = std::min(1.0, std::max(0.5, std::atof(val().c_str())));
