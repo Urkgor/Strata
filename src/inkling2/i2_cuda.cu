@@ -363,29 +363,72 @@ struct GpuEngine::Impl {
         return "";
     }
 
-    /// The integer decode kernels, where they are faster: a Q8_0 dense matrix and an NVFP4 expert matrix of the model timed with the float kernel and the integer one.
+    /// The types with an integer kernel (dp4a), in the order of dp_ok / pf_ok
+    static int dp_idx(int t) {
+        switch (t) {
+            case g4::T_Q8_0: return 0;
+            case g4::T_NVFP4: return 1;
+            case g4::T_Q4_K: return 2;
+            case g4::T_Q5_K: return 3;
+            case g4::T_Q6_K: return 4;
+            case g4::T_IQ2_XS: return 5;
+            case g4::T_IQ2_S: return 6;
+            case g4::T_IQ3_XXS: return 7;
+            case g4::T_IQ3_S: return 8;
+            default: return -1;
+        }
+    }
+    static constexpr int kDpTypes = 9;
+    static int dp_type_of(int idx) {
+        static const int t[kDpTypes] = {g4::T_Q8_0, g4::T_NVFP4, g4::T_Q4_K, g4::T_Q5_K, g4::T_Q6_K, g4::T_IQ2_XS, g4::T_IQ2_S, g4::T_IQ3_XXS, g4::T_IQ3_S};
+        return t[idx];
+    }
+    template <class F>
+    static void with_dp_type(int type, F&& f) {
+        switch (type) {
+            case g4::T_Q8_0: f(std::integral_constant<int, g4::T_Q8_0>{}); break;
+            case g4::T_Q4_K: f(std::integral_constant<int, g4::T_Q4_K>{}); break;
+            case g4::T_Q5_K: f(std::integral_constant<int, g4::T_Q5_K>{}); break;
+            case g4::T_Q6_K: f(std::integral_constant<int, g4::T_Q6_K>{}); break;
+            case g4::T_IQ2_XS: f(std::integral_constant<int, g4::T_IQ2_XS>{}); break;
+            case g4::T_IQ2_S: f(std::integral_constant<int, g4::T_IQ2_S>{}); break;
+            case g4::T_IQ3_XXS: f(std::integral_constant<int, g4::T_IQ3_XXS>{}); break;
+            case g4::T_IQ3_S: f(std::integral_constant<int, g4::T_IQ3_S>{}); break;
+            default: f(std::integral_constant<int, g4::T_NVFP4>{}); break;
+        }
+    }
+    i2k::I2Tabs tabs;                                      // the code-book tables of the IQ kernels (on the card)
+    void upload_tabs() {
+        auto up = [&](auto*& d, const auto* h, size_t n) { using T = std::remove_const_t<std::remove_pointer_t<std::remove_reference_t<decltype(d)>>>; T* q = alloc<T>(n); CK(cudaMemcpy(q, h, n * sizeof(T), cudaMemcpyHostToDevice)); d = q; };
+        up(tabs.g3xxs, g4::tab::iq3xxs_grid_h, 256);
+        up(tabs.g3s, g4::tab::iq3s_grid_h, 512);
+        up(tabs.g2xs, g4::tab::iq2xs_grid_h, 512);
+        up(tabs.g2s, g4::tab::iq2s_grid_h, 1024);
+        up(tabs.signs, g4::tab::ksigns_iq2xs_h, 128);
+    }
+
+    /// The integer kernels, where they are faster: for every type of the model that has one (Q8_0, NVFP4, Q4_K, Q5_K, Q6_K, the code-book types), a matrix of that type timed with the float
+    /// kernel and the integer one, at decode (one token) and at a prompt (16 tokens).  --dp4a on forces them, off drops them.
     void setup_dp() {
         for (bool& b : dp_ok) b = false;
-        dp_any = false;
-        pf_ok[0] = pf_ok[1] = pf_any = false;
+        for (bool& b : pf_ok) b = false;
+        dp_any = pf_any = false;
         if (opt.dp4a == 0) return;
-        const DevMat *m8 = nullptr, *m4 = nullptr;
-        bool m4_streamed = false;
-        for (int ip = 0; ip < hp.n_layer; ++ip) {
-            if (!m8 && L[(size_t) ip].wq.type == g4::T_Q8_0) m8 = &L[(size_t) ip].wq;
-            if (!m4 && L[(size_t) ip].gate_up.type == g4::T_NVFP4) { m4 = &L[(size_t) ip].gate_up; m4_streamed = L[(size_t) ip].streamed; }
-        }
-        const DevMat* mk[3] = {nullptr, nullptr, nullptr};           // a Q4_K, a Q5_K, a Q6_K matrix of E inputs, the output head by preference (the biggest, read at every token)
-        {
-            auto pick = [&](const DevMat& W) {
-                if ((int) W.n_in != hp.n_embd) return;
-                const int k = W.type == g4::T_Q4_K ? 0 : W.type == g4::T_Q5_K ? 1 : W.type == g4::T_Q6_K ? 2 : -1;
-                if (k >= 0 && (!mk[k] || (&W == &head))) mk[k] = &W;
-            };
-            for (int ip = 0; ip < hp.n_layer; ++ip) { const DevLayer& dl = L[(size_t) ip]; for (const DevMat* w : {&dl.wq, &dl.wk, &dl.wv, &dl.wgate, &dl.wrel}) pick(*w); }
-            pick(head);
-        }
         const int E = hp.n_embd;
+        struct Samp { const DevMat* m = nullptr; bool staged = false; const DevMat* mp = nullptr; bool staged_p = false; double fd = 0, id = 0, fp = 0, ip = 0; } sm[kDpTypes];
+        auto consider = [&](const DevMat& W, bool streamed, bool is_head) {
+            const int k = dp_idx(W.type);
+            if (k < 0 || (int) W.n_in != E) return;
+            if (streamed && !stgA) return;                             // (an expert matrix of a streamed layer is timed on the staging slots)
+            if (!sm[k].m || (is_head && !streamed)) { sm[k].m = &W; sm[k].staged = streamed; }          // decode: the output head by preference (the biggest, read at every token)
+            if (!is_head && (!sm[k].mp || (sm[k].staged_p && !streamed))) { sm[k].mp = &W; sm[k].staged_p = streamed; }   // prompt: not the head (its rows are the vocabulary)
+        };
+        for (int ip = 0; ip < hp.n_layer; ++ip) {
+            const DevLayer& dl = L[(size_t) ip];
+            for (const DevMat* w : {&dl.wq, &dl.wk, &dl.wv, &dl.wgate, &dl.wrel}) consider(*w, false, false);
+            consider(dl.gate_up, dl.streamed, false);
+        }
+        consider(head, false, true);
         auto bench = [&](const DevMat& W0, bool staged, double* t_f, double* t_i) {
             DevMat W = W0;
             if (staged) W.d = stgA;                                  // (a streamed layer's experts are not on the card: the staging slots hold the same shape)
@@ -421,26 +464,22 @@ struct GpuEngine::Impl {
             *t_f = timed([&] { mm(W, n0, E, Tn, out, (int) W.n_out); });
             *t_i = timed([&] { mmq(W, pslot(0), pdslot(0), 1, nullptr, nullptr, nullptr, nullptr, nullptr, Tn, out, (int) W.n_out, 0, 0); });
         };
-        double f8 = 0, i8 = 0, f4 = 0, i4 = 0, pf8 = 0, pi8 = 0, pf4 = 0, pi4 = 0;
-        if (m8 && (int) m8->n_in == E) { bench(*m8, false, &f8, &i8); dp_ok[0] = opt.dp4a == 1 || i8 < 0.9 * f8; }
-        if (m4 && (int) m4->n_in == E && !(m4_streamed && !stgA)) { bench(*m4, m4_streamed, &f4, &i4); dp_ok[1] = opt.dp4a == 1 || i4 < 0.9 * f4; }
-        if (m8 && (int) m8->n_in == E) { bench_pf(*m8, false, &pf8, &pi8); pf_ok[0] = std::min(16, chunk) >= 2 && (opt.dp4a == 1 || pi8 < 0.9 * pf8); }
-        if (m4 && (int) m4->n_in == E && !(m4_streamed && !stgA)) { bench_pf(*m4, m4_streamed, &pf4, &pi4); pf_ok[1] = std::min(16, chunk) >= 2 && (opt.dp4a == 1 || pi4 < 0.9 * pf4); }
-        double fk[3] = {0, 0, 0}, ik[3] = {0, 0, 0};
-        for (int k = 0; k < 3; ++k)
-            if (mk[k]) { bench(*mk[k], false, &fk[k], &ik[k]); dp_ok[2 + k] = opt.dp4a == 1 || ik[k] < 0.9 * fk[k]; }
-        dp_any = dp_ok[0] || dp_ok[1] || dp_ok[2] || dp_ok[3] || dp_ok[4];
-        pf_any = pf_ok[0] || pf_ok[1];
-        if (opt.verbose && (m8 || m4 || mk[0] || mk[1] || mk[2])) {
+        for (int k = 0; k < kDpTypes; ++k) {
+            if (sm[k].m) { bench(*sm[k].m, sm[k].staged, &sm[k].fd, &sm[k].id); dp_ok[k] = opt.dp4a == 1 || sm[k].id < 0.9 * sm[k].fd; }
+            if (sm[k].mp && std::min(16, chunk) >= 2) { bench_pf(*sm[k].mp, sm[k].staged_p, &sm[k].fp, &sm[k].ip); pf_ok[k] = opt.dp4a == 1 || sm[k].ip < 0.9 * sm[k].fp; }
+            dp_any = dp_any || dp_ok[k];
+            pf_any = pf_any || pf_ok[k];
+        }
+        if (opt.verbose) {
+            bool any = false;
+            for (int k = 0; k < kDpTypes; ++k) any = any || sm[k].m;
+            if (!any) return;
             std::fprintf(stderr, "strata-inkling2: integer decode kernels (--dp4a on|off|auto):");
-            if (m8) std::fprintf(stderr, " Q8_0 matrix %.3f ms (float kernel %.3f): %s;", i8, f8, dp_ok[0] ? "used" : "not used");
-            if (m4) std::fprintf(stderr, " NVFP4 expert matrix %.3f ms (float kernel %.3f): %s;", i4, f4, dp_ok[1] ? "used" : "not used");
-            for (int k = 0; k < 3; ++k)
-                if (mk[k]) std::fprintf(stderr, " %s matrix (%d rows) %.3f ms (float kernel %.3f): %s;", g4::type_name(mk[k]->type), (int) mk[k]->n_out, ik[k], fk[k], dp_ok[2 + k] ? "used" : "not used");
-            std::fprintf(stderr, "\n");
-            std::fprintf(stderr, "strata-inkling2: integer prompt kernels, 16 tokens:");
-            if (m8) std::fprintf(stderr, " Q8_0 matrix %.3f ms (float kernel %.3f): %s;", pi8, pf8, pf_ok[0] ? "used" : "not used");
-            if (m4) std::fprintf(stderr, " NVFP4 expert matrix %.3f ms (float kernel %.3f): %s;", pi4, pf4, pf_ok[1] ? "used" : "not used");
+            for (int k = 0; k < kDpTypes; ++k)
+                if (sm[k].m) std::fprintf(stderr, " %s (%d rows) %.3f ms (float kernel %.3f): %s;", g4::type_name(dp_type_of(k)), (int) sm[k].m->n_out, sm[k].id, sm[k].fd, dp_ok[k] ? "used" : "not used");
+            std::fprintf(stderr, "\nstrata-inkling2: integer prompt kernels, 16 tokens:");
+            for (int k = 0; k < kDpTypes; ++k)
+                if (sm[k].mp) std::fprintf(stderr, " %s (%d rows) %.3f ms (float kernel %.3f): %s;", g4::type_name(dp_type_of(k)), (int) sm[k].mp->n_out, sm[k].ip, sm[k].fp, pf_ok[k] ? "used" : "not used");
             std::fprintf(stderr, "\n");
         }
     }
@@ -729,6 +768,7 @@ struct GpuEngine::Impl {
         pi = alloc<int>((size_t) (hp.n_vocab / 1024 + 2));
         amax = alloc<int>(1);
         CK(cudaDeviceSynchronize());
+        upload_tabs();
         setup_dp();
         setup_cpu_pool();
         if (opt.verbose) {
@@ -766,14 +806,12 @@ struct GpuEngine::Impl {
     int8_t* xq_ = nullptr;                                // [5 slots of n_qw values] + the experts' activation rows
     float* xd_ = nullptr;
     int n_qw = 0;
-    bool dp_ok[5] = {false, false, false, false, false};  // Q8_0, NVFP4, Q4_K, Q5_K, Q6_K: the integer kernel is used (a speed check at start decides, --dp4a on|off forces)
+    bool dp_ok[9] = {};                                   // by dp_idx: the integer kernel is used (a speed check at start decides, --dp4a on|off forces)
     bool dp_any = false;
-    bool dp_type(int t) const {
-        return hp.n_embd <= 4096 && hp.q_dim() <= 4096 && ((t == g4::T_Q8_0 && dp_ok[0]) || (t == g4::T_NVFP4 && dp_ok[1]) || (t == g4::T_Q4_K && dp_ok[2]) || (t == g4::T_Q5_K && dp_ok[3]) || (t == g4::T_Q6_K && dp_ok[4]));
-    }
-    bool pf_ok[2] = {false, false};                       // the same for reading a prompt (k_mmq): Q8_0, NVFP4
+    bool dp_type(int t) const { const int k = dp_idx(t); return k >= 0 && hp.n_embd <= 4096 && hp.q_dim() <= 4096 && dp_ok[k]; }
+    bool pf_ok[9] = {};                                   // the same for reading a prompt (k_mmq)
     bool pf_any = false;
-    bool pf_type(int t) const { return hp.n_embd <= 4096 && hp.q_dim() <= 4096 && ((t == g4::T_Q8_0 && pf_ok[0]) || (t == g4::T_NVFP4 && pf_ok[1])); }
+    bool pf_type(int t) const { const int k = dp_idx(t); return k >= 0 && hp.n_embd <= 4096 && hp.q_dim() <= 4096 && pf_ok[k]; }
     int8_t* pxq_ = nullptr;                               // a prompt chunk's quantized activations: 4 slots of chunk * n_qw values, then the experts' pair rows
     float* pxd_ = nullptr;
     int cur_Tn = 1;
@@ -788,33 +826,23 @@ struct GpuEngine::Impl {
     }
     void mv(const DevMat& W, const int8_t* xq, const float* xd, long long x_stride, const int* ge, int entries, float* y, int ldy, int y_off, long long expert_bytes) {
         const dim3 grid((unsigned) ((W.n_out + 7) / 8), (unsigned) entries), block(256);
-        auto go = [&](auto tag) {
+        with_dp_type(W.type, [&](auto tag) {
             constexpr int TY = decltype(tag)::value;
-            G4_LAUNCH(G4_K(i2k::k_mv<TY>), grid, block, st, W.d, expert_bytes, (long long) W.row_bytes, (int) W.n_in, (int) W.n_out, xq, xd, x_stride, ge, y, ldy, y_off);
-        };
-        switch (W.type) {
-            case g4::T_Q8_0: go(std::integral_constant<int, g4::T_Q8_0>{}); break;
-            case g4::T_Q4_K: go(std::integral_constant<int, g4::T_Q4_K>{}); break;
-            case g4::T_Q5_K: go(std::integral_constant<int, g4::T_Q5_K>{}); break;
-            case g4::T_Q6_K: go(std::integral_constant<int, g4::T_Q6_K>{}); break;
-            default: go(std::integral_constant<int, g4::T_NVFP4>{}); break;
-        }
+            G4_LAUNCH(G4_K(i2k::k_mv<TY>), grid, block, st, W.d, expert_bytes, (long long) W.row_bytes, (int) W.n_in, (int) W.n_out, xq, xd, x_stride, ge, y, ldy, y_off, tabs);
+        });
     }
     void prep_any(const float* x, int n, int Tn, int slot) {      // the Tn tokens of x into slot `slot` of the decode or the prompt buffers
         if (Tn == 1) prep(x, n, slot);
         else G4_LAUNCH(i2k::k_quant_x, dim3((unsigned) ((n / 32 + 7) / 8), (unsigned) Tn), dim3(256), st, x, n, pslot(slot), pdslot(slot));
     }
     bool q_on(int Tn) const { return Tn == 1 ? dp_any : pf_any; }
-    template <int T>
-    void mmq_t(const DevMat& W, const int8_t* xq, const float* xd, int ng, const int* ge, const int* gf, const int* gn, const int* ei, const int* eo, int ntok, float* y, int ldy, int y_off,
-               long long expert_bytes) {
-        G4_LAUNCH(G4_K((i2k::k_mmq<T, 16>)), dim3((unsigned) ((W.n_out + 15) / 16), (unsigned) ng), dim3(256), st, W.d, expert_bytes, (long long) W.row_bytes, (int) W.n_in, (int) W.n_out, xq, xd, ge, gf, gn, ei, eo,
-                  ntok, y, ldy, y_off);
-    }
     void mmq(const DevMat& W, const int8_t* xq, const float* xd, int ng, const int* ge, const int* gf, const int* gn, const int* ei, const int* eo, int ntok, float* y, int ldy, int y_off,
              long long expert_bytes) {
-        if (W.type == g4::T_Q8_0) mmq_t<g4::T_Q8_0>(W, xq, xd, ng, ge, gf, gn, ei, eo, ntok, y, ldy, y_off, expert_bytes);
-        else mmq_t<g4::T_NVFP4>(W, xq, xd, ng, ge, gf, gn, ei, eo, ntok, y, ldy, y_off, expert_bytes);
+        with_dp_type(W.type, [&](auto tag) {
+            constexpr int TY = decltype(tag)::value;
+            G4_LAUNCH(G4_K((i2k::k_mmq<TY, 16>)), dim3((unsigned) ((W.n_out + 15) / 16), (unsigned) ng), dim3(256), st, W.d, expert_bytes, (long long) W.row_bytes, (int) W.n_in, (int) W.n_out, xq, xd, ge, gf, gn, ei, eo,
+                      ntok, y, ldy, y_off, tabs);
+        });
     }
     /// y = W x for the Tn tokens of x (ldx), whose activations are in `slot` (-1: not quantized): one token and a type with an integer kernel: that; a prompt chunk and k_mmq: that; else the float kernel
     void mmd(const DevMat& W, const float* x, int ldx, int Tn, float* y, int ldy, int slot, int y_off = 0) {

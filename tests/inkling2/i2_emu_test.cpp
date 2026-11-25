@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
     auto row = [&](int t) { return all.data() + (size_t) t * (size_t) nv; };
     auto make = [&](int chunk, int slack, int host_experts = 0, int stage_slots = 32, int cache_slots = 0, int cpu_threads = 0, int kvq = 0, int split_keys = 256) {
         i2cuda::GpuOptions o;
-        o.chunk = chunk; o.slack = slack; o.reserve_mib = 0; o.host_experts = host_experts; o.stage_slots = stage_slots; o.cache_slots = cache_slots; o.cpu_threads = cpu_threads; o.kvq = kvq; o.attn_split_keys = split_keys; o.cpu_force = cpu_threads > 0; o.verbose = false;
+        o.chunk = chunk; o.slack = slack; o.reserve_mib = 0; o.host_experts = host_experts; o.stage_slots = stage_slots; o.cache_slots = cache_slots; o.cpu_threads = cpu_threads; o.kvq = kvq; o.attn_split_keys = split_keys; o.cpu_force = cpu_threads > 0; o.dp4a = 0; o.verbose = false;       // (float kernels: the integer ones add noise that flips the random model's routing; they have their own tests)
         auto e = std::make_unique<i2cuda::GpuEngine>(m, 64, o);
         const std::string er = e->init();
         if (!er.empty()) { std::fprintf(stderr, "init: %s\n", er.c_str()); std::exit(1); }

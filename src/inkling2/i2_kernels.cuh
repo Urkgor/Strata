@@ -163,6 +163,98 @@ G4_DEV void i2_table16(uint32_t q4, uint32_t t0, uint32_t t1, uint32_t t2, uint3
     y = (int) i2_perm(tmp[0], tmp[1], 0x7531u);
 }
 
+
+// ---- the code-book types (IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S): blocks of 256 values, 8 groups of 32, each 4 groups of 8 values: a group is a code-book entry (4 bytes for IQ3, 8 for IQ2) with a sign
+// pattern.  A lane takes one group of 8 (lane = 4 * sub-block + group): its code-book entries, its signs applied byte by byte, and the scale of its 32 (or 16) values.  The tables are read from
+// buffers on the card through the texture path (the constant memory of the float kernels is serialized by lanes that read different entries).
+struct I2Tabs {
+    const uint32_t* g3xxs = nullptr;     // 256 entries of 4 values
+    const uint32_t* g3s = nullptr;       // 512 entries of 4 values
+    const uint64_t* g2xs = nullptr;      // 512 entries of 8 values
+    const uint64_t* g2s = nullptr;       // 1024 entries of 8 values
+    const uint8_t* signs = nullptr;      // 128 sign bytes (the 7-bit pattern and its parity)
+};
+#ifdef STRATA_G4_EMU
+#define I2_LDG(p) (*(p))
+#else
+#define I2_LDG(p) __ldg(p)
+#endif
+G4_DEV uint32_t i2_vsub4(uint32_t a, uint32_t b) {
+#ifdef STRATA_G4_EMU
+    uint32_t r = 0;
+    for (int i = 0; i < 4; ++i) r |= ((((a >> (8 * i)) & 0xffu) - ((b >> (8 * i)) & 0xffu)) & 0xffu) << (8 * i);
+    return r;
+#else
+    return __vsub4(a, b);
+#endif
+}
+G4_DEV uint32_t i2_negmask(uint32_t nib) { return ((nib * 0x00204081u) & 0x01010101u) * 0xFFu; }          // bit k of a nibble -> byte k = 0xFF
+/// the 8 values of a group: two words of 4 bytes, negated where the sign byte has a bit
+G4_DEV void i2_signed(uint32_t w0, uint32_t w1, uint32_t sg, int& o0, int& o1) {
+    const uint32_t m0 = i2_negmask(sg & 15u), m1 = i2_negmask((sg >> 4) & 15u);
+    o0 = (int) i2_vsub4(w0 ^ m0, m0);
+    o1 = (int) i2_vsub4(w1 ^ m1, m1);
+}
+G4_DEV float i2_blk_d(const uint8_t* blk) { return g4::half_to_float((uint16_t) i2_ld16(blk)); }
+
+/// group g (0..3) of sub-block ib (0..7) of a block: its 8 values as two int words and the float to multiply the dot product of its 8 (activation scale not included)
+template <int T>
+G4_DEV void i2_iq_group(const uint8_t* blk, int ib, int g, const I2Tabs& t, int& w0, int& w1, float& sc) {
+    if constexpr (T == g4::T_IQ3_XXS) {
+        const uint32_t a = (uint32_t) i2_ld32_b2(blk + 66 + 4 * ib);
+        const uint32_t i01 = (uint32_t) i2_ld16(blk + 2 + 8 * ib + 2 * g);
+        i2_signed(I2_LDG(t.g3xxs + (i01 & 255u)), I2_LDG(t.g3xxs + (i01 >> 8)), I2_LDG(t.signs + ((a >> (7 * g)) & 127u)), w0, w1);
+        sc = i2_blk_d(blk) * (0.5f + (float) (a >> 28)) * 0.5f;
+    } else if constexpr (T == g4::T_IQ3_S) {
+        const uint32_t qh = blk[66 + ib];
+        const uint32_t i0 = (uint32_t) blk[2 + 8 * ib + 2 * g] | ((qh << (8 - 2 * g)) & 256u), i1 = (uint32_t) blk[2 + 8 * ib + 2 * g + 1] | ((qh << (7 - 2 * g)) & 256u);
+        i2_signed(I2_LDG(t.g3s + i0), I2_LDG(t.g3s + i1), (uint32_t) blk[74 + 4 * ib + g], w0, w1);
+        sc = i2_blk_d(blk) * (float) (1 + 2 * ((blk[106 + (ib >> 1)] >> (4 * (ib & 1))) & 0xf));
+    } else if constexpr (T == g4::T_IQ2_XS) {
+        const uint32_t qv = (uint32_t) i2_ld16(blk + 2 + 2 * (4 * ib + g));
+        const uint64_t gr = I2_LDG(t.g2xs + (qv & 511u));
+        i2_signed((uint32_t) gr, (uint32_t) (gr >> 32), I2_LDG(t.signs + (qv >> 9)), w0, w1);
+        sc = i2_blk_d(blk) * (0.5f + (float) ((blk[66 + ib] >> (4 * (g >> 1))) & 0xf)) * 0.25f;
+    } else {   // IQ2_S
+        const uint32_t gi = (uint32_t) blk[2 + 4 * ib + g] | (((uint32_t) blk[66 + ib] << (8 - 2 * g)) & 0x300u);
+        const uint64_t gr = I2_LDG(t.g2s + gi);
+        i2_signed((uint32_t) gr, (uint32_t) (gr >> 32), (uint32_t) blk[34 + 4 * ib + g], w0, w1);
+        sc = i2_blk_d(blk) * (0.5f + (float) ((blk[74 + ib] >> (4 * (g >> 1))) & 0xf)) * 0.25f;
+    }
+}
+template <int T> G4_HD constexpr int i2_iq_bytes() { return T == g4::T_IQ3_XXS ? 98 : T == g4::T_IQ3_S ? 110 : T == g4::T_IQ2_XS ? 74 : 82; }
+template <int T> G4_HD constexpr bool i2_is_iq() { return T == g4::T_IQ3_XXS || T == g4::T_IQ3_S || T == g4::T_IQ2_XS || T == g4::T_IQ2_S; }
+
+/// Q4_K / Q5_K: the lane's 8 values of sub-block j (4 lanes a sub-block): two int words of unsigned values, the sub-block's scale and min (6 bits each), d and dmin.
+template <int T>
+G4_DEV void i2_kq_lane(const uint8_t* blk, int j, int part, uint32_t& q0, uint32_t& q1, float& dsc, float& dmn) {
+    constexpr int QS = T == g4::T_Q4_K ? 16 : 48;
+    const uint8_t* sc = blk + 4;
+    uint32_t scv, mnv;
+    if (j < 4) { scv = sc[j] & 63u; mnv = sc[j + 4] & 63u; }
+    else { scv = (sc[j + 4] & 0xFu) | ((uint32_t) (sc[j - 4] >> 6) << 4); mnv = (uint32_t) (sc[j + 4] >> 4) | ((uint32_t) (sc[j] >> 6) << 4); }
+    const uint8_t* qs = blk + QS + (j >> 1) * 32 + part * 8;
+    const int sh = (j & 1) * 4;
+    q0 = (*reinterpret_cast<const uint32_t*>(qs) >> sh) & 0x0F0F0F0Fu;
+    q1 = (*reinterpret_cast<const uint32_t*>(qs + 4) >> sh) & 0x0F0F0F0Fu;
+    if constexpr (T == g4::T_Q5_K) {                                           // the fifth bit: bit j of byte l of qh, for the 32 values of sub-block j
+        const uint8_t* qh = blk + 16 + part * 8;
+        q0 |= ((*reinterpret_cast<const uint32_t*>(qh) >> j) & 0x01010101u) << 4;
+        q1 |= ((*reinterpret_cast<const uint32_t*>(qh + 4) >> j) & 0x01010101u) << 4;
+    }
+    dsc = i2_blk_d(blk) * (float) scv;
+    dmn = i2_blk_d(blk + 2) * (float) mnv;
+}
+/// Q6_K: the lane's 8 values (row r of half n, 8 from lp * 8): two words of 6-bit values (still offset by 32) and the int8 scale times d
+G4_DEV void i2_q6_lane(const uint8_t* blk, int n, int r, int lp, uint32_t& q0, uint32_t& q1, float& dsc) {
+    const uint8_t* ql = blk + 64 * n + (r & 1) * 32 + lp * 8;
+    const uint8_t* qh = blk + 128 + 32 * n + lp * 8;
+    const int sh = 4 * (r >> 1), hs = 2 * r;
+    q0 = (((uint32_t) i2_ld32_b2(ql)) >> sh & 0x0F0F0F0Fu) | ((((uint32_t) i2_ld32_b2(qh)) >> hs & 0x03030303u) << 4);
+    q1 = (((uint32_t) i2_ld32_b2(ql + 4)) >> sh & 0x0F0F0F0Fu) | ((((uint32_t) i2_ld32_b2(qh + 4)) >> hs & 0x03030303u) << 4);
+    dsc = i2_blk_d(blk + 208) * (float) (int) (int8_t) blk[192 + 8 * n + (lp >> 1) + 2 * r];
+}
+
 /// x[row][n] -> xq (int8) and xd (the scale of each block of 32): a warp a block, grid (ceil(n / 256), rows), 256 threads.
 __global__ void __launch_bounds__(256)
 k_quant_x(const float* x, int n, int8_t* xq, float* xd) {
@@ -184,7 +276,7 @@ k_quant_x(const float* x, int n, int8_t* xq, float* xd) {
 template <int T>
 __global__ void __launch_bounds__(256)
 k_mv(const uint8_t* __restrict__ w, long long expert_bytes, long long row_bytes, int n_in, int n_out, const int8_t* __restrict__ xq, const float* __restrict__ xd, long long x_stride,
-     const int* __restrict__ grp_exp, float* __restrict__ y, int ldy, int y_off) {
+     const int* __restrict__ grp_exp, float* __restrict__ y, int ldy, int y_off, I2Tabs tabs) {
     // the entry's activations, once per block into shared memory (every row of the block reads all of them: from the L2, with no L1 on Pascal, that was twice the weights' traffic)
     __shared__ int xs_i[1024];                                  // up to 4096 int8 values
     __shared__ float ds[128];
@@ -213,50 +305,46 @@ k_mv(const uint8_t* __restrict__ w, long long expert_bytes, long long row_bytes,
             acc += (float) s * g4::half_to_float((uint16_t) i2_ld16(blk)) * de[b];
         }
     } else if constexpr (T == g4::T_Q4_K || T == g4::T_Q5_K) {
-        // blocks of 256 values: 8 sub-blocks of 32, each value d * sc_j * q - dmin * m_j (6-bit scales and mins packed in 12 bytes).  A lane takes 8 values of one sub-block (4 lanes a
-        // sub-block, a block a trip): the sum of q * x and the sum of x (a dot with ones), the activations' own scale per 32 being the sub-block's.
-        constexpr int BB = T == g4::T_Q4_K ? 144 : 176, QS = T == g4::T_Q4_K ? 16 : 48;
+        // blocks of 256 values: 8 sub-blocks of 32, each value d * sc_j * q - dmin * m_j.  A lane takes 8 values of one sub-block (4 lanes a sub-block, a block a trip): the sum of q * x
+        // and the sum of x (a dot with ones), the activations' own scale per 32 being the sub-block's.
+        constexpr int BB = T == g4::T_Q4_K ? 144 : 176;
         const int nb = n_in / 256, j = lane >> 2, part = lane & 3;
         for (int b = 0; b < nb; ++b) {
             const uint8_t* blk = rp + (size_t) b * BB;
-            const uint8_t* sc = blk + 4;
-            uint32_t scv, mnv;
-            if (j < 4) { scv = sc[j] & 63u; mnv = sc[j + 4] & 63u; }
-            else { scv = (sc[j + 4] & 0xFu) | ((uint32_t) (sc[j - 4] >> 6) << 4); mnv = (uint32_t) (sc[j + 4] >> 4) | ((uint32_t) (sc[j] >> 6) << 4); }
-            const uint8_t* qs = blk + QS + (j >> 1) * 32 + part * 8;
-            const int sh = (j & 1) * 4;
-            uint32_t q0 = (*reinterpret_cast<const uint32_t*>(qs) >> sh) & 0x0F0F0F0Fu, q1 = (*reinterpret_cast<const uint32_t*>(qs + 4) >> sh) & 0x0F0F0F0Fu;
-            if constexpr (T == g4::T_Q5_K) {                                           // the fifth bit: bit j of byte l of qh, for the 32 values of sub-block j
-                const uint8_t* qh = blk + 16 + part * 8;
-                q0 |= ((*reinterpret_cast<const uint32_t*>(qh) >> j) & 0x01010101u) << 4;
-                q1 |= ((*reinterpret_cast<const uint32_t*>(qh + 4) >> j) & 0x01010101u) << 4;
-            }
+            uint32_t q0, q1;
+            float dsc, dmn;
+            i2_kq_lane<T>(blk, j, part, q0, q1, dsc, dmn);
             const int* xv = reinterpret_cast<const int*>(xe + (size_t) b * 256 + (size_t) j * 32 + (size_t) part * 8);
             int s = i2_dp4a((int) q0, xv[0], 0);
             s = i2_dp4a((int) q1, xv[1], s);
             int sx = i2_dp4a(0x01010101, xv[0], 0);
             sx = i2_dp4a(0x01010101, xv[1], sx);
-            const float d = g4::half_to_float((uint16_t) i2_ld16(blk)), dmin = g4::half_to_float((uint16_t) i2_ld16(blk + 2));
-            acc += de[b * 8 + j] * (d * (float) scv * (float) s - dmin * (float) mnv * (float) sx);
+            acc += de[b * 8 + j] * (dsc * (float) s - dmn * (float) sx);
         }
     } else if constexpr (T == g4::T_Q6_K) {
-        // blocks of 256 values: two halves of 128, each four rows of 32 (r) whose 6-bit values are 4 low bits from ql (low or high nibble) and 2 from qh; 16 sub-blocks of 16 with an int8 scale
-        // each, value d * sc * (q - 32).  A lane takes 8 values of one row of one half; the 2-byte aligned blocks (210 bytes) are read in halves.
+        // blocks of 256 values: two halves of 128, each four rows of 32 (r); 16 sub-blocks of 16 with an int8 scale each, value d * sc * (q - 32).  A lane takes 8 values of one row of one half.
         const int nb = n_in / 256, n = lane >> 4, r = (lane >> 2) & 3, lp = lane & 3;
         for (int b = 0; b < nb; ++b) {
             const uint8_t* blk = rp + (size_t) b * 210;
-            const uint8_t* ql = blk + 64 * n + (r & 1) * 32 + lp * 8;
-            const uint8_t* qh = blk + 128 + 32 * n + lp * 8;
-            const int sh = 4 * (r >> 1), hs = 2 * r;
-            const uint32_t q0 = (((uint32_t) i2_ld32_b2(ql)) >> sh & 0x0F0F0F0Fu) | ((((uint32_t) i2_ld32_b2(qh)) >> hs & 0x03030303u) << 4);
-            const uint32_t q1 = (((uint32_t) i2_ld32_b2(ql + 4)) >> sh & 0x0F0F0F0Fu) | ((((uint32_t) i2_ld32_b2(qh + 4)) >> hs & 0x03030303u) << 4);
-            const int scl = (int) (int8_t) blk[192 + 8 * n + (lp >> 1) + 2 * r];
+            uint32_t q0, q1;
+            float dsc;
+            i2_q6_lane(blk, n, r, lp, q0, q1, dsc);
             const int* xv = reinterpret_cast<const int*>(xe + (size_t) b * 256 + (size_t) (128 * n + 32 * r + lp * 8));
             int s = i2_dp4a((int) q0, xv[0], 0);
             s = i2_dp4a((int) q1, xv[1], s);
             int sx = i2_dp4a(0x01010101, xv[0], 0);
             sx = i2_dp4a(0x01010101, xv[1], sx);
-            acc += de[b * 8 + 4 * n + r] * g4::half_to_float((uint16_t) i2_ld16(blk + 208)) * (float) scl * (float) (s - 32 * sx);
+            acc += de[b * 8 + 4 * n + r] * dsc * (float) (s - 32 * sx);
+        }
+    } else if constexpr (i2_is_iq<T>()) {
+        const int nb = n_in / 256, ib = lane >> 2, g = lane & 3;
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* blk = rp + (size_t) b * i2_iq_bytes<T>();
+            int w0, w1;
+            float sc;
+            i2_iq_group<T>(blk, ib, g, tabs, w0, w1, sc);
+            const int* xv = reinterpret_cast<const int*>(xe + (size_t) b * 256 + (size_t) ib * 32 + (size_t) g * 8);
+            acc += de[b * 8 + ib] * sc * (float) i2_dp4a(w1, xv[1], i2_dp4a(w0, xv[0], 0));
         }
     } else {
         const int nb = n_in / 64, sub = lane & 3;
@@ -288,7 +376,7 @@ template <int T, int NT>
 __global__ void __launch_bounds__(256)
 k_mmq(const uint8_t* __restrict__ w, long long expert_bytes, long long row_bytes, int n_in, int n_out, const int8_t* __restrict__ xq, const float* __restrict__ xd,
       const int* __restrict__ grp_exp, const int* __restrict__ grp_first, const int* __restrict__ grp_cnt, const int* __restrict__ ent_in, const int* __restrict__ ent_out,
-      int ntok, float* __restrict__ y, int ldy, int y_off) {
+      int ntok, float* __restrict__ y, int ldy, int y_off, I2Tabs tabs) {
     constexpr int KS = 512;
     __shared__ int xs_i[NT * KS / 4];
     __shared__ float ds[NT * (KS / 32)];
@@ -333,6 +421,63 @@ k_mmq(const uint8_t* __restrict__ w, long long expert_bytes, long long row_bytes
                         const float dx = ds[i * (KS / 32) + b];
                         accA[i] += (float) i2_dp4a(a1, x1, i2_dp4a(a0, x0, 0)) * da * dx;
                         accB[i] += (float) i2_dp4a(c1, x1, i2_dp4a(c0, x0, 0)) * db * dx;
+                    }
+                }
+            }
+        } else if constexpr (T == g4::T_Q4_K || T == g4::T_Q5_K) {
+            constexpr int BB = T == g4::T_Q4_K ? 144 : 176;
+            const int nb = kn / 256, j = lane >> 2, part = lane & 3;
+            for (int b = 0; b < nb; ++b) {
+                uint32_t a0, a1, c0, c1;
+                float da, ma, db, mb;
+                i2_kq_lane<T>(rpA + (size_t) (k0 / 256 + b) * BB, j, part, a0, a1, da, ma);
+                i2_kq_lane<T>(rpB + (size_t) (k0 / 256 + b) * BB, j, part, c0, c1, db, mb);
+#pragma unroll
+                for (int i = 0; i < NT; ++i) {
+                    if (i < cnt) {
+                        const int* xv = xs_i + i * (KS / 4) + b * 64 + j * 8 + part * 2;
+                        const int x0 = xv[0], x1 = xv[1];
+                        const float dx = ds[i * (KS / 32) + b * 8 + j];
+                        const int sx = i2_dp4a(0x01010101, x1, i2_dp4a(0x01010101, x0, 0));
+                        accA[i] += dx * (da * (float) i2_dp4a((int) a1, x1, i2_dp4a((int) a0, x0, 0)) - ma * (float) sx);
+                        accB[i] += dx * (db * (float) i2_dp4a((int) c1, x1, i2_dp4a((int) c0, x0, 0)) - mb * (float) sx);
+                    }
+                }
+            }
+        } else if constexpr (T == g4::T_Q6_K) {
+            const int nb = kn / 256, n = lane >> 4, r = (lane >> 2) & 3, lp = lane & 3;
+            for (int b = 0; b < nb; ++b) {
+                uint32_t a0, a1, c0, c1;
+                float da, db;
+                i2_q6_lane(rpA + (size_t) (k0 / 256 + b) * 210, n, r, lp, a0, a1, da);
+                i2_q6_lane(rpB + (size_t) (k0 / 256 + b) * 210, n, r, lp, c0, c1, db);
+#pragma unroll
+                for (int i = 0; i < NT; ++i) {
+                    if (i < cnt) {
+                        const int* xv = xs_i + i * (KS / 4) + b * 64 + (128 * n + 32 * r + lp * 8) / 4;
+                        const int x0 = xv[0], x1 = xv[1];
+                        const float dx = ds[i * (KS / 32) + b * 8 + 4 * n + r];
+                        const int sx = i2_dp4a(0x01010101, x1, i2_dp4a(0x01010101, x0, 0));
+                        accA[i] += dx * da * (float) (i2_dp4a((int) a1, x1, i2_dp4a((int) a0, x0, 0)) - 32 * sx);
+                        accB[i] += dx * db * (float) (i2_dp4a((int) c1, x1, i2_dp4a((int) c0, x0, 0)) - 32 * sx);
+                    }
+                }
+            }
+        } else if constexpr (i2_is_iq<T>()) {
+            const int nb = kn / 256, ib = lane >> 2, g = lane & 3;
+            for (int b = 0; b < nb; ++b) {
+                int a0, a1, c0, c1;
+                float da, db;
+                i2_iq_group<T>(rpA + (size_t) (k0 / 256 + b) * i2_iq_bytes<T>(), ib, g, tabs, a0, a1, da);
+                i2_iq_group<T>(rpB + (size_t) (k0 / 256 + b) * i2_iq_bytes<T>(), ib, g, tabs, c0, c1, db);
+#pragma unroll
+                for (int i = 0; i < NT; ++i) {
+                    if (i < cnt) {
+                        const int* xv = xs_i + i * (KS / 4) + b * 64 + ib * 8 + g * 2;
+                        const int x0 = xv[0], x1 = xv[1];
+                        const float dx = ds[i * (KS / 32) + b * 8 + ib];
+                        accA[i] += dx * da * (float) i2_dp4a(a1, x1, i2_dp4a(a0, x0, 0));
+                        accB[i] += dx * db * (float) i2_dp4a(c1, x1, i2_dp4a(c0, x0, 0));
                     }
                 }
             }

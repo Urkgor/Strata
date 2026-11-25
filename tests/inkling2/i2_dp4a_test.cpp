@@ -12,22 +12,44 @@
 static int fails = 0;
 #define EXPECT(c, ...) do { if (!(c)) { ++fails; std::printf("FAIL: "); } else std::printf("ok:   "); std::printf(__VA_ARGS__); std::printf("\n"); } while (0)
 
+template <class F> static void with_t(int type, F&& f) {
+    switch (type) {
+        case g4::T_Q8_0: f(std::integral_constant<int, g4::T_Q8_0>{}); break;
+        case g4::T_NVFP4: f(std::integral_constant<int, g4::T_NVFP4>{}); break;
+        case g4::T_Q4_K: f(std::integral_constant<int, g4::T_Q4_K>{}); break;
+        case g4::T_Q5_K: f(std::integral_constant<int, g4::T_Q5_K>{}); break;
+        case g4::T_Q6_K: f(std::integral_constant<int, g4::T_Q6_K>{}); break;
+        case g4::T_IQ2_XS: f(std::integral_constant<int, g4::T_IQ2_XS>{}); break;
+        case g4::T_IQ2_S: f(std::integral_constant<int, g4::T_IQ2_S>{}); break;
+        case g4::T_IQ3_XXS: f(std::integral_constant<int, g4::T_IQ3_XXS>{}); break;
+        default: f(std::integral_constant<int, g4::T_IQ3_S>{}); break;
+    }
+}
+template <class T> static T* up_(const T* h, size_t n) { T* d; cudaMalloc((void**) &d, n * sizeof(T)); cudaMemcpy(d, h, n * sizeof(T), cudaMemcpyHostToDevice); return d; }
+static const int kTypes[] = {g4::T_Q8_0, g4::T_NVFP4, g4::T_Q4_K, g4::T_Q5_K, g4::T_Q6_K, g4::T_IQ2_XS, g4::T_IQ2_S, g4::T_IQ3_XXS, g4::T_IQ3_S};
+/// random blocks with sane scales (the half at the start, at 2 and at 208 for Q6_K; NVFP4's four scale bytes)
+static void fill_blocks(int type, std::vector<uint8_t>& w, std::mt19937& rng) {
+    for (auto& b : w) b = (uint8_t) rng();
+    const int bb = g4::block_bytes(type);
+    for (size_t o = 0; o + (size_t) bb <= w.size(); o += (size_t) bb) {
+        auto half_at = [&](size_t at) { const uint16_t h = (uint16_t) (0x2000 | (rng() & 0x3ff)); w[at] = (uint8_t) (h & 0xff); w[at + 1] = (uint8_t) (h >> 8); };
+        if (type == g4::T_Q4_K || type == g4::T_Q5_K) { half_at(o); half_at(o + 2); }
+        else if (type == g4::T_Q6_K) half_at(o + 208);
+        else if (type == g4::T_NVFP4) for (int s = 0; s < 4; ++s) w[o + (size_t) s] = (uint8_t) (0x20 + (rng() % 40));
+        else half_at(o);
+    }
+}
+
 int main() {
     std::mt19937 rng(11);
-    for (int type : {g4::T_Q8_0, g4::T_NVFP4, g4::T_Q4_K, g4::T_Q5_K, g4::T_Q6_K}) {
+    i2k::I2Tabs tabs;
+    tabs.g3xxs = up_(g4::tab::iq3xxs_grid_h, 256); tabs.g3s = up_(g4::tab::iq3s_grid_h, 512); tabs.g2xs = up_(g4::tab::iq2xs_grid_h, 512);
+    tabs.g2s = up_(g4::tab::iq2s_grid_h, 1024); tabs.signs = up_(g4::tab::ksigns_iq2xs_h, 128);
+    for (int type : kTypes) {
         const int n_in = 2304, n_out = 40, n_exp = 3, ne = 8;       // 3 experts' worth of rows; 8 entries read experts 2, 0, 1, 2, ... with their own (or one shared) activations
         const size_t rb = (size_t) g4::row_bytes(type, n_in), eb = rb * (size_t) n_out;
         std::vector<uint8_t> w(eb * (size_t) n_exp);
-        for (auto& b : w) b = (uint8_t) rng();
-        const int bb = g4::block_bytes(type), be = g4::block_elems(type);
-        for (size_t o = 0; o + (size_t) bb <= w.size(); o += (size_t) bb) {         // sane scales
-            auto half_at = [&](size_t at) { const uint16_t h = (uint16_t) (0x2000 | (rng() & 0x3ff)); w[at] = (uint8_t) (h & 0xff); w[at + 1] = (uint8_t) (h >> 8); };
-            if (type == g4::T_Q8_0) half_at(o);
-            else if (type == g4::T_Q4_K || type == g4::T_Q5_K) { half_at(o); half_at(o + 2); }
-            else if (type == g4::T_Q6_K) half_at(o + 208);
-            else for (int s = 0; s < 4; ++s) w[o + (size_t) s] = (uint8_t) (0x20 + (rng() % 40));
-        }
-        (void) be;
+        fill_blocks(type, w, rng);
         for (int shared = 0; shared < 2; ++shared) {
             std::vector<float> x((size_t) ne * (size_t) n_in);
             for (auto& v : x) v = (float) ((int) (rng() % 2001) - 1000) / 500.f;
@@ -44,15 +66,9 @@ int main() {
             auto run = [&](auto tag) {
                 constexpr int TY = decltype(tag)::value;
                 G4_LAUNCH(G4_K(i2k::k_mv<TY>), dim3((unsigned) ((n_out + 7) / 8), (unsigned) ne), dim3(256), 0, dw, (long long) eb, (long long) rb, n_in, n_out, (const int8_t*) dxq, (const float*) dxd,
-                          (long long) (shared ? 0 : n_in), (const int*) dge, dy, n_out, 0);
+                          (long long) (shared ? 0 : n_in), (const int*) dge, dy, n_out, 0, tabs);
             };
-            switch (type) {
-                case g4::T_Q8_0: run(std::integral_constant<int, g4::T_Q8_0>{}); break;
-                case g4::T_Q4_K: run(std::integral_constant<int, g4::T_Q4_K>{}); break;
-                case g4::T_Q5_K: run(std::integral_constant<int, g4::T_Q5_K>{}); break;
-                case g4::T_Q6_K: run(std::integral_constant<int, g4::T_Q6_K>{}); break;
-                default: run(std::integral_constant<int, g4::T_NVFP4>{}); break;
-            }
+            with_t(type, run);
             std::vector<float> y((size_t) ne * (size_t) n_out);
             cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost);
             double d2 = 0, s2 = 0;
@@ -73,16 +89,11 @@ int main() {
         }
     }
     // reading a prompt: k_mmq, a dense matrix over a ragged number of tokens, and expert groups with gathered rows
-    for (int type : {g4::T_Q8_0, g4::T_NVFP4}) {
+    for (int type : kTypes) {
         const int n_in = 2304, n_out = 24, ntok = 37, n_exp = 3;
         const size_t rb = (size_t) g4::row_bytes(type, n_in), eb = rb * (size_t) n_out;
         std::vector<uint8_t> w(eb * (size_t) n_exp);
-        for (auto& b : w) b = (uint8_t) rng();
-        const int bb = g4::block_bytes(type);
-        for (size_t o = 0; o + (size_t) bb <= w.size(); o += (size_t) bb) {
-            if (type == g4::T_Q8_0) { const uint16_t h = (uint16_t) (0x2000 | (rng() & 0x3ff)); w[o] = (uint8_t) (h & 0xff); w[o + 1] = (uint8_t) (h >> 8); }
-            else for (int s = 0; s < 4; ++s) w[o + (size_t) s] = (uint8_t) (0x20 + (rng() % 40));
-        }
+        fill_blocks(type, w, rng);
         std::vector<float> x((size_t) ntok * (size_t) n_in);
         for (auto& v : x) v = (float) ((int) (rng() % 2001) - 1000) / 500.f;
         // experts: 3 groups: expert 2 reads the tokens 5, 9, 30; expert 0 the tokens 0 .. 15; expert 1 the token 36
@@ -99,14 +110,14 @@ int main() {
         auto run = [&](auto tag, bool dense) {
             constexpr int TY = decltype(tag)::value;
             if (dense) G4_LAUNCH((i2k::k_mmq<TY, 16>), dim3((unsigned) ((n_out + 15) / 16), (unsigned) ((ntok + 15) / 16)), dim3(256), 0, dw, (long long) eb, (long long) rb, n_in, n_out, (const int8_t*) dxq,
-                                 (const float*) dxd, (const int*) nullptr, (const int*) nullptr, (const int*) nullptr, (const int*) nullptr, (const int*) nullptr, ntok, dy, n_out, 0);
+                                 (const float*) dxd, (const int*) nullptr, (const int*) nullptr, (const int*) nullptr, (const int*) nullptr, (const int*) nullptr, ntok, dy, n_out, 0, tabs);
             else G4_LAUNCH((i2k::k_mmq<TY, 16>), dim3((unsigned) ((n_out + 15) / 16), 3u), dim3(256), 0, dw, (long long) eb, (long long) rb, n_in, n_out, (const int8_t*) dxq, (const float*) dxd,
-                           (const int*) dge, (const int*) dgf, (const int*) dgn, (const int*) dei, (const int*) deo, ntok, dy, n_out, 0);
+                           (const int*) dge, (const int*) dgf, (const int*) dgn, (const int*) dei, (const int*) deo, ntok, dy, n_out, 0, tabs);
         };
         std::vector<float> y((size_t) ntok * (size_t) n_out), wrow((size_t) n_in);
         for (int dense = 1; dense >= 0; --dense) {
             cudaMemset(dy, 0, y.size() * 4);
-            if (type == g4::T_Q8_0) run(std::integral_constant<int, g4::T_Q8_0>{}, dense); else run(std::integral_constant<int, g4::T_NVFP4>{}, dense);
+            with_t(type, [&](auto tag) { run(tag, dense); });
             cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost);
             double d2 = 0, s2 = 0;
             const int n_ent = dense ? ntok : (int) ein.size();
