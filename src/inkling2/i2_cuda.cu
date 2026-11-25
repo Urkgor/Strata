@@ -438,18 +438,35 @@ struct GpuEngine::Impl {
         const int nt = opt.cpu_threads > 0 ? opt.cpu_threads : (int) std::max(2u, std::min(8u, hw - 1));
         pool.reset(new i2cpu::Pool(nt));
         const DevLayer& dl = L[(size_t) ip];
-        const int E = hp.n_embd, nj = std::min(4, hp.n_expert);
+        const int E = hp.n_embd, nj = std::min(16, hp.n_expert);          // 16 different experts (more than the caches hold: the weights come from DRAM, as in a decode step)
         std::vector<float> x((size_t) E), y((size_t) nj * (size_t) E);
         for (int i = 0; i < E; ++i) x[(size_t) i] = std::sin(0.37f * (float) i);
         std::vector<i2cpu::Job> jobs;
         for (int j = 0; j < nj; ++j)
             jobs.push_back({dl.h_gu + (size_t) j * dl.gate_up.expert_bytes, dl.gate_up.type, dl.gate_up.row_bytes, dl.h_dn + (size_t) j * dl.down.expert_bytes, dl.down.type,
                             dl.down.row_bytes, y.data() + (size_t) j * (size_t) E, 1.f});
-        double t_cpu = 1e300, t_copy = 1e300;
-        for (int rep = 0; rep < 4; ++rep) {
-            const double t0 = ms_now();
-            pool->run(x.data(), E, hp.n_ff_exp, hp.situ_beta, hp.situ_lin, jobs.data(), nj);
-            t_cpu = std::min(t_cpu, (ms_now() - t0) / nj);
+        // the integer dots (the activations as int8 blocks, as on the card) when the types have them and they are faster
+        const bool int_ok = i2cpu::int8_type(dl.gate_up.type) && i2cpu::int8_type(dl.down.type) && opt.cpu_int8 != 0;
+        auto time_pool = [&](bool int8) {
+            pool->set_int8(int8);
+            double best = 1e300;
+            for (int rep = 0; rep < 3; ++rep) {
+                const double t0 = ms_now();
+                for (int j = 0; j < nj; j += 4) pool->run(x.data(), E, hp.n_ff_exp, hp.situ_beta, hp.situ_lin, jobs.data() + j, std::min(4, nj - j));     // (4 experts a step, as the router sends)
+                best = std::min(best, (ms_now() - t0) / nj);
+            }
+            return best;
+        };
+        const double t_float = time_pool(false);
+        double t_cpu = t_float, t_int = 1e300, t_copy = 1e300;
+        bool use_int = false;
+        if (int_ok) {
+            t_int = time_pool(true);
+            use_int = opt.cpu_int8 == 1 || t_int < 0.95 * t_cpu;
+            t_cpu = use_int ? t_int : t_cpu;
+        }
+        pool->set_int8(use_int);
+        for (int rep = 0; rep < 3; ++rep) {
             const double t1 = ms_now();
             CK(cudaMemcpy(stgA, dl.h_gu, dl.gate_up.expert_bytes, cudaMemcpyHostToDevice));
             CK(cudaMemcpy(stgC, dl.h_dn, dl.down.expert_bytes, cudaMemcpyHostToDevice));
@@ -461,6 +478,8 @@ struct GpuEngine::Impl {
         if (opt.verbose)
             std::fprintf(stderr, "strata-inkling2: CPU expert pool (%d threads%s): an expert takes %.2f ms on the CPU, %.2f ms to copy to the card: %s\n", nt,
                          have_avx2_s() ? ", AVX2" : ", portable code", t_cpu, t_copy, cpu_on ? "cold experts are computed on the CPU" : "off, the copy is faster here");
+        if (opt.verbose && int_ok)
+            std::fprintf(stderr, "strata-inkling2: CPU expert pool, integer dots (--cpu-int8 on|off|auto): %.2f ms an expert (float dots %.2f): %s\n", t_int, t_float, use_int ? "used" : "not used");
         if (!cpu_on) pool.reset();
     }
     static bool have_avx2_s() { return i2cpu::have_avx2(); }
@@ -1373,6 +1392,7 @@ int run(const i2::Model& m, int ctx, bool serve, const std::string& tokens, int 
         else if (a == "--expert-cache-mib") o.cache_mib = std::max(0, std::atoi(val().c_str()));
         else if (a == "--profile") o.profile = true;
         else if (a == "--dp4a") { const std::string v = val(); o.dp4a = v == "off" ? 0 : v == "on" ? 1 : -1; }
+        else if (a == "--cpu-int8") { const std::string v = val(); o.cpu_int8 = v == "on" ? 1 : v == "off" ? 0 : -1; }
         else if (a == "--cpu-experts") { const std::string v = val(); o.cpu_threads = v == "auto" ? -1 : std::max(0, std::atoi(v.c_str())); }
         else if (a == "--cache-decay") o.cache_decay = std::min(1.0, std::max(0.5, std::atof(val().c_str())));
         else if (a == "--swa-slack") o.slack = std::max(0, std::atoi(val().c_str()));

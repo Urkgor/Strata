@@ -27,6 +27,7 @@ struct GpuOptions {
     int attn_max_split = 64;
     int cache_slots = -1;          // the same in experts, for tests (-1: from cache_mib)
     int cpu_threads = -1;          // the CPU expert pool (decode: cold experts computed on the CPU instead of copied): -1 = on when a speed check says it beats the copy, 0 = off, N = N threads
+    int cpu_int8 = -1;             // the pool's dot products on int8 activations (as the card's integer kernels): -1 = when a speed check says they are faster, 1 = on, 0 = off
     bool cpu_force = false;        // use the pool without the speed check (tests)
     double cache_decay = 0.97;     // an expert's use count is multiplied by this at every decoded token: the cache keeps the most used
     bool verbose = true;

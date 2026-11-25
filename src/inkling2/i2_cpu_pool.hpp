@@ -33,6 +33,12 @@ float dot_row(int type, const uint8_t* row, const float* x, int n);
 /// the same through the portable path (g4::dequant32_t), for the tests
 float dot_row_generic(int type, const uint8_t* row, const float* x, int n);
 bool have_avx2();
+/// the types with an integer dot (activations quantized to int8 blocks of 32: the weights' own integers times them, one float scale a block)
+bool int8_type(int type);
+/// n values (a multiple of 32) as int8 blocks of 32 (q) with their scales (d)
+void quantize_i8(const float* x, int n, int8_t* q, float* d);
+/// the dot product of one weight row with activations quantized by quantize_i8 (n a multiple of 64 for NVFP4)
+float dot_row_i8(int type, const uint8_t* row, const int8_t* xq, const float* xd, int n);
 
 class Pool {
 public:
@@ -41,6 +47,9 @@ public:
     Pool(const Pool&) = delete;
     Pool& operator=(const Pool&) = delete;
     int threads() const { return (int) workers_.size() + 1; }
+    /// integer dots (default on; the jobs' types need int8_type, else the float path runs)
+    void set_int8(bool on) { int8_ = on; }
+    bool int8() const { return int8_; }
     void run(const float* x, int E, int F, float beta, float lin, const Job* jobs, int n);
 
 private:
@@ -58,6 +67,9 @@ private:
     size_t total_ = 0, chunk_ = 1;
     std::atomic<size_t> next_{0};
     std::atomic<int> done_{0};
+    bool int8_ = true;
+    std::vector<int8_t> xq_, aq_;                // the input's and the activations' int8 blocks, their scales, the float activations (run() is not re-entrant)
+    std::vector<float> xd_, ad_, act_;
 };
 
 }  // namespace i2cpu
